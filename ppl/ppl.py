@@ -23,7 +23,7 @@ from ppl.sb3.td3.td3 import TD3
 from ppl.sb3.haco.haco_buffer import PrefReplayBuffer
 
 
-def biased_bce_with_logits(adv1, adv2, y, bias=0.5):
+def biased_bce_with_logits(adv1, adv2, y, bias=0.5, reduction="mean"):
     # Apply the log-sum-exp trick.
     # y = 1 if we prefer x2 to x1
     # We need to implement the numerical stability trick.
@@ -35,7 +35,12 @@ def biased_bce_with_logits(adv1, adv2, y, bias=0.5):
     nlp21 = torch.log(torch.exp(-max21) + torch.exp(-logit21 - max21)) + max21
     nlp12 = torch.log(torch.exp(-max12) + torch.exp(-logit12 - max12)) + max12
     loss = y * nlp21 + (1 - y) * nlp12
-    loss = loss.mean()
+    if reduction == "mean":
+        loss = loss.mean()
+    elif reduction == "none":
+        pass
+    else:
+        raise ValueError("Unsupported reduction: {}".format(reduction))
 
     # Now compute the accuracy
     with torch.no_grad():
@@ -54,17 +59,42 @@ class PVPTD3(TD3):
         if "replay_buffer_class" not in kwargs:
             kwargs["replay_buffer_class"] = HACOReplayBuffer
 
-        self.extra_config = {}
+        self.extra_config = {
+            "use_dynamic_regret": False,
+            "regret_mode": "none",
+            "regret_margin": 0.5,
+            "regret_weight_scale": 0.25,
+            "regret_weight_min": 0.75,
+            "regret_weight_max": 1.0,
+            "regret_temperature": 0.25,
+            "regret_warmup_updates": 2000,
+            "detach_regret_weight": True,
+            "use_policy_reg": False,
+            "policy_reg_mode": "fixed",
+            "policy_reg_weight": 0.05,
+            "policy_reg_tau": 0.005,
+            "policy_reg_target_drift": 0.01,
+            "policy_reg_min": 0.0,
+            "policy_reg_max": 0.2,
+            "policy_reg_adapt_rate": 0.05,
+        }
         for k in ["no_done_for_positive", "no_done_for_negative", "reward_0_for_positive", "reward_0_for_negative",
                   "reward_n2_for_intervention", "reward_1_for_all", "use_weighted_reward", "remove_negative",
                   "adaptive_batch_size", "add_bc_loss", "only_bc_loss", "with_human_proxy_value_loss",
-                  "with_agent_proxy_value_loss", "simple_batch"]:
+                  "with_agent_proxy_value_loss", "simple_batch", "use_dynamic_regret", "detach_regret_weight",
+                  "use_policy_reg"]:
             if k in kwargs:
                 v = kwargs.pop(k)
                 assert v in ["True", "False"]
                 v = v == "True"
                 self.extra_config[k] = v
-        for k in ["agent_data_ratio", "bc_loss_weight", "beta"]:
+        for k in ["regret_mode", "policy_reg_mode"]:
+            if k in kwargs:
+                self.extra_config[k] = kwargs.pop(k)
+        for k in ["agent_data_ratio", "bc_loss_weight", "beta", "regret_margin", "regret_weight_scale",
+                  "regret_weight_min", "regret_weight_max", "regret_temperature", "regret_warmup_updates",
+                  "policy_reg_weight", "policy_reg_tau", "policy_reg_target_drift", "policy_reg_min",
+                  "policy_reg_max", "policy_reg_adapt_rate"]:
             if k in kwargs:
                 self.extra_config[k] = kwargs.pop(k)
         self.q_value_bound = q_value_bound
@@ -361,8 +391,35 @@ class PPL(PVPTD3):
                 n_envs=self.n_envs,
                 **self.replay_buffer_kwargs,
         )
+        self.actor_anchor = None
+        self._policy_reg_lambda = self.extra_config["policy_reg_weight"]
+        self._policy_reg_anchor_synced = False
+
     def _excluded_save_params(self) -> List[str]:
-        return super()._excluded_save_params() + ["preference_buffer", "human_data_buffer"]
+        return super()._excluded_save_params() + ["preference_buffer", "human_data_buffer", "actor_anchor"]
+
+    def _sync_policy_reg_anchor(self) -> None:
+        self.actor_anchor = copy.deepcopy(self.actor)
+        self.actor_anchor.train(False)
+        for param in self.actor_anchor.parameters():
+            param.requires_grad = False
+        self._policy_reg_lambda = self.extra_config["policy_reg_weight"]
+        self._policy_reg_anchor_synced = True
+
+    def _update_policy_reg_lambda(self, policy_reg_loss: th.Tensor) -> None:
+        if self.extra_config["policy_reg_mode"] != "adaptive":
+            return
+
+        target_drift = max(self.extra_config["policy_reg_target_drift"], 1e-12)
+        drift_ratio = policy_reg_loss.detach().item() / target_drift
+        adapt_rate = self.extra_config["policy_reg_adapt_rate"]
+        adjustment = 1.0 + adapt_rate * (drift_ratio - 1.0)
+        adjustment = min(1.5, max(0.5, adjustment))
+        self._policy_reg_lambda *= adjustment
+        self._policy_reg_lambda = min(
+            self.extra_config["policy_reg_max"],
+            max(self.extra_config["policy_reg_min"], self._policy_reg_lambda),
+        )
     
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
         # Switch to train mode (this affects batch norm / dropout)
@@ -372,9 +429,12 @@ class PPL(PVPTD3):
         self._update_learning_rate([self.actor.optimizer])
 
         stat_recorder = defaultdict(list)
+        if not hasattr(self, "_ppl_regret_updates"):
+            self._ppl_regret_updates = 0
 
         for step in range(gradient_steps):
             self._n_updates += 1
+            self._ppl_regret_updates += 1
             # Sample replay buffer
             if self.human_data_buffer.pos == 0:
                 break
@@ -401,19 +461,83 @@ class PPL(PVPTD3):
             log_prob_neg = get_log_prob(neg_obs, neg_action)
             adv_pos, adv_neg = beta * log_prob_pos, beta * log_prob_neg
             label = torch.ones_like(adv_pos)
-            dpo_loss, accuracy = biased_bce_with_logits(adv_neg, adv_pos, label.float())
+            raw_cpl_loss_per_sample, accuracy = biased_bce_with_logits(
+                adv_neg, adv_pos, label.float(), reduction="none"
+            )
+            raw_cpl_loss = raw_cpl_loss_per_sample.mean()
+            preference_margin = adv_pos - adv_neg
+            regret_margin = self.extra_config["regret_margin"]
+            dynamic_regret = F.softplus(regret_margin - preference_margin)
+            regret_weight = torch.ones_like(raw_cpl_loss_per_sample)
+
+            regret_active = (
+                self.extra_config["use_dynamic_regret"]
+                and self._ppl_regret_updates >= self.extra_config["regret_warmup_updates"]
+            )
+            regret_mode = self.extra_config["regret_mode"]
+            if not regret_active:
+                regret_mode = "none"
+
+            if regret_mode == "downweight_learned":
+                regret_temperature = max(self.extra_config["regret_temperature"], 1e-6)
+                learned_confidence = torch.sigmoid((preference_margin - regret_margin) / regret_temperature)
+                regret_weight = 1.0 - self.extra_config["regret_weight_scale"] * learned_confidence
+                regret_weight = torch.clamp(
+                    regret_weight,
+                    min=self.extra_config["regret_weight_min"],
+                    max=self.extra_config["regret_weight_max"],
+                )
+                loss_weight = regret_weight.detach() if self.extra_config["detach_regret_weight"] else regret_weight
+                dpo_loss = (loss_weight * raw_cpl_loss_per_sample).mean()
+            elif regret_mode == "dynamic_margin":
+                margin_adjusted_logit = preference_margin - regret_margin
+                dpo_loss = F.softplus(-margin_adjusted_logit).mean()
+            elif regret_mode == "none":
+                dpo_loss = raw_cpl_loss
+            else:
+                raise ValueError("Unsupported regret_mode: {}".format(regret_mode))
             
             bc_loss_weight = self.extra_config["bc_loss_weight"]
             if self.extra_config["only_bc_loss"]:
                 loss = bc_loss
             else:
                 loss = bc_loss_weight * bc_loss + dpo_loss
+
+            policy_reg_loss = th.zeros((), device=self.device)
+            policy_reg_lambda = 0.0
+            if self.extra_config["use_policy_reg"]:
+                if self.actor_anchor is None or not self._policy_reg_anchor_synced:
+                    self._sync_policy_reg_anchor()
+
+                policy_reg_obs = torch.cat([replay_data.observations, pos_obs, neg_obs], dim=0)
+                with th.no_grad():
+                    anchor_action = self.actor_anchor(policy_reg_obs)
+                policy_reg_action = self.actor(policy_reg_obs)
+                policy_reg_loss = F.mse_loss(policy_reg_action, anchor_action)
+                if self.extra_config["policy_reg_mode"] == "fixed":
+                    policy_reg_lambda = self.extra_config["policy_reg_weight"]
+                elif self.extra_config["policy_reg_mode"] == "adaptive":
+                    policy_reg_lambda = self._policy_reg_lambda
+                else:
+                    raise ValueError("Unsupported policy_reg_mode: {}".format(self.extra_config["policy_reg_mode"]))
+                loss = loss + policy_reg_lambda * policy_reg_loss
             
             self.actor.optimizer.zero_grad()
             loss.backward()
             self.actor.optimizer.step()
+
+            if self.extra_config["use_policy_reg"]:
+                self._update_policy_reg_lambda(policy_reg_loss)
+                polyak_update(self.actor.parameters(), self.actor_anchor.parameters(), self.extra_config["policy_reg_tau"])
             
             stat_recorder["bc_loss"].append(bc_loss.item() if bc_loss is not None else float('nan'))
+            stat_recorder["preference_margin"].append(preference_margin.detach().mean().item())
+            stat_recorder["dynamic_regret"].append(dynamic_regret.detach().mean().item())
+            stat_recorder["regret_active"].append(float(regret_active))
+            stat_recorder["regret_weight"].append(regret_weight.detach().mean().item())
+            stat_recorder["raw_cpl_loss"].append(raw_cpl_loss.detach().item())
+            stat_recorder["policy_reg_loss"].append(policy_reg_loss.detach().item())
+            stat_recorder["policy_reg_lambda"].append(policy_reg_lambda)
             stat_recorder["cpl_loss"].append(dpo_loss.item() if dpo_loss is not None else float('nan'))
             stat_recorder["cpl_accuracy"].append(accuracy.item() if accuracy is not None else float('nan'))
             stat_recorder["loss"].append(loss.item() if loss is not None else float('nan'))
@@ -421,6 +545,7 @@ class PPL(PVPTD3):
         self._n_updates += gradient_steps
         self.logger.record("train/predicted_steps", self.preference_buffer.pos)
         self.logger.record("train/human_involved_steps", self.human_data_buffer.pos)
+        self.logger.record("train/regret_updates", self._ppl_regret_updates)
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         for key, values in stat_recorder.items():
             self.logger.record("train/{}".format(key), np.mean(values))

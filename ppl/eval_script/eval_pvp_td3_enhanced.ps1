@@ -2,8 +2,8 @@
 # Author: Auto-generated script for evaluating all PPL checkpoints
 
 # ========== Configuration ==========
-$MODEL_DIR = "E:\CodeProject\CodexExp01\PPL-main\runs\PPL\PPL_0ee03603\models"
-$RESULT_DIR = "evaluation_results\PPL_0ee03603"
+$MODEL_DIR = "E:\CodeProject\CodexExp01\PPL-main\runs\PPL\PPL_3ccbfbac\models"
+$RESULT_DIR = "evaluation_results\PPL_3ccbfbac"
 $START_STEP = 6000
 $END_STEP = 10000
 $STEP_INTERVAL = 200

@@ -33,6 +33,28 @@ if __name__ == '__main__':
     parser.add_argument("--toy_env", action="store_true", help="Whether to use a toy environment.")   # Debug mode
     parser.add_argument("--bc_loss_weight", type=float, default=1.0)
     parser.add_argument("--beta", default=0.1, type=float)
+    parser.add_argument("--use_dynamic_regret", default="False", type=str, choices=["False", "True"])
+    parser.add_argument(
+        "--regret_mode",
+        default="none",
+        type=str,
+        choices=["none", "downweight_learned", "dynamic_margin"]
+    )
+    parser.add_argument("--regret_margin", default=0.5, type=float)
+    parser.add_argument("--regret_weight_scale", default=0.25, type=float)
+    parser.add_argument("--regret_weight_min", default=0.75, type=float)
+    parser.add_argument("--regret_weight_max", default=1.0, type=float)
+    parser.add_argument("--regret_temperature", default=0.25, type=float)
+    parser.add_argument("--regret_warmup_updates", default=2000, type=int)
+    parser.add_argument("--detach_regret_weight", default="True", type=str, choices=["False", "True"])
+    parser.add_argument("--use_policy_reg", default="False", type=str, choices=["False", "True"])
+    parser.add_argument("--policy_reg_mode", default="fixed", type=str, choices=["fixed", "adaptive"])
+    parser.add_argument("--policy_reg_weight", default=0.05, type=float)
+    parser.add_argument("--policy_reg_tau", default=0.005, type=float)
+    parser.add_argument("--policy_reg_target_drift", default=0.01, type=float)
+    parser.add_argument("--policy_reg_min", default=0.0, type=float)
+    parser.add_argument("--policy_reg_max", default=0.2, type=float)
+    parser.add_argument("--policy_reg_adapt_rate", default=0.05, type=float)
     
     args = parser.parse_args()
 
@@ -72,6 +94,23 @@ if __name__ == '__main__':
             only_bc_loss=args.only_bc_loss,
             bc_loss_weight=args.bc_loss_weight,
             beta = args.beta,
+            use_dynamic_regret=args.use_dynamic_regret,
+            regret_mode=args.regret_mode,
+            regret_margin=args.regret_margin,
+            regret_weight_scale=args.regret_weight_scale,
+            regret_weight_min=args.regret_weight_min,
+            regret_weight_max=args.regret_weight_max,
+            regret_temperature=args.regret_temperature,
+            regret_warmup_updates=args.regret_warmup_updates,
+            detach_regret_weight=args.detach_regret_weight,
+            use_policy_reg=args.use_policy_reg,
+            policy_reg_mode=args.policy_reg_mode,
+            policy_reg_weight=args.policy_reg_weight,
+            policy_reg_tau=args.policy_reg_tau,
+            policy_reg_target_drift=args.policy_reg_target_drift,
+            policy_reg_min=args.policy_reg_min,
+            policy_reg_max=args.policy_reg_max,
+            policy_reg_adapt_rate=args.policy_reg_adapt_rate,
             add_bc_loss="True" if args.bc_loss_weight > 0.0 else "False",
             use_balance_sample=True,
             agent_data_ratio=1.0,
