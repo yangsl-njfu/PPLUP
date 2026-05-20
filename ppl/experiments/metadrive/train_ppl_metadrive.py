@@ -33,6 +33,17 @@ if __name__ == '__main__':
     parser.add_argument("--toy_env", action="store_true", help="Whether to use a toy environment.")   # Debug mode
     parser.add_argument("--bc_loss_weight", type=float, default=1.0)
     parser.add_argument("--beta", default=0.1, type=float)
+    parser.add_argument("--use_infeasible_negatives", default="False", type=str, choices=["True", "False"])
+    parser.add_argument("--infeasible_negative_num", default=4, type=int)
+    parser.add_argument("--infeasible_negative_pool_num", default=0, type=int)
+    parser.add_argument("--infeasible_negative_sigma", default=0.2, type=float)
+    parser.add_argument("--infeasible_negative_weight", default=1.0, type=float)
+    parser.add_argument(
+        "--infeasible_negative_mode",
+        default="none",
+        type=str,
+        choices=["none", "local_noise", "corrected_cone"],
+    )
     
     args = parser.parse_args()
 
@@ -65,6 +76,11 @@ if __name__ == '__main__':
         env_config=dict(
             num_predicted_steps=args.num_predicted_steps,
             preference_horizon=args.preference_horizon,
+            use_infeasible_negatives=args.use_infeasible_negatives == "True",
+            infeasible_negative_num=args.infeasible_negative_num,
+            infeasible_negative_pool_num=args.infeasible_negative_pool_num,
+            infeasible_negative_sigma=args.infeasible_negative_sigma,
+            infeasible_negative_mode=args.infeasible_negative_mode,
         ),
 
         # Algorithm config
@@ -72,6 +88,11 @@ if __name__ == '__main__':
             only_bc_loss=args.only_bc_loss,
             bc_loss_weight=args.bc_loss_weight,
             beta = args.beta,
+            use_infeasible_negatives=args.use_infeasible_negatives,
+            infeasible_negative_num=args.infeasible_negative_num,
+            infeasible_negative_sigma=args.infeasible_negative_sigma,
+            infeasible_negative_weight=args.infeasible_negative_weight,
+            infeasible_negative_mode=args.infeasible_negative_mode,
             add_bc_loss="True" if args.bc_loss_weight > 0.0 else "False",
             use_balance_sample=True,
             agent_data_ratio=1.0,

@@ -175,7 +175,14 @@ class BasePredictionEnv(SafeMetaDriveEnv):
             vehicle.navigation.navi_arrow_dir = state.get("navi_arrow_dir", None)
 
     
-    def predict_agent_future_trajectory(self, current_obs, n_steps, action_behavior = None, return_all_states = False):
+    def predict_agent_future_trajectory(
+        self,
+        current_obs,
+        n_steps,
+        action_behavior=None,
+        return_all_states=False,
+        first_action=None,
+    ):
         info = dict()
         saved_state = self.get_state()
         
@@ -187,8 +194,11 @@ class BasePredictionEnv(SafeMetaDriveEnv):
         
         for step in range(n_steps):
             old_pos = copy.deepcopy(self.vehicle.position)
-            action = action_behavior
-            if action_behavior is None:
+            if first_action is not None and step == 0:
+                action = first_action
+            else:
+                action = action_behavior
+            if action is None:
                 action = self.agent_action
                 if hasattr(self, "model"):
                      action, _ = self.model.policy.predict(obs, deterministic=True)

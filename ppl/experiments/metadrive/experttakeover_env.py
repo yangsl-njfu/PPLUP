@@ -142,6 +142,11 @@ class ExpertTakeoverEnv(DrivingEnv):
                 "failure_check_freq": 10,
                 "preference_horizon": 3, 
                 "expert_noise": 0,
+                "use_infeasible_negatives": False,
+                "infeasible_negative_num": 4,
+                "infeasible_negative_pool_num": 0,
+                "infeasible_negative_sigma": 0.2,
+                "infeasible_negative_mode": "none",
             }
         )
         return config
@@ -172,6 +177,135 @@ class ExpertTakeoverEnv(DrivingEnv):
             positive_traj = [step_info].copy()
             negative_traj = predicted_traj[step+1:]
             self.model.preference_buffer.add(positive_traj, negative_traj)
+
+    @staticmethod
+    def _str_to_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            if value in ["True", "true", "1", "yes", "Yes"]:
+                return True
+            if value in ["False", "false", "0", "no", "No"]:
+                return False
+        raise ValueError("Expected a boolean-like value, got {}".format(value))
+
+    @staticmethod
+    def _make_preference_step(obs, action):
+        return {
+            "obs": obs.copy(),
+            "action": action.copy(),
+            "next_obs": obs.copy(),
+            "done": False,
+        }
+
+    def store_single_preference_pair(self, obs, positive_action, negative_action, preference_buffer):
+        positive_traj = [self._make_preference_step(obs, positive_action)]
+        negative_traj = [self._make_preference_step(obs, negative_action)]
+        preference_buffer.add(positive_traj, negative_traj)
+
+    @staticmethod
+    def _is_in_corrected_cone(candidate_action, positive_action, negative_action):
+        bad_direction = negative_action - positive_action
+        from_human = candidate_action - positive_action
+        direction_norm_sq = np.sum(bad_direction ** 2)
+        projection = np.dot(from_human, bad_direction) / (direction_norm_sq + 1e-8)
+        action_distance = np.linalg.norm(from_human)
+        original_distance = np.linalg.norm(bad_direction)
+        return projection >= 0.5 and action_distance >= 0.5 * original_distance
+
+    @staticmethod
+    def _sample_infeasible_candidate_action(mode, positive_action, negative_action, sigma, low, high):
+        if mode in ["local_noise", "corrected_cone"]:
+            noise = np.random.randn(*negative_action.shape) * sigma
+            return np.clip(negative_action + noise, low, high)
+
+        raise ValueError("Unknown infeasible_negative_mode: {}".format(mode))
+
+    def store_verified_infeasible_preference_pairs(
+        self,
+        obs,
+        expert_action,
+        rejected_action,
+        num_predicted_steps,
+    ):
+        if not self._str_to_bool(self.config["use_infeasible_negatives"]):
+            return
+        if not hasattr(self, "model") or not hasattr(self.model, "infeasible_preference_buffer"):
+            return
+
+        mode = self.config["infeasible_negative_mode"]
+        if mode == "none":
+            return
+        if mode not in ["local_noise", "corrected_cone"]:
+            raise ValueError("Unknown infeasible_negative_mode: {}".format(mode))
+
+        keep_candidates = int(self.config["infeasible_negative_num"])
+        total_candidates = int(self.config["infeasible_negative_pool_num"])
+        if total_candidates <= 0:
+            total_candidates = max(keep_candidates * 4, keep_candidates)
+        sigma = float(self.config["infeasible_negative_sigma"])
+        if keep_candidates <= 0 or total_candidates <= 0 or sigma < 0:
+            return
+        if not hasattr(self.action_space, "low") or not hasattr(self.action_space, "high"):
+            raise ValueError("Verified infeasible negatives require a continuous action space.")
+
+        low, high = self.action_space.low, self.action_space.high
+        cone_valid_candidates = 0
+        unsafe_candidates = []
+
+        for _ in range(total_candidates):
+            candidate_action = self._sample_infeasible_candidate_action(
+                mode,
+                expert_action,
+                rejected_action,
+                sigma,
+                low,
+                high,
+            )
+            if mode == "corrected_cone" and not self._is_in_corrected_cone(
+                candidate_action,
+                expert_action,
+                rejected_action,
+            ):
+                continue
+            cone_valid_candidates += 1
+
+            _, candidate_info = self.predict_agent_future_trajectory(
+                obs,
+                num_predicted_steps,
+                first_action=candidate_action.copy(),
+            )
+            if not candidate_info["failure"]:
+                continue
+
+            distance_to_agent = np.linalg.norm(candidate_action - rejected_action)
+            distance_to_human = np.linalg.norm(candidate_action - expert_action)
+            unsafe_candidates.append((distance_to_agent, distance_to_human, candidate_action))
+
+        unsafe_candidates.sort(key=lambda item: item[0])
+        kept_candidates = unsafe_candidates[:keep_candidates]
+        distance_to_agent_sum = 0.0
+        distance_to_human_sum = 0.0
+
+        for distance_to_agent, distance_to_human, candidate_action in kept_candidates:
+            self.store_single_preference_pair(
+                obs,
+                expert_action,
+                candidate_action,
+                self.model.infeasible_preference_buffer,
+            )
+            distance_to_agent_sum += distance_to_agent
+            distance_to_human_sum += distance_to_human
+
+        if hasattr(self.model, "record_infeasible_negative_stats"):
+            self.model.record_infeasible_negative_stats(
+                total_candidates,
+                cone_valid_candidates,
+                len(unsafe_candidates),
+                len(kept_candidates),
+                distance_to_human_sum,
+                distance_to_agent_sum,
+            )
     
     def step(self, actions):
         """Compared to the original one, we call expert_action_prob here and implement a takeover function."""
@@ -213,6 +347,12 @@ class ExpertTakeoverEnv(DrivingEnv):
             if hasattr(self, "model") and hasattr(self.model, "preference_buffer"):
                 predicted_traj, info2 = self.predict_agent_future_trajectory(self.last_obs, num_predicted_steps, action_behavior=self.agent_action.copy())
                 self.store_preference_pairs(predicted_traj, preference_horizon, expert_action.copy())
+                self.store_verified_infeasible_preference_pairs(
+                    self.last_obs,
+                    expert_action.copy(),
+                    self.agent_action.copy(),
+                    num_predicted_steps,
+                )
             
         o, r, d, i = super(DrivingEnv, self).step(actions)
         

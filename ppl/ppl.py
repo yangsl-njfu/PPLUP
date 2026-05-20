@@ -352,7 +352,27 @@ class PVPTD3(TD3):
 
 class PPL(PVPTD3):
     def __init__(self, *args, **kwargs):
+        use_infeasible_negatives = kwargs.pop("use_infeasible_negatives", "False")
+        infeasible_negative_num = kwargs.pop("infeasible_negative_num", 4)
+        infeasible_negative_sigma = kwargs.pop("infeasible_negative_sigma", 0.2)
+        infeasible_negative_weight = kwargs.pop("infeasible_negative_weight", 1.0)
+        infeasible_negative_mode = kwargs.pop("infeasible_negative_mode", "none")
+
         super(PPL, self).__init__(*args, **kwargs)
+        self.extra_config["use_infeasible_negatives"] = self._str_to_bool(use_infeasible_negatives)
+        self.extra_config["infeasible_negative_num"] = int(infeasible_negative_num)
+        self.extra_config["infeasible_negative_sigma"] = float(infeasible_negative_sigma)
+        self.extra_config["infeasible_negative_weight"] = float(infeasible_negative_weight)
+        self.extra_config["infeasible_negative_mode"] = infeasible_negative_mode
+
+        valid_modes = ["none", "local_noise", "corrected_cone"]
+        if self.extra_config["infeasible_negative_mode"] not in valid_modes:
+            raise ValueError("Unknown infeasible_negative_mode: {}".format(infeasible_negative_mode))
+        if self.extra_config["infeasible_negative_num"] < 0:
+            raise ValueError("infeasible_negative_num must be non-negative")
+        if self.extra_config["infeasible_negative_sigma"] < 0:
+            raise ValueError("infeasible_negative_sigma must be non-negative")
+
         self.preference_buffer = PrefReplayBuffer(
                 self.buffer_size,
                 self.observation_space,
@@ -361,8 +381,77 @@ class PPL(PVPTD3):
                 n_envs=self.n_envs,
                 **self.replay_buffer_kwargs,
         )
+        self.infeasible_preference_buffer = PrefReplayBuffer(
+                self.buffer_size,
+                self.observation_space,
+                self.action_space,
+                self.device,
+                n_envs=self.n_envs,
+                **self.replay_buffer_kwargs,
+        )
+        self.infeasible_negative_generated_candidates = 0
+        self.infeasible_negative_cone_valid_candidates = 0
+        self.infeasible_negative_unsafe_candidates = 0
+        self.infeasible_negative_kept_candidates = 0
+        self.infeasible_negative_distance_to_human_sum = 0.0
+        self.infeasible_negative_distance_to_agent_sum = 0.0
+
+    @staticmethod
+    def _str_to_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            if value in ["True", "true", "1", "yes", "Yes"]:
+                return True
+            if value in ["False", "false", "0", "no", "No"]:
+                return False
+        raise ValueError("Expected a boolean-like value, got {}".format(value))
+
+    @staticmethod
+    def _squeeze_preference_sample(value):
+        if isinstance(value, dict):
+            return {key: tensor.squeeze() for key, tensor in value.items()}
+        return value.squeeze()
+
+    def record_infeasible_negative_stats(
+        self,
+        generated_candidates,
+        cone_valid_candidates,
+        unsafe_candidates,
+        kept_candidates,
+        distance_to_human_sum,
+        distance_to_agent_sum,
+    ):
+        self.infeasible_negative_generated_candidates += int(generated_candidates)
+        self.infeasible_negative_cone_valid_candidates += int(cone_valid_candidates)
+        self.infeasible_negative_unsafe_candidates += int(unsafe_candidates)
+        self.infeasible_negative_kept_candidates += int(kept_candidates)
+        self.infeasible_negative_distance_to_human_sum += float(distance_to_human_sum)
+        self.infeasible_negative_distance_to_agent_sum += float(distance_to_agent_sum)
+
+    def _compute_preference_cpo_loss(self, preference_data, beta):
+        pos_obs = self._squeeze_preference_sample(preference_data.pos_observations)
+        pos_action = preference_data.pos_actions.squeeze()
+        neg_obs = self._squeeze_preference_sample(preference_data.neg_observations)
+        neg_action = preference_data.neg_actions.squeeze()
+
+        def get_log_prob(obs, target_action):
+            mean = self.actor(obs)
+            log_prob = -((mean - target_action) ** 2).sum(dim = -1)
+            return log_prob
+
+        log_prob_pos = get_log_prob(pos_obs, pos_action)
+        log_prob_neg = get_log_prob(neg_obs, neg_action)
+        adv_pos, adv_neg = beta * log_prob_pos, beta * log_prob_neg
+        label = torch.ones_like(adv_pos)
+        return biased_bce_with_logits(adv_neg, adv_pos, label.float())
+
     def _excluded_save_params(self) -> List[str]:
-        return super()._excluded_save_params() + ["preference_buffer", "human_data_buffer"]
+        return super()._excluded_save_params() + [
+            "preference_buffer",
+            "infeasible_preference_buffer",
+            "human_data_buffer",
+        ]
     
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
         # Switch to train mode (this affects batch norm / dropout)
@@ -387,27 +476,34 @@ class PPL(PVPTD3):
             stat_recorder["new_action_steering"] = new_action[:, 0].mean().item()
             stat_recorder["new_action_abs_steering"] = th.abs(new_action[:, 0]).mean().item()
             stat_recorder["new_action_accerler"] = new_action[:, 1].mean().item()
-
-            pos_obs, pos_action = preference_data.pos_observations.squeeze(), preference_data.pos_actions.squeeze()
-            neg_obs, neg_action = preference_data.neg_observations.squeeze(), preference_data.neg_actions.squeeze()
-            
-            def get_log_prob(obs, target_action):
-                mean = self.actor(obs)
-                log_prob = -((mean - target_action) ** 2).sum(dim = -1)
-                return log_prob
             
             beta = self.extra_config["beta"]
-            log_prob_pos = get_log_prob(pos_obs, pos_action)
-            log_prob_neg = get_log_prob(neg_obs, neg_action)
-            adv_pos, adv_neg = beta * log_prob_pos, beta * log_prob_neg
-            label = torch.ones_like(adv_pos)
-            dpo_loss, accuracy = biased_bce_with_logits(adv_neg, adv_pos, label.float())
+            dpo_loss, accuracy = self._compute_preference_cpo_loss(preference_data, beta)
+
+            infeasible_cpo_loss = dpo_loss.new_tensor(0.0)
+            infeasible_accuracy = dpo_loss.new_tensor(0.0)
+            has_infeasible_data = self.infeasible_preference_buffer.pos > 0 or self.infeasible_preference_buffer.full
+            use_infeasible = (
+                self.extra_config.get("use_infeasible_negatives", False)
+                and self.extra_config.get("infeasible_negative_mode", "none") != "none"
+                and has_infeasible_data
+            )
+            if use_infeasible:
+                infeasible_data = self.infeasible_preference_buffer.sample(
+                    int(batch_size),
+                    env=self._vec_normalize_env,
+                )
+                infeasible_cpo_loss, infeasible_accuracy = self._compute_preference_cpo_loss(
+                    infeasible_data,
+                    beta,
+                )
             
             bc_loss_weight = self.extra_config["bc_loss_weight"]
             if self.extra_config["only_bc_loss"]:
                 loss = bc_loss
             else:
-                loss = bc_loss_weight * bc_loss + dpo_loss
+                infeasible_negative_weight = self.extra_config.get("infeasible_negative_weight", 1.0)
+                loss = bc_loss_weight * bc_loss + dpo_loss + infeasible_negative_weight * infeasible_cpo_loss
             
             self.actor.optimizer.zero_grad()
             loss.backward()
@@ -415,12 +511,48 @@ class PPL(PVPTD3):
             
             stat_recorder["bc_loss"].append(bc_loss.item() if bc_loss is not None else float('nan'))
             stat_recorder["cpl_loss"].append(dpo_loss.item() if dpo_loss is not None else float('nan'))
+            stat_recorder["original_cpo_loss"].append(dpo_loss.item() if dpo_loss is not None else float('nan'))
+            stat_recorder["infeasible_cpo_loss"].append(
+                infeasible_cpo_loss.item() if infeasible_cpo_loss is not None else float('nan')
+            )
             stat_recorder["cpl_accuracy"].append(accuracy.item() if accuracy is not None else float('nan'))
+            stat_recorder["infeasible_cpl_accuracy"].append(
+                infeasible_accuracy.item() if infeasible_accuracy is not None else float('nan')
+            )
             stat_recorder["loss"].append(loss.item() if loss is not None else float('nan'))
 
         self._n_updates += gradient_steps
         self.logger.record("train/predicted_steps", self.preference_buffer.pos)
+        self.logger.record("train/infeasible_predicted_steps", self.infeasible_preference_buffer.pos)
         self.logger.record("train/human_involved_steps", self.human_data_buffer.pos)
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+
+        generated = self.infeasible_negative_generated_candidates
+        cone_valid = self.infeasible_negative_cone_valid_candidates
+        unsafe = self.infeasible_negative_unsafe_candidates
+        kept = self.infeasible_negative_kept_candidates
+        if generated > 0:
+            infeasible_cone_valid_ratio = cone_valid / generated
+            infeasible_unsafe_ratio = unsafe / generated
+            infeasible_valid_ratio = kept / generated
+        else:
+            infeasible_cone_valid_ratio = 0.0
+            infeasible_unsafe_ratio = 0.0
+            infeasible_valid_ratio = 0.0
+        if kept > 0:
+            infeasible_action_distance = self.infeasible_negative_distance_to_human_sum / kept
+            infeasible_distance_to_agent = (
+                self.infeasible_negative_distance_to_agent_sum / kept
+            )
+        else:
+            infeasible_action_distance = 0.0
+            infeasible_distance_to_agent = 0.0
+        self.logger.record("train/infeasible_negative_generated_candidates", generated)
+        self.logger.record("train/infeasible_negative_cone_valid_ratio", infeasible_cone_valid_ratio)
+        self.logger.record("train/infeasible_negative_predictor_unsafe_ratio", infeasible_unsafe_ratio)
+        self.logger.record("train/infeasible_negative_valid_ratio", infeasible_valid_ratio)
+        self.logger.record("train/infeasible_negative_kept_candidates", kept)
+        self.logger.record("train/infeasible_negative_action_distance", infeasible_action_distance)
+        self.logger.record("train/infeasible_negative_distance_to_agent", infeasible_distance_to_agent)
         for key, values in stat_recorder.items():
             self.logger.record("train/{}".format(key), np.mean(values))
