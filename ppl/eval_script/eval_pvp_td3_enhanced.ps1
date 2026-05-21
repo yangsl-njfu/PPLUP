@@ -1,14 +1,46 @@
 # PPL Batch Evaluation Script for PowerShell
 # Author: Auto-generated script for evaluating all PPL checkpoints
 
+param(
+    [switch]$StaticRSSFilter,
+    [switch]$StaticRSSAssumeAdjacentLanes,
+    [switch]$StaticRSSBypass,
+    [switch]$StaticRSSReverseSteer,
+    [switch]$StaticRSSDiagnostics,
+    [int]$StaticRSSDiagnosticEnvId = -1,
+    [double]$StaticRSSInterventionMargin = 0.0
+)
+
 # ========== Configuration ==========
 $MODEL_DIR = "E:\CodeProject\CodexExp01\PPL-main\runs\PPL\PPL_0ee03603\models"
-$RESULT_DIR = "evaluation_results\PPL_0ee03603"
+$BASE_RESULT_DIR = "evaluation_results\PPL_0ee03603-enhanced"
+$RESULT_DIR = if ($StaticRSSFilter) { "evaluation_results\PPL_0ee03603_static_rss" } else { $BASE_RESULT_DIR }
 $START_STEP = 6000
 $END_STEP = 10000
 $STEP_INTERVAL = 200
 $NUM_EP_IN_ONE_ENV = 1
 $TOTAL_ENV_NUM = 50
+
+$STATIC_RSS_ARGS = @()
+if ($StaticRSSFilter) {
+    $STATIC_RSS_ARGS += "--static_rss_filter"
+    $STATIC_RSS_ARGS += "--static_rss_intervention_margin"
+    $STATIC_RSS_ARGS += "$StaticRSSInterventionMargin"
+}
+if ($StaticRSSAssumeAdjacentLanes) {
+    $STATIC_RSS_ARGS += "--static_rss_assume_adjacent_lanes"
+}
+if ($StaticRSSBypass) {
+    $STATIC_RSS_ARGS += "--static_rss_enable_bypass"
+}
+if ($StaticRSSReverseSteer) {
+    $STATIC_RSS_ARGS += "--static_rss_reverse_steer"
+}
+if ($StaticRSSDiagnostics) {
+    $STATIC_RSS_ARGS += "--static_rss_diagnostics"
+    $STATIC_RSS_ARGS += "--static_rss_diagnostic_env_id"
+    $STATIC_RSS_ARGS += "$StaticRSSDiagnosticEnvId"
+}
 
 # ========== Start Evaluation ==========
 Write-Host "===== PPL Batch Evaluation Script =====" -ForegroundColor Cyan
@@ -16,6 +48,10 @@ Write-Host "Model Directory: $MODEL_DIR" -ForegroundColor White
 Write-Host "Result Directory: $RESULT_DIR" -ForegroundColor White
 Write-Host "Step Range: $START_STEP -> $END_STEP (interval $STEP_INTERVAL)" -ForegroundColor White
 Write-Host "Episodes per Env: $NUM_EP_IN_ONE_ENV, Total Envs: $TOTAL_ENV_NUM" -ForegroundColor White
+Write-Host "Static RSS Filter: $StaticRSSFilter" -ForegroundColor White
+Write-Host "Static RSS Bypass: $StaticRSSBypass" -ForegroundColor White
+Write-Host "Static RSS Intervention Margin: $StaticRSSInterventionMargin" -ForegroundColor White
+Write-Host "Static RSS Diagnostics: $StaticRSSDiagnostics (env_id=$StaticRSSDiagnosticEnvId)" -ForegroundColor White
 Write-Host ""
 
 # Create result directory
@@ -36,7 +72,7 @@ for ($step = $START_STEP; $step -le $END_STEP; $step += $STEP_INTERVAL) {
     if (Test-Path $model_path) {
         try {
             Write-Host "[$current_count/$total_ckpts] Evaluating checkpoint $step ..." -ForegroundColor Green
-            python -m ppl.eval_script.metadrive.eval_ppl_metadrive --path "$MODEL_DIR" --ckpt_index $step --ret_save_folder "$RESULT_DIR" --num_ep_in_one_env $NUM_EP_IN_ONE_ENV --total_env_num $TOTAL_ENV_NUM
+            python -m ppl.eval_script.metadrive.eval_ppl_metadrive --path "$MODEL_DIR" --ckpt_index $step --ret_save_folder "$RESULT_DIR" --num_ep_in_one_env $NUM_EP_IN_ONE_ENV --total_env_num $TOTAL_ENV_NUM @STATIC_RSS_ARGS
             if ($LASTEXITCODE -ne 0) {
                 throw "Python evaluation failed for checkpoint $step with exit code $LASTEXITCODE"
             }

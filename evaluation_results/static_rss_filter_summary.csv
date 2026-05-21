@@ -1,0 +1,4 @@
+scenario,nominal_action_acc,nominal_action_steer,filtered_action_acc,filtered_action_steer,selected_mode,filter_applied,obstacle_detected,distance_to_obstacle_m,rss_brake_distance_m,rss_margin_m,left_feasible,right_feasible,selected_progress_score,selected_intervention_cost,selected_score,decision_meaning
+no obstacle,1.0,0.0,1.0,0.0,normal,False,False,,,,False,False,,,,No static obstacle ahead; keep nominal policy action.
+left bypass available,1.0,0.0,-2.0,0.4,left_bypass,True,True,25.5,17.425,8.075,True,False,7.062565610816835,9.16,6.970965610816835,Static obstacle ahead; left bypass is safe and gives more progress than stop.
+no bypass available,1.0,0.0,-5.0,0.0,stop,True,True,25.5,17.425,8.075,False,False,5.75,36.0,5.39,"Static obstacle ahead; no safe bypass candidate, so use RSS stop."

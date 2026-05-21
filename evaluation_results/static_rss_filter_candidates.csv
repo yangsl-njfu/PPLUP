@@ -1,0 +1,4 @@
+scenario,candidate_mode,selected,safe,action_acc,action_steer,progress_score,intervention_cost,h_stop_min,obstacle_clearance_margin,lane_boundary_margin,progress_margin,lateral_progress_margin,front_vehicle_rss_margin,rear_vehicle_rss_margin,steer_direction_margin
+left bypass available,stop,False,True,-5.0,0.0,5.75,36.0,8.075,,,,,,,
+left bypass available,left_bypass,True,True,-2.0,0.4,7.062565610816835,9.16,,17.060166697477975,1.45,6.562565610816835,0.5542509344868045,inf,inf,0.35000000000000003
+no bypass available,stop,True,True,-5.0,0.0,5.75,36.0,8.075,,,,,,,
