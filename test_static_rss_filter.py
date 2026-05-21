@@ -92,6 +92,44 @@ class StaticRSSFilterTest(unittest.TestCase):
         self.assertTrue(info["left_feasible"])
         self.assertFalse(info["right_feasible"])
 
+    def test_margin_gate_still_allows_preemptive_bypass(self):
+        gated_filter = StaticRSSFilter(
+            StaticRSSConfig(
+                enable_bypass=True,
+                enforce_intervention_margin=True,
+                intervention_margin_threshold=0.0,
+            )
+        )
+
+        u_safe, info = gated_filter.filter_action(
+            make_state(with_obstacle=True, left_available=True, right_available=False),
+            [1.0, 0.0],
+        )
+
+        self.assertEqual(info["mode"], "left_bypass")
+        self.assertGreater(u_safe[1], 0.0)
+        self.assertTrue(info["rss_margin_gate_active"])
+        self.assertTrue(info["preemptive_bypass_allowed"])
+
+    def test_margin_gate_without_bypass_returns_normal_until_rss_violation(self):
+        gated_filter = StaticRSSFilter(
+            StaticRSSConfig(
+                enable_bypass=False,
+                enforce_intervention_margin=True,
+                intervention_margin_threshold=0.0,
+            )
+        )
+        u_nom = [1.0, 0.0]
+
+        u_safe, info = gated_filter.filter_action(
+            make_state(with_obstacle=True, left_available=True, right_available=False),
+            u_nom,
+        )
+
+        self.assertEqual(u_safe, u_nom)
+        self.assertEqual(info["mode"], "normal")
+        self.assertEqual(info["reason"], "rss_margin_positive_no_intervention")
+
     def test_dynamic_front_vehicle_unsafe_stops(self):
         dynamic_filter = StaticRSSFilter(StaticRSSConfig(intervention_margin_threshold=1.0))
         state = make_state(with_obstacle=False, left_available=True, right_available=False)

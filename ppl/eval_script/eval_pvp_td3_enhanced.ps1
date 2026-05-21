@@ -5,6 +5,7 @@ param(
     [switch]$StaticRSSFilter,
     [switch]$StaticRSSAssumeAdjacentLanes,
     [switch]$StaticRSSBypass,
+    [switch]$StaticRSSStopOnly,
     [switch]$StaticRSSReverseSteer,
     [switch]$StaticRSSDiagnostics,
     [int]$StaticRSSDiagnosticEnvId = -1,
@@ -20,6 +21,13 @@ $END_STEP = 10000
 $STEP_INTERVAL = 200
 $NUM_EP_IN_ONE_ENV = 1
 $TOTAL_ENV_NUM = 50
+$EffectiveStaticRSSBypass = $StaticRSSFilter -and -not $StaticRSSStopOnly
+if ($StaticRSSBypass) {
+    $EffectiveStaticRSSBypass = $true
+}
+if ($StaticRSSStopOnly) {
+    $EffectiveStaticRSSBypass = $false
+}
 
 $STATIC_RSS_ARGS = @()
 if ($StaticRSSFilter) {
@@ -30,7 +38,7 @@ if ($StaticRSSFilter) {
 if ($StaticRSSAssumeAdjacentLanes) {
     $STATIC_RSS_ARGS += "--static_rss_assume_adjacent_lanes"
 }
-if ($StaticRSSBypass) {
+if ($EffectiveStaticRSSBypass) {
     $STATIC_RSS_ARGS += "--static_rss_enable_bypass"
 }
 if ($StaticRSSReverseSteer) {
@@ -49,7 +57,8 @@ Write-Host "Result Directory: $RESULT_DIR" -ForegroundColor White
 Write-Host "Step Range: $START_STEP -> $END_STEP (interval $STEP_INTERVAL)" -ForegroundColor White
 Write-Host "Episodes per Env: $NUM_EP_IN_ONE_ENV, Total Envs: $TOTAL_ENV_NUM" -ForegroundColor White
 Write-Host "Static RSS Filter: $StaticRSSFilter" -ForegroundColor White
-Write-Host "Static RSS Bypass: $StaticRSSBypass" -ForegroundColor White
+Write-Host "Static RSS Bypass: $EffectiveStaticRSSBypass" -ForegroundColor White
+Write-Host "Static RSS Stop Only: $StaticRSSStopOnly" -ForegroundColor White
 Write-Host "Static RSS Intervention Margin: $StaticRSSInterventionMargin" -ForegroundColor White
 Write-Host "Static RSS Diagnostics: $StaticRSSDiagnostics (env_id=$StaticRSSDiagnosticEnvId)" -ForegroundColor White
 Write-Host ""

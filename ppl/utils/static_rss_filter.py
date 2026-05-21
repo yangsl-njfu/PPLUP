@@ -68,6 +68,7 @@ class StaticRSSConfig:
     enable_dynamic_front_vehicle_rss: bool = True
     enable_predictive_clearance_guard: bool = True
     enable_bypass: bool = True
+    allow_bypass_before_rss_violation: bool = True
     enforce_intervention_margin: bool = False
     intervention_margin_threshold: float = 0.0
     metadrive_steer_sign: float = 1.0
@@ -162,11 +163,16 @@ class StaticRSSFilter:
         ego_speed = self._ego_speed(state)
         d_brake = self.compute_brake_distance(ego_speed)
         current_rss_margin = d_obs - d_brake
-
-        if (
+        rss_margin_gate_active = (
             self.config.enforce_intervention_margin
             and current_rss_margin > self.config.intervention_margin_threshold
-        ):
+        )
+        preemptive_bypass_allowed = (
+            self.config.enable_bypass
+            and self.config.allow_bypass_before_rss_violation
+        )
+
+        if rss_margin_gate_active and not preemptive_bypass_allowed:
             if clearance_info is not None:
                 return self._filter_predictive_clearance_risk(state, clearance_info, u_original)
             return u_original, {
@@ -175,6 +181,8 @@ class StaticRSSFilter:
                 "d_obs": d_obs,
                 "d_brake": d_brake,
                 "rss_margin": current_rss_margin,
+                "rss_margin_gate_active": True,
+                "preemptive_bypass_allowed": False,
                 "left_feasible": False,
                 "right_feasible": False,
                 "state_debug": self._state_debug(state),
@@ -185,21 +193,22 @@ class StaticRSSFilter:
 
         candidates: List[StaticRSSCandidate] = []
 
-        u_stop_nom = self.generate_stop_nominal_action(state)
-        u_stop_proj, stop_project_debug = self.ray_project_action(state, obstacle, u_stop_nom, "stop")
-        stop_safe, stop_margins = self.is_action_safe_for_mode(state, obstacle, u_stop_proj, "stop")
-        candidates.append(
-            self._make_candidate(
-                action=u_stop_proj,
-                mode="stop",
-                safe=stop_safe,
-                margins=stop_margins,
-                projection_debug=stop_project_debug,
-                feasible_debug={"feasible": True},
-                u_original=u_original,
-                state=state,
+        if not rss_margin_gate_active:
+            u_stop_nom = self.generate_stop_nominal_action(state)
+            u_stop_proj, stop_project_debug = self.ray_project_action(state, obstacle, u_stop_nom, "stop")
+            stop_safe, stop_margins = self.is_action_safe_for_mode(state, obstacle, u_stop_proj, "stop")
+            candidates.append(
+                self._make_candidate(
+                    action=u_stop_proj,
+                    mode="stop",
+                    safe=stop_safe,
+                    margins=stop_margins,
+                    projection_debug=stop_project_debug,
+                    feasible_debug={"feasible": True},
+                    u_original=u_original,
+                    state=state,
+                )
             )
-        )
 
         left_feasible, left_debug = False, {"feasible": False, "reason": "bypass_disabled"}
         if self.config.enable_bypass:
@@ -249,6 +258,33 @@ class StaticRSSFilter:
                 )
             )
 
+        if rss_margin_gate_active:
+            safe_bypass_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.safe and candidate.mode in {"left_bypass", "right_bypass"}
+            ]
+            if not safe_bypass_candidates:
+                if clearance_info is not None:
+                    return self._filter_predictive_clearance_risk(state, clearance_info, u_original)
+                candidate_debug = [asdict(candidate) for candidate in candidates]
+                return u_original, {
+                    "mode": "normal",
+                    "obstacle_detected": True,
+                    "dynamic_vehicle_detected": dynamic_info is not None,
+                    "d_obs": d_obs,
+                    "d_brake": d_brake,
+                    "rss_margin": current_rss_margin,
+                    "rss_margin_gate_active": True,
+                    "preemptive_bypass_allowed": True,
+                    "left_feasible": left_feasible,
+                    "right_feasible": right_feasible,
+                    "state_debug": self._state_debug(state),
+                    "blocking_object": self._object_debug(obstacle, state),
+                    "candidates": candidate_debug,
+                    "reason": "rss_margin_positive_no_safe_bypass",
+                }
+
         u_safe, selected_info = self.select_action(candidates, u_original)
         candidate_debug = [asdict(candidate) for candidate in candidates]
 
@@ -259,6 +295,8 @@ class StaticRSSFilter:
             "d_obs": d_obs,
             "d_brake": d_brake,
             "rss_margin": current_rss_margin,
+            "rss_margin_gate_active": rss_margin_gate_active,
+            "preemptive_bypass_allowed": preemptive_bypass_allowed,
             "left_feasible": left_feasible,
             "right_feasible": right_feasible,
             "state_debug": self._state_debug(state),
@@ -660,9 +698,9 @@ class StaticRSSFilter:
         for RSS bypass checks.
         """
         raw_env = self._unwrap_env(env)
-        vehicle = getattr(raw_env, "vehicle", None)
-        if vehicle is None and hasattr(raw_env, "agent"):
-            vehicle = getattr(raw_env, "agent", None)
+        vehicle = self._resolve_attr(raw_env, "vehicle", None)
+        if vehicle is None:
+            vehicle = self._resolve_attr(raw_env, "agent", None)
         if vehicle is None:
             raise ValueError("Cannot parse MetaDrive state: env has no vehicle/agent attribute.")
 
@@ -701,6 +739,12 @@ class StaticRSSFilter:
             "static_obstacles": static_obstacles,
             "vehicles": vehicles,
             "lanes": lanes,
+            "adapter_debug": {
+                "parse_ok": True,
+                "raw_object_count": len(objects),
+                "static_count": len(static_obstacles),
+                "vehicle_count": len(vehicles),
+            },
         }
 
     def augment_state_from_observation(self, state: State, observation: Any) -> State:
@@ -1220,6 +1264,12 @@ class StaticRSSFilter:
         reference = self._clip_action(reference)
         return (action[0] - reference[0]) ** 2 + (action[1] - reference[1]) ** 2
 
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
     def _unwrap_env(self, env: Any) -> Any:
         raw_env = env
         seen = set()
@@ -1228,19 +1278,63 @@ class StaticRSSFilter:
             raw_env = raw_env.env
         return raw_env
 
+    def _resolve_attr(self, obj: Any, name: str, default: Any = None) -> Any:
+        """Read a MetaDrive attribute that may be a property or zero-arg method."""
+        value = getattr(obj, name, default)
+        if callable(value):
+            try:
+                return value()
+            except TypeError:
+                return value
+            except Exception:
+                return default
+        return value
+
+    def _metadrive_position_xy(self, obj: Any) -> Tuple[float, float]:
+        """Return ``(x, y)`` for MetaDrive/Panda3D objects across API variants."""
+        position = self._resolve_attr(obj, "position", None)
+
+        if position is None:
+            position = self._resolve_attr(obj, "get_position", None)
+
+        if position is None:
+            return 0.0, 0.0
+
+        if hasattr(position, "x") and hasattr(position, "y"):
+            try:
+                return float(position.x), float(position.y)
+            except Exception:
+                pass
+
+        try:
+            return float(position[0]), float(position[1])
+        except Exception:
+            pass
+
+        try:
+            return float(position.getX()), float(position.getY())
+        except Exception:
+            pass
+
+        return 0.0, 0.0
+
     def _metadrive_vehicle_to_dict(self, vehicle: Any, default_speed: float = 0.0) -> Dict[str, Any]:
-        position = getattr(vehicle, "position", (0.0, 0.0))
-        heading = getattr(vehicle, "heading_theta", getattr(vehicle, "heading", 0.0))
-        speed = getattr(vehicle, "speed", default_speed)
-        length = getattr(vehicle, "LENGTH", self.config.vehicle_length)
-        width = getattr(vehicle, "WIDTH", self.config.vehicle_width)
+        x, y = self._metadrive_position_xy(vehicle)
+        heading = self._resolve_attr(
+            vehicle,
+            "heading_theta",
+            self._resolve_attr(vehicle, "heading", 0.0),
+        )
+        speed = self._resolve_attr(vehicle, "speed", default_speed)
+        length = self._resolve_attr(vehicle, "LENGTH", self.config.vehicle_length)
+        width = self._resolve_attr(vehicle, "WIDTH", self.config.vehicle_width)
         return {
-            "x": float(position[0]),
-            "y": float(position[1]),
-            "heading": float(heading),
-            "speed": max(0.0, float(speed)),
-            "length": float(length),
-            "width": float(width),
+            "x": float(x),
+            "y": float(y),
+            "heading": self._safe_float(heading, 0.0),
+            "speed": max(0.0, self._safe_float(speed, default_speed)),
+            "length": self._safe_float(length, self.config.vehicle_length),
+            "width": self._safe_float(width, self.config.vehicle_width),
             "lane_id": self._metadrive_lane_id(vehicle),
         }
 
@@ -1252,7 +1346,7 @@ class StaticRSSFilter:
             {
                 "object_type": "vehicle" if has_vehicle_dynamics else "object",
                 "class_name": class_name,
-                "object_id": getattr(obj, "id", getattr(obj, "name", "")),
+                "object_id": self._resolve_attr(obj, "id", self._resolve_attr(obj, "name", "")),
             }
         )
         if not has_vehicle_dynamics:
@@ -1260,24 +1354,27 @@ class StaticRSSFilter:
         return parsed
 
     def _metadrive_lane_id(self, vehicle: Any) -> Optional[Any]:
-        navigation = getattr(vehicle, "navigation", None)
+        navigation = self._resolve_attr(vehicle, "navigation", None)
         if navigation is not None:
-            current_road = getattr(navigation, "current_road", None)
+            current_road = self._resolve_attr(navigation, "current_road", None)
             if current_road is not None:
                 return (
-                    getattr(current_road, "start_node", None),
-                    getattr(current_road, "end_node", None),
+                    self._resolve_attr(current_road, "start_node", None),
+                    self._resolve_attr(current_road, "end_node", None),
                 )
-            current_lanes = getattr(navigation, "current_ref_lanes", None)
+            current_lanes = self._resolve_attr(navigation, "current_ref_lanes", None)
             if current_lanes:
-                return getattr(current_lanes[0], "index", None)
-        lane = getattr(vehicle, "lane", None)
-        return getattr(lane, "index", None)
+                try:
+                    return self._resolve_attr(current_lanes[0], "index", None)
+                except Exception:
+                    pass
+        lane = self._resolve_attr(vehicle, "lane", None)
+        return self._resolve_attr(lane, "index", None) if lane is not None else None
 
     def _metadrive_current_lane_width(self, vehicle: Any) -> float:
         lane = self._metadrive_current_lane(vehicle)
         if lane is not None:
-            width = getattr(lane, "width", None)
+            width = self._resolve_attr(lane, "width", None)
             if width is not None:
                 try:
                     return float(width)
@@ -1286,19 +1383,22 @@ class StaticRSSFilter:
         return self.config.default_lane_width
 
     def _metadrive_current_lane(self, vehicle: Any) -> Optional[Any]:
-        navigation = getattr(vehicle, "navigation", None)
+        navigation = self._resolve_attr(vehicle, "navigation", None)
         if navigation is not None:
-            current_lanes = getattr(navigation, "current_ref_lanes", None)
+            current_lanes = self._resolve_attr(navigation, "current_ref_lanes", None)
             if current_lanes:
-                return current_lanes[0]
-        return getattr(vehicle, "lane", None)
+                try:
+                    return current_lanes[0]
+                except Exception:
+                    pass
+        return self._resolve_attr(vehicle, "lane", None)
 
     def _metadrive_lanes(self, vehicle: Any) -> Dict[str, Dict[str, Any]]:
         current_lane = self._metadrive_current_lane(vehicle)
         current_width = self._metadrive_current_lane_width(vehicle)
         lanes = {
             "current": {
-                "lane_id": getattr(current_lane, "index", None),
+                "lane_id": self._resolve_attr(current_lane, "index", None) if current_lane is not None else None,
                 "width": current_width,
                 "available": True,
                 "drivable": True,
@@ -1310,15 +1410,21 @@ class StaticRSSFilter:
 
         if left_lane is not None or self.config.metadrive_assume_adjacent_lanes:
             lanes["left"] = {
-                "lane_id": getattr(left_lane, "index", "left"),
-                "width": float(getattr(left_lane, "width", current_width)),
+                "lane_id": self._resolve_attr(left_lane, "index", "left") if left_lane is not None else "left",
+                "width": self._safe_float(
+                    self._resolve_attr(left_lane, "width", current_width) if left_lane is not None else current_width,
+                    current_width,
+                ),
                 "available": True,
                 "drivable": True,
             }
         if right_lane is not None or self.config.metadrive_assume_adjacent_lanes:
             lanes["right"] = {
-                "lane_id": getattr(right_lane, "index", "right"),
-                "width": float(getattr(right_lane, "width", current_width)),
+                "lane_id": self._resolve_attr(right_lane, "index", "right") if right_lane is not None else "right",
+                "width": self._safe_float(
+                    self._resolve_attr(right_lane, "width", current_width) if right_lane is not None else current_width,
+                    current_width,
+                ),
                 "available": True,
                 "drivable": True,
             }
@@ -1326,7 +1432,7 @@ class StaticRSSFilter:
 
     def _metadrive_side_lane(self, vehicle: Any, lane_offset: int) -> Optional[Any]:
         current_lane = self._metadrive_current_lane(vehicle)
-        lane_index = getattr(current_lane, "index", None)
+        lane_index = self._resolve_attr(current_lane, "index", None) if current_lane is not None else None
         if not isinstance(lane_index, tuple) or len(lane_index) < 3:
             return None
 
@@ -1336,11 +1442,11 @@ class StaticRSSFilter:
         side_index[-1] += lane_offset
         side_index = tuple(side_index)
 
-        navigation = getattr(vehicle, "navigation", None)
+        navigation = self._resolve_attr(vehicle, "navigation", None)
         road_network = None
         if navigation is not None:
-            nav_map = getattr(navigation, "map", None)
-            road_network = getattr(nav_map, "road_network", None)
+            nav_map = self._resolve_attr(navigation, "map", None)
+            road_network = self._resolve_attr(nav_map, "road_network", None) if nav_map is not None else None
         if road_network is None:
             return None
 
@@ -1350,7 +1456,7 @@ class StaticRSSFilter:
             return None
 
     def _collect_metadrive_objects(self, raw_env: Any) -> List[Any]:
-        engine = getattr(raw_env, "engine", None)
+        engine = self._resolve_attr(raw_env, "engine", None)
         if engine is None:
             return []
 
@@ -1360,7 +1466,9 @@ class StaticRSSFilter:
         def add_item(item: Any) -> None:
             if item is None or id(item) in seen:
                 return
-            if not hasattr(item, "position"):
+            try:
+                self._metadrive_position_xy(item)
+            except Exception:
                 return
             seen.add(id(item))
             objects.append(item)
@@ -1399,7 +1507,7 @@ class StaticRSSFilter:
         for attr in (
             *object_attrs,
         ):
-            add_container(getattr(engine, attr, None))
+            add_container(self._resolve_attr(engine, attr, None))
 
         for manager_name in (
             "traffic_manager",
@@ -1410,13 +1518,13 @@ class StaticRSSFilter:
             "vehicle_manager",
             "static_object_manager",
         ):
-            manager = getattr(engine, manager_name, None)
+            manager = self._resolve_attr(engine, manager_name, None)
             if manager is None:
                 continue
             for attr in object_attrs:
-                add_container(getattr(manager, attr, None))
+                add_container(self._resolve_attr(manager, attr, None))
 
-        managers = getattr(engine, "managers", None)
+        managers = self._resolve_attr(engine, "managers", None)
         if isinstance(managers, dict):
             for manager in managers.values():
                 for attr in object_attrs:

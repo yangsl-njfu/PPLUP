@@ -22,6 +22,7 @@ import argparse
 import os
 import os.path as osp
 import time
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -330,6 +331,7 @@ def evaluate_ppl_once(
                     )
                     action = env_action_safe
                 except Exception as error:
+                    traceback.print_exc()
                     rss_info = {
                         "mode": "adapter_error",
                         "obstacle_detected": False,
