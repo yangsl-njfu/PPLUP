@@ -76,6 +76,7 @@ class StaticRSSConfig:
     enforce_intervention_margin: bool = False
     intervention_margin_threshold: float = 0.0
     metadrive_steer_sign: float = 1.0
+    preserve_steer_on_stop: bool = True
 
 
 @dataclass
@@ -125,7 +126,7 @@ class StaticRSSFilter:
             clearance_info = self.detect_predictive_clearance_risk(state, u_original)
 
         if obstacle_info is None and dynamic_info is None and clearance_info is None:
-            return u_original, {
+            return u_original, self._with_action_debug({
                 "mode": "normal",
                 "obstacle_detected": False,
                 "dynamic_vehicle_detected": False,
@@ -133,7 +134,7 @@ class StaticRSSFilter:
                 "right_feasible": False,
                 "state_debug": self._state_debug(state),
                 "candidates": [],
-            }
+            }, u_original, u_original)
 
         if self.config.enable_dynamic_front_vehicle_rss and dynamic_info is not None:
             vehicle, d_front = dynamic_info
@@ -155,13 +156,13 @@ class StaticRSSFilter:
             return self._filter_predictive_clearance_risk(state, clearance_info, u_original)
 
         if obstacle_info is None:
-            return u_original, {
+            return u_original, self._with_action_debug({
                 "mode": "normal",
                 "obstacle_detected": False,
                 "dynamic_vehicle_detected": True,
                 "state_debug": self._state_debug(state),
                 "candidates": [],
-            }
+            }, u_original, u_original)
 
         obstacle, d_obs = obstacle_info
         ego_speed = self._ego_speed(state)
@@ -179,7 +180,7 @@ class StaticRSSFilter:
         if rss_margin_gate_active and not preemptive_bypass_allowed:
             if clearance_info is not None:
                 return self._filter_predictive_clearance_risk(state, clearance_info, u_original)
-            return u_original, {
+            return u_original, self._with_action_debug({
                 "mode": "normal",
                 "obstacle_detected": True,
                 "d_obs": d_obs,
@@ -193,13 +194,20 @@ class StaticRSSFilter:
                 "blocking_object": self._object_debug(obstacle, state),
                 "candidates": [],
                 "reason": "rss_margin_positive_no_intervention",
-            }
+            }, u_original, u_original)
 
         candidates: List[StaticRSSCandidate] = []
 
         if not rss_margin_gate_active:
-            u_stop_nom = self.generate_stop_nominal_action(state)
-            u_stop_proj, stop_project_debug = self.ray_project_action(state, obstacle, u_stop_nom, "stop")
+            if self.config.preserve_steer_on_stop:
+                u_stop_nom = list(u_original)
+                stop_center = self._clip_action([self.config.min_acc, u_original[1]])
+            else:
+                u_stop_nom = self.generate_stop_nominal_action(state)
+                stop_center = None
+            u_stop_proj, stop_project_debug = self.ray_project_action(
+                state, obstacle, u_stop_nom, "stop", center_override=stop_center
+            )
             stop_safe, stop_margins = self.is_action_safe_for_mode(state, obstacle, u_stop_proj, "stop")
             candidates.append(
                 self._make_candidate(
@@ -272,7 +280,7 @@ class StaticRSSFilter:
                 if clearance_info is not None:
                     return self._filter_predictive_clearance_risk(state, clearance_info, u_original)
                 candidate_debug = [asdict(candidate) for candidate in candidates]
-                return u_original, {
+                return u_original, self._with_action_debug({
                     "mode": "normal",
                     "obstacle_detected": True,
                     "dynamic_vehicle_detected": dynamic_info is not None,
@@ -287,12 +295,12 @@ class StaticRSSFilter:
                     "blocking_object": self._object_debug(obstacle, state),
                     "candidates": candidate_debug,
                     "reason": "rss_margin_positive_no_safe_bypass",
-                }
+                }, u_original, u_original)
 
         u_safe, selected_info = self.select_action(candidates, u_original)
         candidate_debug = [asdict(candidate) for candidate in candidates]
 
-        return u_safe, {
+        return u_safe, self._with_action_debug({
             "mode": selected_info["mode"],
             "obstacle_detected": True,
             "dynamic_vehicle_detected": dynamic_info is not None,
@@ -309,7 +317,7 @@ class StaticRSSFilter:
             "projection_debug": selected_info.get("projection_debug", {}),
             "selected": selected_info,
             "candidates": candidate_debug,
-        }
+        }, u_original, u_safe)
 
     def detect_static_obstacle_ahead(self, state: State) -> Optional[Tuple[Dict[str, Any], float]]:
         """Return the closest static obstacle blocking the current lane/path.
@@ -483,6 +491,12 @@ class StaticRSSFilter:
         """Generate the nominal RSS stop action in internal ``[acc, steer]`` form."""
         return self._clip_action([self.config.min_acc, 0.0])
 
+    def generate_stop_nominal_action_from_original(self, u_original: Sequence[float]) -> Action:
+        """Generate stop nominal action, optionally preserving original steering."""
+        if self.config.preserve_steer_on_stop:
+            return self._clip_action([self.config.min_acc, u_original[1]])
+        return self._clip_action([self.config.min_acc, 0.0])
+
     def generate_bypass_nominal_action(self, state: State, direction: str) -> Action:
         """Generate a simple progress-preserving bypass nominal action."""
         self._validate_direction(direction)
@@ -561,15 +575,25 @@ class StaticRSSFilter:
         return safe, margins
 
     def ray_project_action(
-        self, state: State, obstacle: Dict[str, Any], u_nom: Sequence[float], mode: str
+        self,
+        state: State,
+        obstacle: Dict[str, Any],
+        u_nom: Sequence[float],
+        mode: str,
+        center_override: Optional[Action] = None,
     ) -> Tuple[Action, Dict[str, Any]]:
         """Project an action to a mode-specific safe set via ray search.
 
         The ray starts at a conservative safe center ``c`` and points toward
         ``u_nom``. The largest safe lambda in ``[0, 1]`` is selected.
+
+        When ``center_override`` is provided, it replaces the default
+        ``_safe_center_for_mode(mode)``. This enables 1-D projection for
+        stop modes when ``preserve_steer_on_stop`` is active: the center
+        and nominal share the same steer, so only acc is searched.
         """
         u_nom = self._clip_action(u_nom)
-        center = self._safe_center_for_mode(mode)
+        center = center_override if center_override is not None else self._safe_center_for_mode(mode)
         tests = []
 
         nominal_safe, nominal_margins = self.is_action_safe_for_mode(state, obstacle, u_nom, mode)
@@ -614,7 +638,10 @@ class StaticRSSFilter:
     ) -> Tuple[Action, Dict[str, Any]]:
         """Select the final action by safety, progress, then intervention cost."""
         safe_candidates = [candidate for candidate in candidates if candidate.safe]
-        fallback = self._clip_action([self.config.min_acc, 0.0])
+        if self.config.preserve_steer_on_stop:
+            fallback = self._clip_action([self.config.min_acc, u_original[1]])
+        else:
+            fallback = self._clip_action([self.config.min_acc, 0.0])
 
         if not safe_candidates:
             if self.config.fallback_to_brake:
@@ -840,6 +867,17 @@ class StaticRSSFilter:
             feasible_debug=feasible_debug,
         )
 
+    def _with_action_debug(
+        self, info: Dict[str, Any], u_original: Sequence[float], u_safe: Sequence[float]
+    ) -> Dict[str, Any]:
+        info["acc_nominal"] = float(u_original[0])
+        info["acc_safe"] = float(u_safe[0])
+        info["acc_delta"] = float(u_safe[0] - u_original[0])
+        info["steer_nominal"] = float(u_original[1])
+        info["steer_safe"] = float(u_safe[1])
+        info["steer_delta"] = float(u_safe[1] - u_original[1])
+        return info
+
     def _check_stop_horizon(
         self, state: State, obstacle: Dict[str, Any], action: Sequence[float]
     ) -> Tuple[bool, Dict[str, float]]:
@@ -932,8 +970,15 @@ class StaticRSSFilter:
         dynamic_margin: float,
         u_original: Action,
     ) -> Tuple[Action, Dict[str, Any]]:
-        u_stop_nom = self.generate_stop_nominal_action(state)
-        u_stop_proj, project_debug = self.ray_project_action(state, vehicle, u_stop_nom, "dynamic_stop")
+        if self.config.preserve_steer_on_stop:
+            u_stop_nom = list(u_original)
+            stop_center = self._clip_action([self.config.min_acc, u_original[1]])
+        else:
+            u_stop_nom = self.generate_stop_nominal_action(state)
+            stop_center = None
+        u_stop_proj, project_debug = self.ray_project_action(
+            state, vehicle, u_stop_nom, "dynamic_stop", center_override=stop_center
+        )
         stop_safe, margins = self.is_action_safe_for_mode(state, vehicle, u_stop_proj, "dynamic_stop")
         candidate = self._make_candidate(
             action=u_stop_proj,
@@ -946,7 +991,7 @@ class StaticRSSFilter:
             state=state,
         )
         u_safe, selected_info = self.select_action([candidate], u_original)
-        return u_safe, {
+        return u_safe, self._with_action_debug({
             "mode": selected_info["mode"],
             "obstacle_detected": False,
             "dynamic_vehicle_detected": True,
@@ -962,14 +1007,21 @@ class StaticRSSFilter:
             "projection_debug": selected_info.get("projection_debug", {}),
             "selected": selected_info,
             "candidates": [asdict(candidate)],
-        }
+        }, u_original, u_safe)
 
     def _filter_predictive_clearance_risk(
         self, state: State, clearance_info: Dict[str, Any], u_original: Action
     ) -> Tuple[Action, Dict[str, Any]]:
         obj = clearance_info["object"]
-        u_stop_nom = self.generate_stop_nominal_action(state)
-        u_stop_proj, project_debug = self.ray_project_action(state, obj, u_stop_nom, "clearance_stop")
+        if self.config.preserve_steer_on_stop:
+            u_stop_nom = list(u_original)
+            stop_center = self._clip_action([self.config.min_acc, u_original[1]])
+        else:
+            u_stop_nom = self.generate_stop_nominal_action(state)
+            stop_center = None
+        u_stop_proj, project_debug = self.ray_project_action(
+            state, obj, u_stop_nom, "clearance_stop", center_override=stop_center
+        )
         stop_safe, margins = self.is_action_safe_for_mode(state, obj, u_stop_proj, "clearance_stop")
         candidate = self._make_candidate(
             action=u_stop_proj,
@@ -986,7 +1038,7 @@ class StaticRSSFilter:
             state=state,
         )
         u_safe, selected_info = self.select_action([candidate], u_original)
-        return u_safe, {
+        return u_safe, self._with_action_debug({
             "mode": selected_info["mode"],
             "obstacle_detected": obj in state.get("static_obstacles", []),
             "dynamic_vehicle_detected": obj in state.get("vehicles", []),
@@ -1002,7 +1054,7 @@ class StaticRSSFilter:
             "projection_debug": selected_info.get("projection_debug", {}),
             "selected": selected_info,
             "candidates": [asdict(candidate)],
-        }
+        }, u_original, u_safe)
 
     def _score_progress_after_rollout(self, state: State, action: Sequence[float]) -> float:
         rollout = self._rollout_states(state, action, self.config.horizon_steps)

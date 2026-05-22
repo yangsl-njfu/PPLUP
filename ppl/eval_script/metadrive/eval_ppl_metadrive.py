@@ -197,6 +197,12 @@ def make_static_rss_step_record(
         internal_action_nominal_steer=float(internal_action_nominal[1]),
         internal_action_safe_acc=float(internal_action_safe[0]),
         internal_action_safe_steer=float(internal_action_safe[1]),
+        acc_nominal=rss_info.get("acc_nominal", np.nan),
+        acc_safe=rss_info.get("acc_safe", np.nan),
+        acc_delta=rss_info.get("acc_delta", np.nan),
+        steer_nominal=rss_info.get("steer_nominal", np.nan),
+        steer_safe=rss_info.get("steer_safe", np.nan),
+        steer_delta=rss_info.get("steer_delta", np.nan),
         adapter_error=rss_info.get("adapter_error", ""),
     )
 
@@ -439,6 +445,12 @@ def evaluate_ppl_once(
                     print("env_action_nominal={}".format(env_action_nominal))
                     print("env_action_safe={}".format(env_action_safe))
                     print("action_delta={}".format(action_delta))
+                    print("acc_nominal={}".format(rss_info.get("acc_nominal")))
+                    print("acc_safe={}".format(rss_info.get("acc_safe")))
+                    print("acc_delta={}".format(rss_info.get("acc_delta")))
+                    print("steer_nominal={}".format(rss_info.get("steer_nominal")))
+                    print("steer_safe={}".format(rss_info.get("steer_safe")))
+                    print("steer_delta={}".format(rss_info.get("steer_delta")))
 
             o, r, d, info = env.step(action)
             step_count += 1
