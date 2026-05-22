@@ -290,6 +290,7 @@ def evaluate_ppl_once(
     save_static_rss_step_csv=False,
     static_rss_diagnostic_env_id=-1,
     static_rss_dry_run=False,
+    static_rss_disable_clearance_guard=False,
     static_rss_debug_print_every=0,
     eval_max_steps_per_episode=3000,
     eval_env_start=EVAL_ENV_START,
@@ -345,6 +346,7 @@ def evaluate_ppl_once(
                 enforce_intervention_margin=True,
                 intervention_margin_threshold=static_rss_intervention_margin,
                 metadrive_steer_sign=-1.0 if static_rss_reverse_steer else 1.0,
+                enable_predictive_clearance_guard=not static_rss_disable_clearance_guard,
             )
         )
         print("[StaticRSSFilter] Enabled. Final evaluation CSV format is unchanged.")
@@ -688,6 +690,11 @@ if __name__ == "__main__":
         help="Call and log Static RSS filter decisions, but execute nominal policy actions in env.step.",
     )
     parser.add_argument(
+        "--static_rss_disable_clearance_guard",
+        action="store_true",
+        help="Disable predictive clearance guard in StaticRSSFilter.",
+    )
+    parser.add_argument(
         "--static_rss_debug_print_every",
         type=int,
         default=0,
@@ -730,6 +737,7 @@ if __name__ == "__main__":
             save_static_rss_step_csv=args.static_rss_diagnostics and not args.no_static_rss_step_csv,
             static_rss_diagnostic_env_id=args.static_rss_diagnostic_env_id,
             static_rss_dry_run=args.static_rss_dry_run,
+            static_rss_disable_clearance_guard=args.static_rss_disable_clearance_guard,
             static_rss_debug_print_every=args.static_rss_debug_print_every,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
@@ -757,6 +765,7 @@ if __name__ == "__main__":
             save_static_rss_step_csv=args.static_rss_diagnostics and not args.no_static_rss_step_csv,
             static_rss_diagnostic_env_id=args.static_rss_diagnostic_env_id,
             static_rss_dry_run=args.static_rss_dry_run,
+            static_rss_disable_clearance_guard=args.static_rss_disable_clearance_guard,
             static_rss_debug_print_every=args.static_rss_debug_print_every,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
@@ -788,6 +797,7 @@ if __name__ == "__main__":
                 save_static_rss_step_csv=args.static_rss_diagnostics and not args.no_static_rss_step_csv,
                 static_rss_diagnostic_env_id=args.static_rss_diagnostic_env_id,
                 static_rss_dry_run=args.static_rss_dry_run,
+                static_rss_disable_clearance_guard=args.static_rss_disable_clearance_guard,
                 static_rss_debug_print_every=args.static_rss_debug_print_every,
                 eval_max_steps_per_episode=args.eval_max_steps_per_episode,
                 eval_env_start=args.eval_start_seed,
