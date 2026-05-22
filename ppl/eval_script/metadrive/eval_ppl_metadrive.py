@@ -107,8 +107,39 @@ def make_static_rss_step_record(
     nearest = state_debug.get("nearest_object", {}) if isinstance(state_debug, dict) else {}
     adapter_debug = state_debug.get("adapter_debug", {}) if isinstance(state_debug, dict) else {}
     blocking = rss_info.get("blocking_object", {}) if isinstance(rss_info, dict) else {}
+    candidates = rss_info.get("candidates", []) if isinstance(rss_info, dict) else []
+    if not isinstance(candidates, list):
+        candidates = []
+
+    def candidate_by_mode(mode):
+        for candidate in candidates:
+            if isinstance(candidate, dict) and candidate.get("mode") == mode:
+                return candidate
+        return {}
+
+    def candidate_safe(candidate):
+        if not candidate:
+            return ""
+        return candidate.get("safe", "")
+
+    def candidate_projection_failed(candidate):
+        if not candidate:
+            return ""
+        projection_debug = candidate.get("projection_debug", {})
+        if not isinstance(projection_debug, dict):
+            return ""
+        return projection_debug.get("projection_failed", "")
+
+    def candidate_margin(candidate, name):
+        if not candidate:
+            return np.nan
+        margins = candidate.get("margins", {})
+        if not isinstance(margins, dict):
+            return np.nan
+        return margins.get(name, np.nan)
+
     action_delta = float(np.linalg.norm(np.asarray(env_action_safe) - np.asarray(env_action_nominal)))
-    return dict(
+    record = dict(
         ckpt_index=ckpt_index,
         env_id=env_id,
         episode=episode,
@@ -169,6 +200,37 @@ def make_static_rss_step_record(
         adapter_error=rss_info.get("adapter_error", ""),
     )
 
+    if rss_info.get("mode") == "fallback_no_safe_candidate":
+        stop_candidate = candidate_by_mode("stop")
+        left_candidate = candidate_by_mode("left_bypass")
+        right_candidate = candidate_by_mode("right_bypass")
+        record.update(
+            reason=rss_info.get("reason", ""),
+            blocking_object_type=blocking.get("object_type", ""),
+            blocking_object_x=blocking.get("x", np.nan),
+            blocking_object_y=blocking.get("y", np.nan),
+            blocking_object_longitudinal=blocking.get("longitudinal", np.nan),
+            blocking_object_lateral=blocking.get("lateral", np.nan),
+            d_obs=rss_info.get("d_obs", np.nan),
+            d_brake=rss_info.get("d_brake", np.nan),
+            rss_margin=rss_info.get("rss_margin", np.nan),
+            left_feasible=rss_info.get("left_feasible", ""),
+            right_feasible=rss_info.get("right_feasible", ""),
+            candidate_count=len(candidates),
+            safe_candidate_count=sum(
+                1 for candidate in candidates if isinstance(candidate, dict) and candidate.get("safe") is True
+            ),
+            stop_candidate_safe=candidate_safe(stop_candidate),
+            stop_h_stop_min=candidate_margin(stop_candidate, "h_stop_min"),
+            stop_projection_failed=candidate_projection_failed(stop_candidate),
+            left_candidate_safe=candidate_safe(left_candidate),
+            left_projection_failed=candidate_projection_failed(left_candidate),
+            right_candidate_safe=candidate_safe(right_candidate),
+            right_projection_failed=candidate_projection_failed(right_candidate),
+        )
+
+    return record
+
 
 def summarize_static_rss_episode(step_records):
     """Create episode-level StaticRSSFilter statistics for the main eval CSV."""
@@ -227,6 +289,9 @@ def evaluate_ppl_once(
     static_rss_reverse_steer=False,
     save_static_rss_step_csv=False,
     static_rss_diagnostic_env_id=-1,
+    static_rss_dry_run=False,
+    static_rss_debug_print_every=0,
+    eval_max_steps_per_episode=3000,
     eval_env_start=EVAL_ENV_START,
 ):
     """
@@ -283,6 +348,8 @@ def evaluate_ppl_once(
             )
         )
         print("[StaticRSSFilter] Enabled. Final evaluation CSV format is unchanged.")
+        if static_rss_dry_run:
+            print("[StaticRSSFilter] Dry-run mode: filter decisions are logged but nominal actions are executed.")
 
     saved_results = []
     static_rss_step_records = []
@@ -329,7 +396,10 @@ def evaluate_ppl_once(
                         rss_filter.from_internal_action(internal_action_safe, "metadrive"),
                         dtype=np.float32,
                     )
-                    action = env_action_safe
+                    if static_rss_dry_run:
+                        action = env_action_nominal
+                    else:
+                        action = env_action_safe
                 except Exception as error:
                     traceback.print_exc()
                     rss_info = {
@@ -346,6 +416,27 @@ def evaluate_ppl_once(
                 rss_mode_counts[rss_mode] = rss_mode_counts.get(rss_mode, 0) + 1
                 if np.linalg.norm(env_action_safe - env_action_nominal) > 1e-6 and rss_mode != "adapter_error":
                     rss_changed_steps += 1
+
+            if rss_filter is not None and static_rss_debug_print_every > 0:
+                next_step_count = step_count + 1
+                if next_step_count % static_rss_debug_print_every == 0:
+                    action_delta = float(np.linalg.norm(env_action_safe - env_action_nominal))
+                    print("[RSS DEBUG] step={}".format(next_step_count))
+                    print("mode={}".format(rss_info.get("mode")))
+                    print("reason={}".format(rss_info.get("reason", "")))
+                    print("obstacle_detected={}".format(rss_info.get("obstacle_detected")))
+                    print("dynamic_vehicle_detected={}".format(rss_info.get("dynamic_vehicle_detected")))
+                    print("d_obs={}".format(rss_info.get("d_obs")))
+                    print("d_brake={}".format(rss_info.get("d_brake")))
+                    print("rss_margin={}".format(rss_info.get("rss_margin")))
+                    print("d_dynamic={}".format(rss_info.get("d_dynamic")))
+                    print("clearance_margin={}".format(rss_info.get("clearance_margin")))
+                    print("risk_step={}".format(rss_info.get("risk_step")))
+                    print("left_feasible={}".format(rss_info.get("left_feasible")))
+                    print("right_feasible={}".format(rss_info.get("right_feasible")))
+                    print("env_action_nominal={}".format(env_action_nominal))
+                    print("env_action_safe={}".format(env_action_safe))
+                    print("action_delta={}".format(action_delta))
 
             o, r, d, info = env.step(action)
             step_count += 1
@@ -377,7 +468,7 @@ def evaluate_ppl_once(
             if use_render:
                 env.render()
 
-            if d or step_count >= 3000:
+            if d or step_count >= eval_max_steps_per_episode:
                 ep_times.append(time.time() - last_time)
                 last_time = time.time()
 
@@ -540,6 +631,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_ep_in_one_env", type=int, default=1, help="Episodes per environment seed.")
     parser.add_argument("--total_env_num", type=int, default=50, help="Number of environment seeds.")
     parser.add_argument(
+        "--eval_max_steps_per_episode",
+        type=int,
+        default=3000,
+        help="Maximum steps per episode before forcing evaluation rollover.",
+    )
+    parser.add_argument(
         "--stochastic",
         action="store_true",
         help="Use stochastic policy during evaluation (default: deterministic).",
@@ -586,6 +683,17 @@ if __name__ == "__main__":
         help="Save an extra per-step Static RSS diagnostics CSV. Final result CSV stays unchanged.",
     )
     parser.add_argument(
+        "--static_rss_dry_run",
+        action="store_true",
+        help="Call and log Static RSS filter decisions, but execute nominal policy actions in env.step.",
+    )
+    parser.add_argument(
+        "--static_rss_debug_print_every",
+        type=int,
+        default=0,
+        help="Print Static RSS debug info every N steps when > 0.",
+    )
+    parser.add_argument(
         "--static_rss_diagnostic_env_id",
         type=int,
         default=-1,
@@ -621,6 +729,9 @@ if __name__ == "__main__":
             static_rss_reverse_steer=args.static_rss_reverse_steer,
             save_static_rss_step_csv=args.static_rss_diagnostics and not args.no_static_rss_step_csv,
             static_rss_diagnostic_env_id=args.static_rss_diagnostic_env_id,
+            static_rss_dry_run=args.static_rss_dry_run,
+            static_rss_debug_print_every=args.static_rss_debug_print_every,
+            eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
         )
 
@@ -645,6 +756,9 @@ if __name__ == "__main__":
             static_rss_reverse_steer=args.static_rss_reverse_steer,
             save_static_rss_step_csv=args.static_rss_diagnostics and not args.no_static_rss_step_csv,
             static_rss_diagnostic_env_id=args.static_rss_diagnostic_env_id,
+            static_rss_dry_run=args.static_rss_dry_run,
+            static_rss_debug_print_every=args.static_rss_debug_print_every,
+            eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
         )
 
@@ -673,6 +787,9 @@ if __name__ == "__main__":
                 static_rss_reverse_steer=args.static_rss_reverse_steer,
                 save_static_rss_step_csv=args.static_rss_diagnostics and not args.no_static_rss_step_csv,
                 static_rss_diagnostic_env_id=args.static_rss_diagnostic_env_id,
+                static_rss_dry_run=args.static_rss_dry_run,
+                static_rss_debug_print_every=args.static_rss_debug_print_every,
+                eval_max_steps_per_episode=args.eval_max_steps_per_episode,
                 eval_env_start=args.eval_start_seed,
             )
             if ret is not None:

@@ -69,6 +69,10 @@ class StaticRSSConfig:
     enable_predictive_clearance_guard: bool = True
     enable_bypass: bool = True
     allow_bypass_before_rss_violation: bool = True
+    fallback_to_brake: bool = False
+    enable_recovery_mode: bool = True
+    recovery_margin_improvement: float = 0.05
+    recovery_allow_equal_margin: bool = True
     enforce_intervention_margin: bool = False
     intervention_margin_threshold: float = 0.0
     metadrive_steer_sign: float = 1.0
@@ -613,11 +617,20 @@ class StaticRSSFilter:
         fallback = self._clip_action([self.config.min_acc, 0.0])
 
         if not safe_candidates:
-            return fallback, {
-                "mode": "fallback_stop",
-                "action": fallback,
+            if self.config.fallback_to_brake:
+                return fallback, {
+                    "mode": "fallback_stop",
+                    "action": fallback,
+                    "selected_score": None,
+                    "projection_debug": {"reason": "no_safe_candidate"},
+                }
+            nominal = self._clip_action(u_original)
+            return nominal, {
+                "mode": "fallback_no_safe_candidate",
+                "action": nominal,
                 "selected_score": None,
-                "projection_debug": {"reason": "no_safe_candidate"},
+                "reason": "no_safe_candidate_keep_nominal",
+                "projection_debug": {"reason": "no_safe_candidate_keep_nominal"},
             }
 
         stop_candidates = [candidate for candidate in safe_candidates if candidate.mode == "stop"]
@@ -712,6 +725,9 @@ class StaticRSSFilter:
         objects = self._collect_metadrive_objects(raw_env)
         static_obstacles = []
         vehicles = []
+        ignored_count = 0
+        ignored_types: Dict[str, int] = {}
+        static_object_types = {"traffic_object", "obstacle", "cone", "barrier", "static_obstacle"}
 
         for obj in objects:
             if obj is vehicle:
@@ -729,10 +745,17 @@ class StaticRSSFilter:
             else:
                 parsed["relative_lane"] = 0
 
-            if parsed.get("object_type") != "vehicle" or parsed.get("speed", 0.0) <= self.config.metadrive_static_speed_threshold:
+            object_type = str(parsed.get("object_type", "unknown")).lower()
+            if object_type == "vehicle":
+                if parsed.get("speed", 0.0) <= self.config.metadrive_static_speed_threshold:
+                    static_obstacles.append(parsed)
+                else:
+                    vehicles.append(parsed)
+            elif object_type in static_object_types:
                 static_obstacles.append(parsed)
             else:
-                vehicles.append(parsed)
+                ignored_count += 1
+                ignored_types[object_type] = ignored_types.get(object_type, 0) + 1
 
         return {
             "ego": ego,
@@ -744,6 +767,8 @@ class StaticRSSFilter:
                 "raw_object_count": len(objects),
                 "static_count": len(static_obstacles),
                 "vehicle_count": len(vehicles),
+                "ignored_count": ignored_count,
+                "ignored_types": ignored_types,
             },
         }
 
@@ -818,32 +843,74 @@ class StaticRSSFilter:
     def _check_stop_horizon(
         self, state: State, obstacle: Dict[str, Any], action: Sequence[float]
     ) -> Tuple[bool, Dict[str, float]]:
-        min_margin = self._stop_margin(state, obstacle)
-        rollout_state = state
-        for _ in range(self.config.horizon_steps):
-            rollout_state = self._simulate_next_state(rollout_state, action)
-            min_margin = min(min_margin, self._stop_margin(rollout_state, obstacle))
-        return min_margin >= -self.config.small_tolerance, {"h_stop_min": min_margin}
+        return self._check_margin_horizon(
+            state=state,
+            action=action,
+            margin_fn=lambda rollout_state: self._stop_margin(rollout_state, obstacle),
+            min_margin_key="h_stop_min",
+        )
 
     def _check_dynamic_front_horizon(
         self, state: State, vehicle: Dict[str, Any], action: Sequence[float]
     ) -> Tuple[bool, Dict[str, float]]:
-        min_margin = self._dynamic_front_margin(state, vehicle)
-        rollout_state = state
-        for _ in range(self.config.horizon_steps):
-            rollout_state = self._simulate_next_state(rollout_state, action)
-            min_margin = min(min_margin, self._dynamic_front_margin(rollout_state, vehicle))
-        return min_margin >= -self.config.small_tolerance, {"dynamic_front_margin_min": min_margin}
+        return self._check_margin_horizon(
+            state=state,
+            action=action,
+            margin_fn=lambda rollout_state: self._dynamic_front_margin(rollout_state, vehicle),
+            min_margin_key="dynamic_front_margin_min",
+        )
 
     def _check_clearance_horizon(
         self, state: State, obj: Dict[str, Any], action: Sequence[float]
     ) -> Tuple[bool, Dict[str, float]]:
-        min_margin = self._obstacle_clearance_margin(state, obj)
+        return self._check_margin_horizon(
+            state=state,
+            action=action,
+            margin_fn=lambda rollout_state: self._obstacle_clearance_margin(rollout_state, obj),
+            min_margin_key="clearance_margin_min",
+        )
+
+    def _check_margin_horizon(
+        self,
+        state: State,
+        action: Sequence[float],
+        margin_fn: Any,
+        min_margin_key: str,
+    ) -> Tuple[bool, Dict[str, float]]:
+        current_margin = margin_fn(state)
+        final_margin = current_margin
+        min_margin = current_margin
         rollout_state = state
+
         for _ in range(self.config.horizon_steps):
             rollout_state = self._simulate_next_state(rollout_state, action)
-            min_margin = min(min_margin, self._obstacle_clearance_margin(rollout_state, obj))
-        return min_margin >= -self.config.small_tolerance, {"clearance_margin_min": min_margin}
+            final_margin = margin_fn(rollout_state)
+            min_margin = min(min_margin, final_margin)
+
+        margin_improvement = final_margin - current_margin
+        recovery_mode_used = False
+        safe = min_margin >= -self.config.small_tolerance
+
+        if (
+            not safe
+            and self.config.enable_recovery_mode
+            and current_margin < -self.config.small_tolerance
+            and self._clip_action(action)[0] <= self.config.small_tolerance
+        ):
+            improves_enough = margin_improvement >= self.config.recovery_margin_improvement
+            holds_margin = self.config.recovery_allow_equal_margin and final_margin >= current_margin
+            recovery_mode_used = improves_enough or holds_margin
+            safe = recovery_mode_used
+
+        margins = {
+            min_margin_key: min_margin,
+            "current_margin": current_margin,
+            "final_margin": final_margin,
+            "min_margin": min_margin,
+            "margin_improvement": margin_improvement,
+            "recovery_mode_used": recovery_mode_used,
+        }
+        return safe, margins
 
     def _stop_margin(self, state: State, obstacle: Dict[str, Any]) -> float:
         d_obs = self._distance_to_obstacle_front(state, obstacle)
@@ -886,6 +953,7 @@ class StaticRSSFilter:
             "d_front": d_front,
             "d_dynamic": d_dynamic,
             "rss_margin": dynamic_margin,
+            "reason": selected_info.get("reason", ""),
             "left_feasible": False,
             "right_feasible": False,
             "state_debug": self._state_debug(state),
@@ -925,6 +993,7 @@ class StaticRSSFilter:
             "clearance_margin": clearance_info.get("clearance_margin"),
             "risk_step": clearance_info.get("risk_step"),
             "rss_margin": clearance_info.get("clearance_margin"),
+            "reason": selected_info.get("reason", ""),
             "left_feasible": False,
             "right_feasible": False,
             "state_debug": self._state_debug(state),
@@ -1030,6 +1099,8 @@ class StaticRSSFilter:
             "object_type": obj.get("object_type", ""),
             "class_name": obj.get("class_name", ""),
             "object_id": obj.get("object_id", ""),
+            "x": obj.get("x", float("nan")),
+            "y": obj.get("y", float("nan")),
             "speed": obj.get("speed", float("nan")),
             "relative_lane": obj.get("relative_lane", ""),
             "longitudinal": longitudinal,
@@ -1342,16 +1413,67 @@ class StaticRSSFilter:
         parsed = self._metadrive_vehicle_to_dict(obj, default_speed=default_speed)
         class_name = type(obj).__name__
         has_vehicle_dynamics = hasattr(obj, "speed") or hasattr(obj, "before_step") or hasattr(obj, "set_velocity")
+        object_type = self._metadrive_object_type(obj, class_name, has_vehicle_dynamics)
         parsed.update(
             {
-                "object_type": "vehicle" if has_vehicle_dynamics else "object",
+                "object_type": object_type,
                 "class_name": class_name,
                 "object_id": self._resolve_attr(obj, "id", self._resolve_attr(obj, "name", "")),
             }
         )
-        if not has_vehicle_dynamics:
+        if object_type != "vehicle":
             parsed["speed"] = 0.0
         return parsed
+
+    def _metadrive_object_type(self, obj: Any, class_name: str, has_vehicle_dynamics: bool) -> str:
+        raw_type = self._resolve_attr(obj, "object_type", None)
+        if raw_type is None:
+            raw_type = self._resolve_attr(obj, "type", None)
+        if raw_type is None:
+            raw_type = self._resolve_attr(obj, "TYPE", None)
+
+        normalized = self._normalize_object_type(raw_type)
+        known_types = {"vehicle", "traffic_object", "obstacle", "cone", "barrier", "static_obstacle"}
+        if normalized in known_types:
+            return normalized
+        if normalized:
+            return normalized
+        if has_vehicle_dynamics:
+            return "vehicle"
+
+        lowered_class = str(class_name).lower()
+        if "vehicle" in lowered_class or "trafficparticipant" in lowered_class:
+            return "vehicle"
+        if "cone" in lowered_class:
+            return "cone"
+        if "barrier" in lowered_class:
+            return "barrier"
+        if "trafficobject" in lowered_class or "traffic_object" in lowered_class:
+            return "traffic_object"
+        if "staticobstacle" in lowered_class or "static_obstacle" in lowered_class:
+            return "static_obstacle"
+        if "obstacle" in lowered_class:
+            return "obstacle"
+        return normalized or "unknown"
+
+    def _normalize_object_type(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = getattr(value, "name", value)
+        text = str(value).strip().lower()
+        text = text.replace("-", "_").replace(" ", "_")
+        if "." in text:
+            text = text.rsplit(".", 1)[-1]
+        aliases = {
+            "trafficobject": "traffic_object",
+            "traffic_cone": "cone",
+            "trafficcone": "cone",
+            "staticobject": "static_obstacle",
+            "static_object": "static_obstacle",
+            "vehicleobject": "vehicle",
+        }
+        return aliases.get(text, text)
 
     def _metadrive_lane_id(self, vehicle: Any) -> Optional[Any]:
         navigation = self._resolve_attr(vehicle, "navigation", None)
