@@ -31,7 +31,7 @@ from ppl.experiments.metadrive.driving_env import DrivingEnv
 from ppl.ppl import PPL
 from ppl.sb3.td3.policies import TD3Policy
 from ppl.utils.print_dict_utils import pretty_print, RecorderEnv
-from ppl.utils.static_rss_filter import StaticRSSConfig, StaticRSSFilter
+from ppl.utils.rss_cbf_filter import RSSCBFConfig, RSSCBFFilter
 
 EVAL_ENV_START = 1000  # Evaluation seeds start from 1000
 
@@ -87,7 +87,7 @@ def reset_eval_env(env, seed):
             raise force_seed_error
 
 
-def make_static_rss_step_record(
+def make_rss_cbf_step_record(
     ckpt_index,
     env_id,
     episode,
@@ -100,95 +100,45 @@ def make_static_rss_step_record(
     rss_info,
     env_info=None,
 ):
-    """Flatten one StaticRSSFilter decision for step-level CSV logging."""
+    """Flatten one RSS-CBF runtime assurance decision for step-level CSV logging."""
     env_info = env_info or {}
-    selected = rss_info.get("selected", {}) if isinstance(rss_info, dict) else {}
-    state_debug = rss_info.get("state_debug", {}) if isinstance(rss_info, dict) else {}
-    nearest = state_debug.get("nearest_object", {}) if isinstance(state_debug, dict) else {}
-    adapter_debug = state_debug.get("adapter_debug", {}) if isinstance(state_debug, dict) else {}
-    blocking = rss_info.get("blocking_object", {}) if isinstance(rss_info, dict) else {}
-    candidates = rss_info.get("candidates", []) if isinstance(rss_info, dict) else []
-    if not isinstance(candidates, list):
-        candidates = []
-
-    def candidate_by_mode(mode):
-        for candidate in candidates:
-            if isinstance(candidate, dict) and candidate.get("mode") == mode:
-                return candidate
-        return {}
-
-    def candidate_safe(candidate):
-        if not candidate:
-            return ""
-        return candidate.get("safe", "")
-
-    def candidate_projection_failed(candidate):
-        if not candidate:
-            return ""
-        projection_debug = candidate.get("projection_debug", {})
-        if not isinstance(projection_debug, dict):
-            return ""
-        return projection_debug.get("projection_failed", "")
-
-    def candidate_margin(candidate, name):
-        if not candidate:
-            return np.nan
-        margins = candidate.get("margins", {})
-        if not isinstance(margins, dict):
-            return np.nan
-        return margins.get(name, np.nan)
-
-    action_delta = float(np.linalg.norm(np.asarray(env_action_safe) - np.asarray(env_action_nominal)))
-    record = dict(
+    rss_info = rss_info or {}
+    action_delta = float(
+        rss_info.get(
+            "action_delta",
+            np.linalg.norm(np.asarray(internal_action_safe) - np.asarray(internal_action_nominal)),
+        )
+    )
+    return dict(
         ckpt_index=ckpt_index,
+        method="ppl_rss_cbf",
         env_id=env_id,
         episode=episode,
         episode_in_env=episode_in_env,
-        step_in_episode=step_in_episode,
+        step=step_in_episode,
         mode=rss_info.get("mode", "unknown"),
-        filter_applied=action_delta > 1e-6 and rss_info.get("mode", "normal") != "adapter_error",
-        obstacle_detected=rss_info.get("obstacle_detected", False),
+        reason=rss_info.get("reason", ""),
+        rss_margin=rss_info.get("rss_margin", np.nan),
         dynamic_vehicle_detected=rss_info.get("dynamic_vehicle_detected", False),
+        action_delta=action_delta,
+        acc_nominal=rss_info.get("acc_nominal", np.nan),
+        acc_safe=rss_info.get("acc_safe", np.nan),
+        acc_delta=rss_info.get("acc_delta", np.nan),
+        steer_nominal=rss_info.get("steer_nominal", np.nan),
+        steer_safe=rss_info.get("steer_safe", np.nan),
+        steer_delta=rss_info.get("steer_delta", np.nan),
         step_cost=env_info.get("cost", np.nan),
-        total_cost=env_info.get("total_cost", np.nan),
+        cumulative_cost=env_info.get("total_cost", np.nan),
         crash=env_info.get("crash", False),
         crash_vehicle=env_info.get("crash_vehicle", False),
         crash_object=env_info.get("crash_object", False),
-        crash_sidewalk=env_info.get("crash_sidewalk", False),
         out_of_road=env_info.get("out_of_road", False),
         route_completion=env_info.get("route_completion", np.nan),
         velocity=env_info.get("velocity", np.nan),
-        step_reward=env_info.get("step_reward", np.nan),
-        d_obs=rss_info.get("d_obs", np.nan),
-        d_brake=rss_info.get("d_brake", np.nan),
+        filter_applied=action_delta > 1e-6,
+        object_kind=rss_info.get("object_kind", ""),
         d_front=rss_info.get("d_front", np.nan),
-        d_dynamic=rss_info.get("d_dynamic", np.nan),
-        clearance_margin=rss_info.get("clearance_margin", np.nan),
-        risk_step=rss_info.get("risk_step", np.nan),
-        rss_margin=rss_info.get("rss_margin", np.nan),
-        left_feasible=rss_info.get("left_feasible", False),
-        right_feasible=rss_info.get("right_feasible", False),
-        num_static_obstacles=state_debug.get("num_static_obstacles", np.nan),
-        num_dynamic_vehicles=state_debug.get("num_dynamic_vehicles", np.nan),
-        lidar_fallback_used=adapter_debug.get("observation_lidar_fallback_used", False),
-        lidar_fallback_distance=adapter_debug.get("observation_lidar_distance", np.nan),
-        lidar_fallback_source=adapter_debug.get("observation_lidar_source", ""),
-        nearest_object_type=nearest.get("object_type", ""),
-        nearest_object_class=nearest.get("class_name", ""),
-        nearest_object_distance=nearest.get("distance", np.nan),
-        nearest_object_longitudinal=nearest.get("longitudinal", np.nan),
-        nearest_object_lateral=nearest.get("lateral", np.nan),
-        nearest_object_speed=nearest.get("speed", np.nan),
-        blocking_object_type=blocking.get("object_type", ""),
-        blocking_object_class=blocking.get("class_name", ""),
-        blocking_object_distance=blocking.get("distance", np.nan),
-        blocking_object_longitudinal=blocking.get("longitudinal", np.nan),
-        blocking_object_lateral=blocking.get("lateral", np.nan),
-        blocking_object_speed=blocking.get("speed", np.nan),
-        selected_score=rss_info.get("selected_score", np.nan),
-        selected_progress_score=selected.get("progress_score", np.nan),
-        selected_intervention_cost=selected.get("intervention_cost", np.nan),
-        action_delta=action_delta,
+        rss_distance=rss_info.get("rss_distance", np.nan),
         env_action_nominal_steer=float(env_action_nominal[0]),
         env_action_nominal_throttle_brake=float(env_action_nominal[1]),
         env_action_safe_steer=float(env_action_safe[0]),
@@ -197,85 +147,36 @@ def make_static_rss_step_record(
         internal_action_nominal_steer=float(internal_action_nominal[1]),
         internal_action_safe_acc=float(internal_action_safe[0]),
         internal_action_safe_steer=float(internal_action_safe[1]),
-        acc_nominal=rss_info.get("acc_nominal", np.nan),
-        acc_safe=rss_info.get("acc_safe", np.nan),
-        acc_delta=rss_info.get("acc_delta", np.nan),
-        steer_nominal=rss_info.get("steer_nominal", np.nan),
-        steer_safe=rss_info.get("steer_safe", np.nan),
-        steer_delta=rss_info.get("steer_delta", np.nan),
         adapter_error=rss_info.get("adapter_error", ""),
     )
 
-    if rss_info.get("mode") == "fallback_no_safe_candidate":
-        stop_candidate = candidate_by_mode("stop")
-        left_candidate = candidate_by_mode("left_bypass")
-        right_candidate = candidate_by_mode("right_bypass")
-        record.update(
-            reason=rss_info.get("reason", ""),
-            blocking_object_type=blocking.get("object_type", ""),
-            blocking_object_x=blocking.get("x", np.nan),
-            blocking_object_y=blocking.get("y", np.nan),
-            blocking_object_longitudinal=blocking.get("longitudinal", np.nan),
-            blocking_object_lateral=blocking.get("lateral", np.nan),
-            d_obs=rss_info.get("d_obs", np.nan),
-            d_brake=rss_info.get("d_brake", np.nan),
-            rss_margin=rss_info.get("rss_margin", np.nan),
-            left_feasible=rss_info.get("left_feasible", ""),
-            right_feasible=rss_info.get("right_feasible", ""),
-            candidate_count=len(candidates),
-            safe_candidate_count=sum(
-                1 for candidate in candidates if isinstance(candidate, dict) and candidate.get("safe") is True
-            ),
-            stop_candidate_safe=candidate_safe(stop_candidate),
-            stop_h_stop_min=candidate_margin(stop_candidate, "h_stop_min"),
-            stop_projection_failed=candidate_projection_failed(stop_candidate),
-            left_candidate_safe=candidate_safe(left_candidate),
-            left_projection_failed=candidate_projection_failed(left_candidate),
-            right_candidate_safe=candidate_safe(right_candidate),
-            right_projection_failed=candidate_projection_failed(right_candidate),
-        )
 
-    return record
-
-
-def summarize_static_rss_episode(step_records):
-    """Create episode-level StaticRSSFilter statistics for the main eval CSV."""
+def summarize_rss_cbf_steps(step_records):
+    """Create checkpoint-level RSS-CBF diagnostics for console output."""
     if not step_records:
         return dict(
-            static_rss_steps=0,
-            static_rss_intervention_steps=0,
-            static_rss_intervention_rate=0.0,
-            static_rss_obstacle_steps=0,
-            static_rss_stop_steps=0,
-            static_rss_left_bypass_steps=0,
-            static_rss_right_bypass_steps=0,
-            static_rss_adapter_error_steps=0,
-            static_rss_mean_d_obs=np.nan,
-            static_rss_mean_d_brake=np.nan,
-            static_rss_mean_rss_margin=np.nan,
+            total_steps=0,
+            changed_actions=0,
+            changed_rate=0.0,
+            modes={},
+            cost_by_mode={},
         )
 
     modes = [record["mode"] for record in step_records]
-    obstacle_steps = sum(1 for record in step_records if record["obstacle_detected"])
-    intervention_steps = sum(1 for record in step_records if record["filter_applied"])
-    adapter_error_steps = sum(1 for mode in modes if mode == "adapter_error")
-
-    def _mean_valid(key):
-        values = [record[key] for record in step_records if pd.notna(record[key])]
-        return float(np.mean(values)) if values else np.nan
-
+    mode_counts = {mode: modes.count(mode) for mode in sorted(set(modes))}
+    changed_actions = sum(1 for record in step_records if record.get("filter_applied", False))
+    cost_by_mode = {}
+    for record in step_records:
+        cost = record.get("step_cost", np.nan)
+        if pd.notna(cost):
+            mode = record.get("mode", "unknown")
+            cost_by_mode[mode] = cost_by_mode.get(mode, 0.0) + float(cost)
     return dict(
-        static_rss_steps=len(step_records),
-        static_rss_intervention_steps=intervention_steps,
-        static_rss_intervention_rate=intervention_steps / max(len(step_records), 1),
-        static_rss_obstacle_steps=obstacle_steps,
-        static_rss_stop_steps=modes.count("stop"),
-        static_rss_left_bypass_steps=modes.count("left_bypass"),
-        static_rss_right_bypass_steps=modes.count("right_bypass"),
-        static_rss_adapter_error_steps=adapter_error_steps,
-        static_rss_mean_d_obs=_mean_valid("d_obs"),
-        static_rss_mean_d_brake=_mean_valid("d_brake"),
-        static_rss_mean_rss_margin=_mean_valid("rss_margin"),
+        total_steps=len(step_records),
+        changed_actions=changed_actions,
+        changed_rate=changed_actions / max(len(step_records), 1),
+        modes=mode_counts,
+        cost_by_mode=cost_by_mode,
     )
 
 
@@ -287,17 +188,8 @@ def evaluate_ppl_once(
     num_ep_in_one_env=5,
     total_env_num=50,
     deterministic=True,
-    use_static_rss_filter=False,
-    static_rss_assume_adjacent_lanes=False,
-    static_rss_static_speed_threshold=0.2,
-    static_rss_enable_bypass=False,
-    static_rss_intervention_margin=0.0,
-    static_rss_reverse_steer=False,
-    save_static_rss_step_csv=False,
-    static_rss_diagnostic_env_id=-1,
-    static_rss_dry_run=False,
-    static_rss_disable_clearance_guard=False,
-    static_rss_debug_print_every=0,
+    rss_cbf=False,
+    rss_cbf_diagnostics=False,
     eval_max_steps_per_episode=3000,
     eval_env_start=EVAL_ENV_START,
 ):
@@ -342,34 +234,20 @@ def evaluate_ppl_once(
         env.close()
         return None
 
+    method = "ppl_rss_cbf" if rss_cbf else "ppl"
     rss_filter = None
-    if use_static_rss_filter:
-        rss_filter = StaticRSSFilter(
-            StaticRSSConfig(
-                metadrive_assume_adjacent_lanes=static_rss_assume_adjacent_lanes,
-                metadrive_static_speed_threshold=static_rss_static_speed_threshold,
-                enable_bypass=static_rss_enable_bypass,
-                enforce_intervention_margin=True,
-                intervention_margin_threshold=static_rss_intervention_margin,
-                metadrive_steer_sign=-1.0 if static_rss_reverse_steer else 1.0,
-                enable_predictive_clearance_guard=not static_rss_disable_clearance_guard,
-            )
-        )
-        print("[StaticRSSFilter] Enabled. Final evaluation CSV format is unchanged.")
-        if static_rss_dry_run:
-            print("[StaticRSSFilter] Dry-run mode: filter decisions are logged but nominal actions are executed.")
+    save_rss_cbf_step_csv = bool(rss_cbf or rss_cbf_diagnostics)
+    if rss_cbf:
+        rss_filter = RSSCBFFilter(RSSCBFConfig())
+        print("[RSS-CBF] Runtime assurance enabled. Step diagnostics will be saved.")
 
     saved_results = []
-    static_rss_step_records = []
-    episode_static_rss_records = []
+    rss_cbf_step_records = []
     ep_velocities = []
     rss_adapter_error_printed = False
     rss_total_steps = 0
     rss_changed_steps = 0
     rss_mode_counts = {}
-    rss_static_count_sum = 0
-    rss_dynamic_count_sum = 0
-    rss_lidar_fallback_steps = 0
 
     try:
         start = time.time()
@@ -388,79 +266,52 @@ def evaluate_ppl_once(
             env_action_safe = env_action_nominal.copy()
             internal_action_nominal = [np.nan, np.nan]
             internal_action_safe = [np.nan, np.nan]
-            rss_info = {"mode": "normal", "obstacle_detected": False}
+            rss_info = None
 
             if rss_filter is not None:
                 try:
                     rss_state = rss_filter.parse_state_from_metadrive(env)
                     rss_state = rss_filter.augment_state_from_observation(rss_state, o)
-                    rss_static_count_sum += len(rss_state.get("static_obstacles", []))
-                    rss_dynamic_count_sum += len(rss_state.get("vehicles", []))
-                    if rss_state.get("adapter_debug", {}).get("observation_lidar_fallback_used", False):
-                        rss_lidar_fallback_steps += 1
                     internal_action_nominal = rss_filter.to_internal_action(env_action_nominal, "metadrive")
                     internal_action_safe, rss_info = rss_filter.filter_action(rss_state, internal_action_nominal)
                     env_action_safe = np.asarray(
                         rss_filter.from_internal_action(internal_action_safe, "metadrive"),
                         dtype=np.float32,
                     )
-                    if static_rss_dry_run:
-                        action = env_action_nominal
-                    else:
-                        action = env_action_safe
+                    action = env_action_safe
                 except Exception as error:
                     traceback.print_exc()
+                    internal_action_nominal = rss_filter.to_internal_action(env_action_nominal, "metadrive")
+                    internal_action_safe = internal_action_nominal
                     rss_info = {
-                        "mode": "adapter_error",
-                        "obstacle_detected": False,
+                        "mode": "fallback_no_safe_candidate",
+                        "reason": "adapter_error: {}".format(error),
+                        "dynamic_vehicle_detected": False,
+                        "rss_margin": np.nan,
+                        "action_delta": 0.0,
+                        "acc_nominal": internal_action_nominal[0],
+                        "acc_safe": internal_action_safe[0],
+                        "acc_delta": 0.0,
+                        "steer_nominal": internal_action_nominal[1],
+                        "steer_safe": internal_action_safe[1],
+                        "steer_delta": 0.0,
                         "adapter_error": str(error),
                     }
                     if not rss_adapter_error_printed:
-                        print("[StaticRSSFilter] Adapter failed once; continuing without filtering. Error: {}".format(error))
+                        print("[RSS-CBF] Adapter failed once; continuing without filtering. Error: {}".format(error))
                         rss_adapter_error_printed = True
 
                 rss_total_steps += 1
                 rss_mode = rss_info.get("mode", "unknown")
                 rss_mode_counts[rss_mode] = rss_mode_counts.get(rss_mode, 0) + 1
-                if np.linalg.norm(env_action_safe - env_action_nominal) > 1e-6 and rss_mode != "adapter_error":
+                if np.linalg.norm(env_action_safe - env_action_nominal) > 1e-6:
                     rss_changed_steps += 1
-
-            if rss_filter is not None and static_rss_debug_print_every > 0:
-                next_step_count = step_count + 1
-                if next_step_count % static_rss_debug_print_every == 0:
-                    action_delta = float(np.linalg.norm(env_action_safe - env_action_nominal))
-                    print("[RSS DEBUG] step={}".format(next_step_count))
-                    print("mode={}".format(rss_info.get("mode")))
-                    print("reason={}".format(rss_info.get("reason", "")))
-                    print("obstacle_detected={}".format(rss_info.get("obstacle_detected")))
-                    print("dynamic_vehicle_detected={}".format(rss_info.get("dynamic_vehicle_detected")))
-                    print("d_obs={}".format(rss_info.get("d_obs")))
-                    print("d_brake={}".format(rss_info.get("d_brake")))
-                    print("rss_margin={}".format(rss_info.get("rss_margin")))
-                    print("d_dynamic={}".format(rss_info.get("d_dynamic")))
-                    print("clearance_margin={}".format(rss_info.get("clearance_margin")))
-                    print("risk_step={}".format(rss_info.get("risk_step")))
-                    print("left_feasible={}".format(rss_info.get("left_feasible")))
-                    print("right_feasible={}".format(rss_info.get("right_feasible")))
-                    print("env_action_nominal={}".format(env_action_nominal))
-                    print("env_action_safe={}".format(env_action_safe))
-                    print("action_delta={}".format(action_delta))
-                    print("acc_nominal={}".format(rss_info.get("acc_nominal")))
-                    print("acc_safe={}".format(rss_info.get("acc_safe")))
-                    print("acc_delta={}".format(rss_info.get("acc_delta")))
-                    print("steer_nominal={}".format(rss_info.get("steer_nominal")))
-                    print("steer_safe={}".format(rss_info.get("steer_safe")))
-                    print("steer_delta={}".format(rss_info.get("steer_delta")))
 
             o, r, d, info = env.step(action)
             step_count += 1
 
-            if (
-                rss_filter is not None
-                and save_static_rss_step_csv
-                and (static_rss_diagnostic_env_id < 0 or eval_env_start + env_index == static_rss_diagnostic_env_id)
-            ):
-                record = make_static_rss_step_record(
+            if rss_filter is not None and save_rss_cbf_step_csv:
+                record = make_rss_cbf_step_record(
                     ckpt_index=ckpt_index,
                     env_id=eval_env_start + env_index,
                     episode=ep_count + 1,
@@ -473,8 +324,7 @@ def evaluate_ppl_once(
                     rss_info=rss_info,
                     env_info=info,
                 )
-                static_rss_step_records.append(record)
-                episode_static_rss_records.append(record)
+                rss_cbf_step_records.append(record)
 
             if info:
                 ep_velocities.append(info.get("velocity", 0))
@@ -503,12 +353,12 @@ def evaluate_ppl_once(
                     velocity_step_mean=np.mean(ep_velocities) if ep_velocities else 0,
                 ))
                 ep_velocities = []
-                episode_static_rss_records = []
 
                 res["episode"] = ep_count
                 res["ckpt_index"] = ckpt_index
                 res["env_id"] = env_id_recorded
                 res["num_ep_in_one_env"] = num_ep_in_recorded
+                res["method"] = method
 
                 saved_results.append(res)
                 df = pd.DataFrame(saved_results)
@@ -525,9 +375,9 @@ def evaluate_ppl_once(
                 # Backup CSV
                 tmp_path = osp.join(folder_name, "{}_tmp.csv".format(ckpt_name))
                 df.to_csv(tmp_path)
-                if rss_filter is not None and save_static_rss_step_csv and static_rss_step_records:
-                    tmp_step_path = osp.join(folder_name, "{}_static_rss_steps_tmp.csv".format(ckpt_name))
-                    pd.DataFrame(static_rss_step_records).to_csv(tmp_step_path, index=False)
+                if rss_filter is not None and save_rss_cbf_step_csv and rss_cbf_step_records:
+                    tmp_step_path = osp.join(folder_name, "{}_rss_cbf_steps_tmp.csv".format(ckpt_name))
+                    pd.DataFrame(rss_cbf_step_records).to_csv(tmp_step_path, index=False)
 
                 step_count = 0
 
@@ -546,7 +396,8 @@ def evaluate_ppl_once(
         env.close()
 
     df = pd.DataFrame(saved_results)
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not df.empty:
+        df["method"] = method
 
     # Compute key rates
     success_rate = df["success"].mean() * 100 if "success" in df.columns else 0
@@ -576,25 +427,22 @@ def evaluate_ppl_once(
     df.to_csv(final_path)
     print("Final results saved to: {}".format(final_path))
 
-    if rss_filter is not None and save_static_rss_step_csv:
-        step_path = osp.join(folder_name, "{}_static_rss_steps.csv".format(ckpt_name))
-        pd.DataFrame(static_rss_step_records).to_csv(step_path, index=False)
-        print("Static RSS step-level results saved to: {}".format(step_path))
+    if rss_filter is not None and save_rss_cbf_step_csv:
+        step_path = osp.join(folder_name, "{}_rss_cbf_steps.csv".format(ckpt_name))
+        pd.DataFrame(rss_cbf_step_records).to_csv(step_path, index=False)
+        print("RSS-CBF step-level results saved to: {}".format(step_path))
 
     if rss_filter is not None:
+        rss_summary = summarize_rss_cbf_steps(rss_cbf_step_records)
         changed_rate = rss_changed_steps / max(rss_total_steps, 1)
-        avg_static = rss_static_count_sum / max(rss_total_steps, 1)
-        avg_dynamic = rss_dynamic_count_sum / max(rss_total_steps, 1)
         print(
-            "[StaticRSSFilter] total_steps={} changed_actions={} changed_rate={:.4f} "
-            "avg_static_objects={:.2f} avg_dynamic_vehicles={:.2f} lidar_fallback_steps={} modes={}".format(
+            "[RSS-CBF] total_steps={} changed_actions={} changed_rate={:.4f} "
+            "modes={} cost_by_mode={}".format(
                 rss_total_steps,
                 rss_changed_steps,
                 changed_rate,
-                avg_static,
-                avg_dynamic,
-                rss_lidar_fallback_steps,
-                rss_mode_counts,
+                rss_summary["modes"] if rss_cbf_step_records else rss_mode_counts,
+                rss_summary["cost_by_mode"],
             )
         )
 
@@ -656,72 +504,14 @@ if __name__ == "__main__":
         help="Use stochastic policy during evaluation (default: deterministic).",
     )
     parser.add_argument(
-        "--static_rss_filter",
+        "--rss_cbf",
         action="store_true",
-        help="Enable Progress-Aware RSS Action Projection before env.step(action).",
+        help="Enable RSS-CBF runtime assurance safety filter.",
     )
     parser.add_argument(
-        "--static_rss_assume_adjacent_lanes",
+        "--rss_cbf_diagnostics",
         action="store_true",
-        help=(
-            "If MetaDrive lane introspection cannot find side lanes, still expose "
-            "default-width left/right lanes to the filter. Use only for controlled "
-            "static-obstacle experiments."
-        ),
-    )
-    parser.add_argument(
-        "--static_rss_static_speed_threshold",
-        type=float,
-        default=0.2,
-        help="Objects at or below this speed are treated as static obstacles by the MetaDrive adapter.",
-    )
-    parser.add_argument(
-        "--static_rss_enable_bypass",
-        action="store_true",
-        help="Allow certified left/right bypass candidates. Default Static RSS filtering is stop-only.",
-    )
-    parser.add_argument(
-        "--static_rss_intervention_margin",
-        type=float,
-        default=0.0,
-        help="Only filter when d_obs - d_brake is at or below this margin.",
-    )
-    parser.add_argument(
-        "--static_rss_reverse_steer",
-        action="store_true",
-        help="Flip MetaDrive steering sign if bypass direction is opposite in the installed environment.",
-    )
-    parser.add_argument(
-        "--static_rss_diagnostics",
-        action="store_true",
-        help="Save an extra per-step Static RSS diagnostics CSV. Final result CSV stays unchanged.",
-    )
-    parser.add_argument(
-        "--static_rss_dry_run",
-        action="store_true",
-        help="Call and log Static RSS filter decisions, but execute nominal policy actions in env.step.",
-    )
-    parser.add_argument(
-        "--static_rss_disable_clearance_guard",
-        action="store_true",
-        help="Disable predictive clearance guard in StaticRSSFilter.",
-    )
-    parser.add_argument(
-        "--static_rss_debug_print_every",
-        type=int,
-        default=0,
-        help="Print Static RSS debug info every N steps when > 0.",
-    )
-    parser.add_argument(
-        "--static_rss_diagnostic_env_id",
-        type=int,
-        default=-1,
-        help="Only record Static RSS step diagnostics for this env_id. Use -1 to record all envs.",
-    )
-    parser.add_argument(
-        "--no_static_rss_step_csv",
-        action="store_true",
-        help="When diagnostics are enabled, do not save the extra per-step Static RSS CSV.",
+        help="Save RSS-CBF step-level diagnostics. Enabled automatically by --rss_cbf.",
     )
 
     args = parser.parse_args()
@@ -740,17 +530,8 @@ if __name__ == "__main__":
             num_ep_in_one_env=args.num_ep_in_one_env,
             total_env_num=args.total_env_num,
             deterministic=deterministic,
-            use_static_rss_filter=args.static_rss_filter,
-            static_rss_assume_adjacent_lanes=args.static_rss_assume_adjacent_lanes,
-            static_rss_static_speed_threshold=args.static_rss_static_speed_threshold,
-            static_rss_enable_bypass=args.static_rss_enable_bypass,
-            static_rss_intervention_margin=args.static_rss_intervention_margin,
-            static_rss_reverse_steer=args.static_rss_reverse_steer,
-            save_static_rss_step_csv=args.static_rss_diagnostics and not args.no_static_rss_step_csv,
-            static_rss_diagnostic_env_id=args.static_rss_diagnostic_env_id,
-            static_rss_dry_run=args.static_rss_dry_run,
-            static_rss_disable_clearance_guard=args.static_rss_disable_clearance_guard,
-            static_rss_debug_print_every=args.static_rss_debug_print_every,
+            rss_cbf=args.rss_cbf,
+            rss_cbf_diagnostics=args.rss_cbf_diagnostics,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
         )
@@ -768,17 +549,8 @@ if __name__ == "__main__":
             num_ep_in_one_env=args.num_ep_in_one_env,
             total_env_num=args.total_env_num,
             deterministic=deterministic,
-            use_static_rss_filter=args.static_rss_filter,
-            static_rss_assume_adjacent_lanes=args.static_rss_assume_adjacent_lanes,
-            static_rss_static_speed_threshold=args.static_rss_static_speed_threshold,
-            static_rss_enable_bypass=args.static_rss_enable_bypass,
-            static_rss_intervention_margin=args.static_rss_intervention_margin,
-            static_rss_reverse_steer=args.static_rss_reverse_steer,
-            save_static_rss_step_csv=args.static_rss_diagnostics and not args.no_static_rss_step_csv,
-            static_rss_diagnostic_env_id=args.static_rss_diagnostic_env_id,
-            static_rss_dry_run=args.static_rss_dry_run,
-            static_rss_disable_clearance_guard=args.static_rss_disable_clearance_guard,
-            static_rss_debug_print_every=args.static_rss_debug_print_every,
+            rss_cbf=args.rss_cbf,
+            rss_cbf_diagnostics=args.rss_cbf_diagnostics,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
         )
@@ -800,17 +572,8 @@ if __name__ == "__main__":
                 num_ep_in_one_env=args.num_ep_in_one_env,
                 total_env_num=args.total_env_num,
                 deterministic=deterministic,
-                use_static_rss_filter=args.static_rss_filter,
-                static_rss_assume_adjacent_lanes=args.static_rss_assume_adjacent_lanes,
-                static_rss_static_speed_threshold=args.static_rss_static_speed_threshold,
-                static_rss_enable_bypass=args.static_rss_enable_bypass,
-                static_rss_intervention_margin=args.static_rss_intervention_margin,
-                static_rss_reverse_steer=args.static_rss_reverse_steer,
-                save_static_rss_step_csv=args.static_rss_diagnostics and not args.no_static_rss_step_csv,
-                static_rss_diagnostic_env_id=args.static_rss_diagnostic_env_id,
-                static_rss_dry_run=args.static_rss_dry_run,
-                static_rss_disable_clearance_guard=args.static_rss_disable_clearance_guard,
-                static_rss_debug_print_every=args.static_rss_debug_print_every,
+                rss_cbf=args.rss_cbf,
+                rss_cbf_diagnostics=args.rss_cbf_diagnostics,
                 eval_max_steps_per_episode=args.eval_max_steps_per_episode,
                 eval_env_start=args.eval_start_seed,
             )

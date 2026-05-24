@@ -1,2 +1,0 @@
-ckpt_index,success_rate,crash_rate,crash_count,out_of_road_rate,out_of_road_count,avg_reward,avg_episode_length,avg_velocity,avg_cost,avg_route_completion,num_episodes
-6000,0.68,0.08,4,0.32,16,322.86058865761925,258.8,11.894322943518807,2.86,0.8732140855249848,50

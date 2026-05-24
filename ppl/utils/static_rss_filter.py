@@ -66,7 +66,7 @@ class StaticRSSConfig:
     metadrive_lidar_distance_trigger_ratio: float = 0.35
     metadrive_lidar_proximity_trigger_ratio: float = 0.65
     enable_dynamic_front_vehicle_rss: bool = True
-    enable_predictive_clearance_guard: bool = True
+    enable_predictive_clearance_guard: bool = False
     enable_bypass: bool = True
     allow_bypass_before_rss_violation: bool = True
     fallback_to_brake: bool = False
@@ -422,6 +422,26 @@ class StaticRSSFilter:
             + response_speed ** 2 / (2.0 * cfg.b_min)
             + margin
         )
+
+    def compute_rss_distance(
+        self,
+        speed: float,
+        front_speed: float = 0.0,
+        margin: Optional[float] = None,
+    ) -> float:
+        """Compute the forward RSS safety distance used by runtime assurance."""
+        v = max(0.0, float(speed))
+        cfg = self.config
+        if margin is None:
+            margin = cfg.vehicle_length / 2.0 + cfg.obstacle_margin
+        response_speed = v + cfg.a_max * cfg.rho
+        distance = (
+            v * cfg.rho
+            + 0.5 * cfg.a_max * cfg.rho ** 2
+            + response_speed ** 2 / (2.0 * cfg.b_min)
+            + float(margin)
+        )
+        return max(0.0, distance)
 
     def compute_dynamic_front_distance(self, ego_speed: float, front_speed: float) -> float:
         """Compute RSS front-distance for a moving lead vehicle."""
@@ -843,6 +863,46 @@ class StaticRSSFilter:
         )
         return augmented
 
+    def inject_forced_static_obstacle(
+        self,
+        state: State,
+        distance: float = 30.0,
+        lateral: float = 0.0,
+        length: float = 4.5,
+        width: float = 2.0,
+    ) -> State:
+        """Inject a debug static obstacle at a fixed distance ahead of ego.
+
+        This is a first-iteration verification tool: the obstacle exists only
+        in the RSS filter state, not in the physical simulator. It allows
+        testing stop / bypass mode switching without a real MetaDrive obstacle.
+        """
+        augmented = copy.deepcopy(state)
+        ego = self._ego(augmented)
+        heading = float(ego.get("heading", 0.0))
+        ego_x = float(ego.get("x", 0.0))
+        ego_y = float(ego.get("y", 0.0))
+        obs_x = ego_x + distance * math.cos(heading) - lateral * math.sin(heading)
+        obs_y = ego_y + distance * math.sin(heading) + lateral * math.cos(heading)
+        obstacle = {
+            "x": obs_x,
+            "y": obs_y,
+            "heading": heading,
+            "speed": 0.0,
+            "length": length,
+            "width": width,
+            "lane_id": ego.get("lane_id"),
+            "object_type": "forced_debug_obstacle",
+            "class_name": "ForcedDebugObstacle",
+            "object_id": "forced_static_obstacle",
+        }
+        augmented.setdefault("static_obstacles", []).append(obstacle)
+        adapter_debug = augmented.setdefault("adapter_debug", {})
+        adapter_debug["forced_obstacle_injected"] = True
+        adapter_debug["forced_obstacle_distance"] = distance
+        adapter_debug["forced_obstacle_lateral"] = lateral
+        return augmented
+
     def _make_candidate(
         self,
         action: Action,
@@ -876,6 +936,8 @@ class StaticRSSFilter:
         info["steer_nominal"] = float(u_original[1])
         info["steer_safe"] = float(u_safe[1])
         info["steer_delta"] = float(u_safe[1] - u_original[1])
+        info["action_delta"] = float(math.sqrt(info["acc_delta"] ** 2 + info["steer_delta"] ** 2))
+        info.setdefault("reason", "")
         return info
 
     def _check_stop_horizon(
