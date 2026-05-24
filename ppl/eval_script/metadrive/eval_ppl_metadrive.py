@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import copy
 import os
 import os.path as osp
 import time
@@ -32,8 +33,9 @@ from ppl.ppl import PPL
 from ppl.sb3.td3.policies import TD3Policy
 from ppl.utils.print_dict_utils import pretty_print, RecorderEnv
 from ppl.utils.rss_cbf_filter import RSSCBFConfig, RSSCBFFilter
+from ppl.utils.train_eval_config import baseline_eval_config
 
-EVAL_ENV_START = 1000  # Evaluation seeds start from 1000
+EVAL_ENV_START = baseline_eval_config["start_seed"]  # Evaluation seeds start from the shared eval config.
 
 
 class PolicyFunction:
@@ -62,14 +64,15 @@ class PolicyFunction:
         return self.algo.predict(o, deterministic=deterministic)
 
 
-def make_metadrive_env(use_render=False, eval_env_start=EVAL_ENV_START):
+def make_metadrive_env(use_render=None, eval_env_start=EVAL_ENV_START):
     """Build the evaluation environment (no manual control, fixed seed range)."""
-    config = dict(
-        use_render=use_render,
-        manual_control=False,
-        start_seed=eval_env_start,
-        horizon=1500,
-    )
+    config = copy.deepcopy(baseline_eval_config)
+    config.pop("main_exp", None)
+    if use_render is None:
+        use_render = bool(config.get("use_render", False))
+    config["use_render"] = use_render
+    config["manual_control"] = False
+    config["start_seed"] = eval_env_start
     if use_render:
         config["disable_model_compression"] = True
     env = DrivingEnv(config=config)
@@ -184,7 +187,7 @@ def evaluate_ppl_once(
     ckpt_path,
     ckpt_index,
     folder_name,
-    use_render=False,
+    use_render=None,
     num_ep_in_one_env=5,
     total_env_num=50,
     deterministic=True,
@@ -488,7 +491,20 @@ if __name__ == "__main__":
     )
 
     # --- Eval settings ---
-    parser.add_argument("--use_render", action="store_true", help="Enable rendering.")
+    render_group = parser.add_mutually_exclusive_group()
+    render_group.add_argument(
+        "--use_render",
+        dest="use_render",
+        action="store_true",
+        help="Enable rendering. Defaults to baseline_eval_config['use_render'].",
+    )
+    render_group.add_argument(
+        "--no_render",
+        dest="use_render",
+        action="store_false",
+        help="Disable rendering even if baseline_eval_config enables it.",
+    )
+    parser.set_defaults(use_render=baseline_eval_config.get("use_render", False))
     parser.add_argument("--eval_start_seed", type=int, default=EVAL_ENV_START, help="First MetaDrive eval env seed.")
     parser.add_argument("--num_ep_in_one_env", type=int, default=1, help="Episodes per environment seed.")
     parser.add_argument("--total_env_num", type=int, default=50, help="Number of environment seeds.")

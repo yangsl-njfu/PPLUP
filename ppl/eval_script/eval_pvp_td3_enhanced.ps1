@@ -8,7 +8,7 @@ param(
 # ========== Configuration ==========
 $MODEL_DIR = "E:\CodeProject\CodexExp01\PPL-main\runs\PPL\PPL_0ee03603\models"
 $METHOD = if ($RSSCBF) { "ppl_rss_cbf" } else { "ppl" }
-$RESULT_DIR = if ($RSSCBF) { "evaluation_results\PPL_0ee03603_rss_cbf" } else { "evaluation_results\PPL_0ee03603-enhanced" }
+$RESULT_DIR = if ($RSSCBF) { "evaluation_results\PPL_0ee03603_rss_cbf_test" } else { "evaluation_results\PPL_0ee03603-enhanced" }
 $START_STEP = 8000
 $END_STEP = 10000
 $STEP_INTERVAL = 200
