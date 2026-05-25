@@ -32,6 +32,7 @@ class RSSMPCConfig(RSSCBFConfig):
 
     horizon_steps: int = 10
     recovery_horizon_steps: int = 20
+    recovery_num_candidates: int = 96
     dt: float = 0.1
     num_samples: int = 64
     min_acc: float = -5.0
@@ -83,6 +84,19 @@ class RSSMPCConfig(RSSCBFConfig):
     guard_override_min_acc: float = 0.2
     recovery_hold_steps: int = 3
     recovery_hold_margin_buffer: float = 4.0
+    corridor_lateral_offset: float = 1.2
+    corridor_target_speed: float = 2.5
+    corridor_target_progress: float = 2.0
+    corridor_target_clearance: float = 0.3
+    corridor_required_rss_margin: float = 1.0
+    corridor_road_boundary_margin: float = 0.15
+    corridor_switch_penalty: float = 15.0
+    corridor_keep_margin: float = 3.0
+    recovery_corridor_ttl: int = 6
+    recovery_side_switch_cooldown: int = 4
+    w_corridor_lateral: float = 6.0
+    w_corridor_clearance: float = 4.0
+    w_road_boundary: float = 500.0
     creep_acc: float = 0.6
     nudge_steer: float = 0.35
     nudge_steer_ratio_threshold: float = 0.5
@@ -126,6 +140,11 @@ class RSSMPCFilter(RSSCBFFilter):
         self._held_recovery_action: Optional[Action] = None
         self._held_recovery_ttl = 0
         self._last_candidate_families: List[str] = []
+        self._last_candidate_corridors: List[Dict[str, Any]] = []
+        self.previous_recovery_corridor = ""
+        self.active_recovery_corridor = ""
+        self.recovery_corridor_ttl = 0
+        self.recovery_side_switch_cooldown = 0
 
     def reset(self) -> None:
         """Clear rolling deadlock state at episode reset."""
@@ -135,6 +154,11 @@ class RSSMPCFilter(RSSCBFFilter):
         self._held_recovery_action = None
         self._held_recovery_ttl = 0
         self._last_candidate_families = []
+        self._last_candidate_corridors = []
+        self.previous_recovery_corridor = ""
+        self.active_recovery_corridor = ""
+        self.recovery_corridor_ttl = 0
+        self.recovery_side_switch_cooldown = 0
 
     def update_after_step(self, env_info: Optional[Dict[str, Any]]) -> None:
         """Optionally attach post-step route progress to the newest history sample."""
@@ -155,6 +179,7 @@ class RSSMPCFilter(RSSCBFFilter):
         through unchanged, and unsafe non-deadlocked actions use RSS-CBF only.
         MPC is called only for CBF-induced safe-but-stuck recovery.
         """
+        self._tick_corridor_memory()
         u_original = self._clip_action(u_nom)
         cbf_safe, cbf_info = self.rss_cbf_filter.filter_action(state, u_original)
         cbf_safe = self._clip_action(cbf_safe)
@@ -267,6 +292,8 @@ class RSSMPCFilter(RSSCBFFilter):
                             "mpc_call_reason": "held_recovery_after_deadlock",
                             "cbf_guard_override_used": True,
                             "cbf_guard_override_reason": "held_certified_recovery_action_with_large_rss_margin",
+                            "certified_recovery_override_used": True,
+                            "certified_recovery_override_reason": "held_certified_recovery_action_with_large_rss_margin",
                             "recovery_hold_used": True,
                         },
                     ),
@@ -317,22 +344,37 @@ class RSSMPCFilter(RSSCBFFilter):
 
         recovery_horizon = max(1, int(self.mpc_config.recovery_horizon_steps))
         original_horizon = self.mpc_config.horizon_steps
+        original_num_samples = self.mpc_config.num_samples
         self.mpc_config.horizon_steps = recovery_horizon
+        self.mpc_config.num_samples = max(1, int(self.mpc_config.recovery_num_candidates))
         try:
-            candidates = self._generate_recovery_candidate_sequences(u_original, cbf_reference_action)
+            corridor_pack = self._generate_corridor_candidate_sequences(
+                state=state,
+                obj=obj,
+                object_kind=object_kind,
+                current_margin=current_margin,
+                u_nom=u_original,
+                u_cbf=cbf_reference_action,
+            )
         finally:
             self.mpc_config.horizon_steps = original_horizon
+            self.mpc_config.num_samples = original_num_samples
+        candidates = corridor_pack["sequences"]
+        corridor_info = corridor_pack["info"]
 
         best: Optional[Dict[str, Any]] = None
         feasible_count = 0
         terminal_feasible_count = 0
         no_rss_feasible_count = 0
+        no_road_safe_count = 0
+        first_step_rejected_count = 0
         no_terminal_recoverable_count = 0
         guard_rejected_count = 0
         terminal_feasible_candidates: List[Dict[str, Any]] = []
         guard_rejected_candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
 
         for idx, sequence in enumerate(candidates):
+            corridor = self._last_candidate_corridors[idx] if idx < len(self._last_candidate_corridors) else {}
             evaluation = self._evaluate_sequence(
                 state=state,
                 obj=obj,
@@ -341,6 +383,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 sequence=sequence,
                 u_nom=u_original,
                 u_cbf=cbf_reference_action,
+                corridor=corridor,
             )
             if idx < len(self._last_candidate_families):
                 evaluation["recovery_candidate_family"] = self._last_candidate_families[idx]
@@ -353,6 +396,12 @@ class RSSMPCFilter(RSSCBFFilter):
             )
             if not rss_feasible:
                 no_rss_feasible_count += 1
+                continue
+            if not evaluation.get("road_boundary_safe", False):
+                no_road_safe_count += 1
+                continue
+            if not evaluation.get("first_step_recovery_feasible", True):
+                first_step_rejected_count += 1
                 continue
             if not evaluation["terminal_recoverable"]:
                 no_terminal_recoverable_count += 1
@@ -389,8 +438,14 @@ class RSSMPCFilter(RSSCBFFilter):
         total_candidates = len(candidates)
         if best is not None:
             failure_reason = ""
+        elif not corridor_info.get("drivable_corridor_available", False):
+            failure_reason = "no_corridor_available"
         elif no_rss_feasible_count == total_candidates:
             failure_reason = "no_rss_feasible_candidate"
+        elif no_road_safe_count > 0 and no_rss_feasible_count + no_road_safe_count == total_candidates:
+            failure_reason = "no_road_boundary_safe_candidate"
+        elif first_step_rejected_count > 0 and no_rss_feasible_count + no_road_safe_count + first_step_rejected_count == total_candidates:
+            failure_reason = "first_step_recovery_rejected"
         elif terminal_feasible_count == 0:
             failure_reason = "no_terminal_recoverable_candidate"
         elif feasible_count == 0:
@@ -404,10 +459,17 @@ class RSSMPCFilter(RSSCBFFilter):
             return {
                 "mpc_failure_reason": failure_reason,
                 "mpc_no_rss_feasible_count": no_rss_feasible_count,
+                "mpc_no_road_safe_count": no_road_safe_count,
                 "mpc_no_terminal_recoverable_count": no_terminal_recoverable_count,
                 "mpc_guard_rejected_count": guard_rejected_count,
                 "mpc_terminal_candidate_count": terminal_feasible_count,
+                "mpc_num_corridors": int(corridor_info.get("mpc_num_corridors", 0)),
+                "mpc_num_rss_feasible": max(0, total_candidates - no_rss_feasible_count),
+                "mpc_num_road_safe": max(0, total_candidates - no_rss_feasible_count - no_road_safe_count),
+                "mpc_num_terminal_recoverable": terminal_feasible_count,
+                "mpc_num_guard_rejected": guard_rejected_count,
                 "recovery_horizon_steps_used": recovery_horizon,
+                **corridor_info,
             }
 
         if best is not None:
@@ -417,13 +479,18 @@ class RSSMPCFilter(RSSCBFFilter):
             cbf_guard_delta = best["cbf_guard_delta"]
             cbf_guard_used = best["cbf_guard_used"]
             guard_override_used = best.get("cbf_guard_override_used", False)
-            if guard_override_used:
+            best_is_minimum_risk = best.get("corridor_type") == "minimum_risk_stop"
+            if best_is_minimum_risk:
+                mode = "minimum_risk_stop"
+                reason = "minimum_risk_condition"
+            elif guard_override_used:
                 mode = "rss_mpc_recovery"
                 reason = "mpc_recovery_large_margin_guard_override"
                 self._remember_recovery_action(u_safe)
             else:
                 mode = "rss_mpc_cbf_guard" if cbf_guard_used else "rss_mpc_recovery"
                 reason = "cbf_guard_projected_mpc_recovery" if cbf_guard_used else "mpc_recovery_sequence"
+            corridor_memory_info = self._commit_recovery_corridor(best.get("corridor", {}))
             return u_safe, self._make_mpc_info(
                 state=state,
                 obj=obj,
@@ -437,7 +504,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 rss_margin_current=current_margin,
                 dynamic_vehicle_detected=dynamic_detected,
                 obstacle_detected=static_detected,
-                mpc_success=True,
+                mpc_success=not best_is_minimum_risk,
                 mpc_num_candidates=total_candidates,
                 mpc_num_feasible=feasible_count,
                 mpc_best_cost=best["cost"],
@@ -456,18 +523,31 @@ class RSSMPCFilter(RSSCBFFilter):
                     {
                         "mpc_called": True,
                         "mpc_call_reason": "deadlock_risk",
+                        **_diagnostics_block(),
                         "terminal_recoverable": best["terminal_recoverable"],
                         "terminal_recovery_reason": best["terminal_recovery_reason"],
                         "recovery_progress": best["recovery_progress"],
                         "recovery_margin_improvement": best["recovery_margin_improvement"],
                         "blocking_object_final": best["blocking_object_final"],
+                        "minimum_risk_stop_used": best_is_minimum_risk,
                         "mpc_terminal_feasible": terminal_feasible_count,
                         "mpc_guard_rejected": guard_rejected_count,
                         "cbf_guard_override_used": guard_override_used,
                         "cbf_guard_override_reason": best.get("cbf_guard_override_reason", ""),
+                        "certified_recovery_override_used": guard_override_used,
+                        "certified_recovery_override_reason": best.get("cbf_guard_override_reason", ""),
+                        "guard_reject_reason": best.get("guard_reject_reason", ""),
                         "first_step_recovery_reason": best.get("first_step_recovery_reason", ""),
                         "recovery_candidate_family": best.get("recovery_candidate_family", ""),
-                        **_diagnostics_block(),
+                        "selected_recovery_corridor": best.get("corridor_type", ""),
+                        "active_recovery_corridor": self.active_recovery_corridor,
+                        "previous_recovery_corridor": self.previous_recovery_corridor,
+                        "corridor_target_lateral_offset": best.get("corridor_target_lateral_offset", math.nan),
+                        "corridor_target_speed": best.get("corridor_target_speed", math.nan),
+                        "corridor_cost": best.get("corridor_cost", math.nan),
+                        "corridor_terminal_recoverable": best.get("terminal_recoverable", False),
+                        "first_step_recovery_feasible": best.get("first_step_recovery_feasible", False),
+                        **corridor_memory_info,
                     },
                 ),
             )
@@ -510,6 +590,8 @@ class RSSMPCFilter(RSSCBFFilter):
                         "mpc_guard_rejected": guard_rejected_count,
                         "cbf_guard_override_used": True,
                         "cbf_guard_override_reason": "held_certified_recovery_action_with_large_rss_margin",
+                        "certified_recovery_override_used": True,
+                        "certified_recovery_override_reason": "held_certified_recovery_action_with_large_rss_margin",
                         "recovery_hold_used": True,
                         **_diagnostics_block(),
                     },
@@ -536,6 +618,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 if override_used:
                     u_safe = self._clip_action(evaluation["sequence"][0])
                     self._remember_recovery_action(u_safe)
+                    corridor_memory_info = self._commit_recovery_corridor(evaluation.get("corridor", {}))
                     return u_safe, self._make_mpc_info(
                         state=state,
                         obj=obj,
@@ -568,6 +651,7 @@ class RSSMPCFilter(RSSCBFFilter):
                             {
                                 "mpc_called": True,
                                 "mpc_call_reason": "deadlock_risk",
+                                **_diagnostics_block(),
                                 "terminal_recoverable": evaluation["terminal_recoverable"],
                                 "terminal_recovery_reason": evaluation["terminal_recovery_reason"],
                                 "recovery_progress": evaluation["recovery_progress"],
@@ -577,9 +661,20 @@ class RSSMPCFilter(RSSCBFFilter):
                                 "mpc_guard_rejected": guard_rejected_count,
                                 "cbf_guard_override_used": True,
                                 "cbf_guard_override_reason": override_reason,
+                                "certified_recovery_override_used": True,
+                                "certified_recovery_override_reason": override_reason,
+                                "guard_reject_reason": guard_eval.get("guard_reject_reason", ""),
                                 "first_step_recovery_reason": evaluation.get("first_step_recovery_reason", ""),
                                 "recovery_candidate_family": evaluation.get("recovery_candidate_family", ""),
-                                **_diagnostics_block(),
+                                "selected_recovery_corridor": evaluation.get("corridor_type", ""),
+                                "active_recovery_corridor": self.active_recovery_corridor,
+                                "previous_recovery_corridor": self.previous_recovery_corridor,
+                                "corridor_target_lateral_offset": evaluation.get("corridor_target_lateral_offset", math.nan),
+                                "corridor_target_speed": evaluation.get("corridor_target_speed", math.nan),
+                                "corridor_cost": evaluation.get("corridor_cost", math.nan),
+                                "corridor_terminal_recoverable": evaluation.get("terminal_recoverable", False),
+                                "first_step_recovery_feasible": evaluation.get("first_step_recovery_feasible", False),
+                                **corridor_memory_info,
                             },
                         ),
                     )
@@ -825,6 +920,348 @@ class RSSMPCFilter(RSSCBFFilter):
         merged.update(updates)
         return merged
 
+    def _tick_corridor_memory(self) -> None:
+        if self.recovery_corridor_ttl > 0:
+            self.recovery_corridor_ttl -= 1
+        elif self.active_recovery_corridor:
+            self.previous_recovery_corridor = self.active_recovery_corridor
+            self.active_recovery_corridor = ""
+        if self.recovery_side_switch_cooldown > 0:
+            self.recovery_side_switch_cooldown -= 1
+
+    def _commit_recovery_corridor(self, corridor: Dict[str, Any]) -> Dict[str, Any]:
+        selected = str(corridor.get("corridor_type", ""))
+        previous = self.active_recovery_corridor
+        if selected == "minimum_risk_stop":
+            if previous:
+                self.previous_recovery_corridor = previous
+                self.active_recovery_corridor = ""
+                self.recovery_corridor_ttl = 0
+            return {
+                "corridor_switch_used": bool(previous),
+                "corridor_switch_reason": "minimum_risk_stop_no_drivable_corridor" if previous else "",
+            }
+        switch_used = bool(selected and previous and selected != previous)
+        switch_reason = ""
+        if switch_used:
+            switch_reason = "better_recovery_corridor_selected"
+            if {selected, previous} == {"left_offset", "right_offset"}:
+                self.recovery_side_switch_cooldown = max(
+                    self.recovery_side_switch_cooldown,
+                    int(self.mpc_config.recovery_side_switch_cooldown),
+                )
+        if selected:
+            self.previous_recovery_corridor = previous
+            self.active_recovery_corridor = selected
+            self.recovery_corridor_ttl = max(0, int(self.mpc_config.recovery_corridor_ttl))
+        return {
+            "corridor_switch_used": switch_used,
+            "corridor_switch_reason": switch_reason,
+        }
+
+    def _generate_corridor_candidate_sequences(
+        self,
+        state: State,
+        obj: Dict[str, Any],
+        object_kind: str,
+        current_margin: float,
+        u_nom: Action,
+        u_cbf: Action,
+    ) -> Dict[str, Any]:
+        corridors, corridor_info = self._generate_recovery_corridors(state, obj, object_kind, current_margin)
+        horizon = max(1, int(self.mpc_config.horizon_steps))
+        max_candidates = max(1, int(self.mpc_config.num_samples))
+        sequences: List[np.ndarray] = []
+        families: List[str] = []
+        corridor_meta: List[Dict[str, Any]] = []
+
+        recovery_corridors = [corridor for corridor in corridors if corridor.get("corridor_type") != "minimum_risk_stop"]
+        stop_corridors = [corridor for corridor in corridors if corridor.get("corridor_type") == "minimum_risk_stop"]
+        ordered_corridors = recovery_corridors + stop_corridors
+        if not ordered_corridors:
+            ordered_corridors = [self._minimum_risk_corridor(state, "no_corridor_available")]
+
+        per_corridor = max(4, max_candidates // max(1, len(ordered_corridors)))
+        for corridor in ordered_corridors:
+            for sequence, family in self._sequences_for_corridor(corridor, u_nom, u_cbf, horizon, per_corridor):
+                if len(sequences) >= max_candidates:
+                    break
+                sequences.append(sequence)
+                families.append(family)
+                corridor_meta.append(corridor)
+            if len(sequences) >= max_candidates:
+                break
+
+        while len(sequences) < max_candidates:
+            sequence = self._sample_corridor_random_sequence(ordered_corridors[0], u_nom, horizon)
+            sequences.append(sequence)
+            families.append("corridor_random")
+            corridor_meta.append(ordered_corridors[0])
+
+        self._last_candidate_families = families[:max_candidates]
+        self._last_candidate_corridors = corridor_meta[:max_candidates]
+        corridor_info = dict(corridor_info)
+        corridor_info["mpc_num_corridors"] = len(corridors)
+        return {
+            "sequences": sequences[:max_candidates],
+            "corridors": corridors,
+            "info": corridor_info,
+        }
+
+    def _generate_recovery_corridors(
+        self,
+        state: State,
+        obj: Dict[str, Any],
+        object_kind: str,
+        current_margin: float,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        cfg = self.mpc_config
+        lane_width = max(self.config.default_lane_width, self._current_lane_width(state))
+        lanes = state.get("lanes", {}) or {}
+        left_lane = lanes.get("left", {}) or {}
+        right_lane = lanes.get("right", {}) or {}
+        left_available = bool(left_lane.get("available", False) and left_lane.get("drivable", True))
+        right_available = bool(right_lane.get("available", False) and right_lane.get("drivable", True))
+        road_margin = self._current_road_boundary_margin(state)
+        road_boundary_active = math.isfinite(road_margin) and road_margin < max(0.35, cfg.corridor_road_boundary_margin * 2.0)
+        forward_available = bool(current_margin >= cfg.corridor_required_rss_margin)
+        recenter_available = road_boundary_active or abs(self._ego(state).get("lateral", 0.0)) > lane_width * 0.35
+
+        corridors: List[Dict[str, Any]] = []
+
+        def make_corridor(
+            corridor_type: str,
+            target_lateral_offset: float,
+            target_speed: float,
+            target_progress: float,
+            target_clearance: float,
+            available: bool,
+            reason: str,
+            priority: float,
+        ) -> Dict[str, Any]:
+            return {
+                "corridor_type": corridor_type,
+                "target_lateral_offset": float(target_lateral_offset),
+                "target_speed": float(target_speed),
+                "target_progress": float(target_progress),
+                "target_clearance": float(target_clearance),
+                "required_rss_margin": float(cfg.corridor_required_rss_margin),
+                "road_boundary_margin": float(cfg.corridor_road_boundary_margin),
+                "available": bool(available),
+                "reason": reason,
+                "priority": float(priority),
+                "road_boundary_active": bool(road_boundary_active),
+            }
+
+        if recenter_available:
+            corridors.append(make_corridor(
+                "recenter",
+                0.0,
+                min(cfg.corridor_target_speed, 2.0),
+                cfg.corridor_target_progress,
+                cfg.corridor_target_clearance,
+                True,
+                "road_boundary_or_large_lateral_offset",
+                0.8,
+            ))
+
+        if left_available and self._corridor_boundary_feasible(state, cfg.corridor_lateral_offset):
+            corridors.append(make_corridor(
+                "left_offset",
+                cfg.corridor_lateral_offset,
+                cfg.corridor_target_speed,
+                cfg.corridor_target_progress,
+                cfg.corridor_target_clearance,
+                True,
+                "left_drivable_space_available",
+                0.5,
+            ))
+
+        if right_available and self._corridor_boundary_feasible(state, -cfg.corridor_lateral_offset):
+            corridors.append(make_corridor(
+                "right_offset",
+                -cfg.corridor_lateral_offset,
+                cfg.corridor_target_speed,
+                cfg.corridor_target_progress,
+                cfg.corridor_target_clearance,
+                True,
+                "right_drivable_space_available",
+                0.5,
+            ))
+
+        if forward_available and self._corridor_boundary_feasible(state, 0.0):
+            corridors.append(make_corridor(
+                "creep_forward",
+                0.0,
+                min(cfg.corridor_target_speed, 1.5),
+                max(0.8, cfg.corridor_target_progress * 0.5),
+                cfg.corridor_target_clearance,
+                True,
+                "front_rss_margin_allows_creep",
+                0.6,
+            ))
+
+        drivable_available = any(c.get("corridor_type") != "minimum_risk_stop" for c in corridors)
+        if not drivable_available:
+            corridors.append(self._minimum_risk_corridor(state, "no_road_boundary_safe_recovery_corridor"))
+
+        # Keep the active corridor near the front unless it is no longer represented.
+        if self.active_recovery_corridor:
+            corridors.sort(
+                key=lambda c: (
+                    0 if c.get("corridor_type") == self.active_recovery_corridor else 1,
+                    c.get("priority", 1.0),
+                )
+            )
+        else:
+            corridors.sort(key=lambda c: c.get("priority", 1.0))
+
+        info = {
+            "left_corridor_available": any(c.get("corridor_type") == "left_offset" for c in corridors),
+            "right_corridor_available": any(c.get("corridor_type") == "right_offset" for c in corridors),
+            "forward_corridor_available": any(c.get("corridor_type") == "creep_forward" for c in corridors),
+            "recenter_corridor_available": any(c.get("corridor_type") == "recenter" for c in corridors),
+            "drivable_corridor_available": drivable_available,
+            "road_boundary_active": bool(road_boundary_active),
+            "no_left_corridor": not any(c.get("corridor_type") == "left_offset" for c in corridors),
+            "no_right_corridor": not any(c.get("corridor_type") == "right_offset" for c in corridors),
+            "no_forward_corridor": not any(c.get("corridor_type") == "creep_forward" for c in corridors),
+            "no_recenter_corridor": not any(c.get("corridor_type") == "recenter" for c in corridors),
+            "active_recovery_corridor": self.active_recovery_corridor,
+            "previous_recovery_corridor": self.previous_recovery_corridor,
+        }
+        return corridors, info
+
+    def _minimum_risk_corridor(self, state: State, reason: str) -> Dict[str, Any]:
+        return {
+            "corridor_type": "minimum_risk_stop",
+            "target_lateral_offset": 0.0,
+            "target_speed": 0.0,
+            "target_progress": 0.0,
+            "target_clearance": 0.0,
+            "required_rss_margin": 0.0,
+            "road_boundary_margin": float(self.mpc_config.corridor_road_boundary_margin),
+            "available": True,
+            "reason": reason,
+            "priority": 99.0,
+            "road_boundary_active": bool(self._current_road_boundary_margin(state) < self.mpc_config.corridor_road_boundary_margin),
+        }
+
+    def _current_road_boundary_margin(self, state: State) -> float:
+        return self._road_boundary_margin_for_state(state, state)
+
+    def _road_boundary_margin_for_state(self, reference_state: State, rollout_state: State) -> float:
+        initial_ego = self._ego(reference_state)
+        _, lateral = self._relative_position(initial_ego, self._ego(rollout_state))
+        current_width = self._current_lane_width(reference_state)
+        lanes = reference_state.get("lanes", {}) or {}
+        left_width = self._lane_available_width(reference_state, lanes.get("left")) if lanes.get("left") else 0.0
+        right_width = self._lane_available_width(reference_state, lanes.get("right")) if lanes.get("right") else 0.0
+        left_available = bool((lanes.get("left") or {}).get("available", False))
+        right_available = bool((lanes.get("right") or {}).get("available", False))
+        upper = current_width / 2.0 + (left_width if left_available else 0.0) - self.config.lane_margin
+        lower = -current_width / 2.0 - (right_width if right_available else 0.0) + self.config.lane_margin
+        return min(upper - lateral, lateral - lower)
+
+    def _corridor_boundary_feasible(self, state: State, target_lateral_offset: float) -> bool:
+        current_width = self._current_lane_width(state)
+        lanes = state.get("lanes", {}) or {}
+        left_width = self._lane_available_width(state, lanes.get("left")) if lanes.get("left") else 0.0
+        right_width = self._lane_available_width(state, lanes.get("right")) if lanes.get("right") else 0.0
+        left_available = bool((lanes.get("left") or {}).get("available", False))
+        right_available = bool((lanes.get("right") or {}).get("available", False))
+        upper = current_width / 2.0 + (left_width if left_available else 0.0) - self.mpc_config.corridor_road_boundary_margin
+        lower = -current_width / 2.0 - (right_width if right_available else 0.0) + self.mpc_config.corridor_road_boundary_margin
+        return lower <= float(target_lateral_offset) <= upper
+
+    def _sequences_for_corridor(
+        self,
+        corridor: Dict[str, Any],
+        u_nom: Action,
+        u_cbf: Action,
+        horizon: int,
+        limit: int,
+    ) -> List[Tuple[np.ndarray, str]]:
+        cfg = self.mpc_config
+        corridor_type = str(corridor.get("corridor_type", "creep_forward"))
+        target_speed = float(corridor.get("target_speed", cfg.corridor_target_speed))
+        target_offset = float(corridor.get("target_lateral_offset", 0.0))
+        direction = 0.0 if abs(target_offset) < self.config.small_tolerance else math.copysign(1.0, target_offset)
+        steer_mag = min(cfg.max_steer, max(cfg.nudge_steer, abs(target_offset) / max(cfg.corridor_lateral_offset, 1e-6) * cfg.bypass_steer))
+        steer_target = direction * steer_mag
+        base_acc = max(cfg.creep_acc, min(cfg.max_acc, target_speed * 0.5))
+        results: List[Tuple[np.ndarray, str]] = []
+
+        def add(acc_values: Sequence[float], steer_values: Sequence[float], family: str) -> None:
+            if len(results) >= limit:
+                return
+            sequence = np.asarray(
+                [self._clip_action([acc, steer]) for acc, steer in zip(acc_values, steer_values)],
+                dtype=np.float64,
+            )
+            if sequence.shape == (horizon, 2):
+                results.append((sequence, family))
+
+        if corridor_type == "minimum_risk_stop":
+            add(np.full(horizon, cfg.strong_brake), np.full(horizon, u_nom[1]), "minimum_risk_stop")
+            add(np.full(horizon, cfg.strong_brake), np.zeros(horizon), "minimum_risk_stop_zero_steer")
+            return results
+
+        if corridor_type == "recenter":
+            recenter_steer = -math.copysign(min(cfg.nudge_steer, abs(u_nom[1])), u_nom[1]) if abs(u_nom[1]) > 0.05 else 0.0
+            add(np.full(horizon, cfg.creep_acc), np.linspace(u_nom[1], 0.0, horizon), "recenter_smooth")
+            add(np.full(horizon, base_acc), np.full(horizon, recenter_steer), "recenter_inward")
+            add(np.linspace(cfg.creep_acc, base_acc, horizon), np.linspace(recenter_steer, 0.0, horizon), "recenter_then_straight")
+        elif corridor_type in {"left_offset", "right_offset"}:
+            half = max(1, horizon // 2)
+            add(np.full(horizon, base_acc), np.full(horizon, steer_target), "{}_constant".format(corridor_type))
+            add(
+                np.full(horizon, base_acc),
+                np.concatenate([np.full(half, steer_target), np.linspace(steer_target, 0.0, horizon - half)]),
+                "{}_then_straight".format(corridor_type),
+            )
+            add(
+                np.linspace(cfg.creep_acc, base_acc, horizon),
+                np.concatenate([np.full(half, steer_target * 0.75), np.full(horizon - half, steer_target * 0.25)]),
+                "{}_smooth".format(corridor_type),
+            )
+            add(
+                np.concatenate([[cfg.comfort_brake], np.full(horizon - 1, base_acc)]),
+                np.concatenate([[0.0], np.full(horizon - 1, steer_target)]),
+                "{}_brake1_then_offset".format(corridor_type),
+            )
+        else:
+            add(np.full(horizon, cfg.creep_acc), np.full(horizon, u_nom[1]), "creep_nominal_steer")
+            add(np.full(horizon, base_acc), np.zeros(horizon), "creep_straight")
+            add(np.linspace(cfg.creep_acc, base_acc, horizon), np.linspace(u_nom[1], 0.0, horizon), "creep_smooth")
+            for steer in (cfg.nudge_steer, -cfg.nudge_steer):
+                add(np.full(horizon, cfg.creep_acc), np.full(horizon, steer), "creep_nudge")
+
+        while len(results) < limit:
+            results.append((self._sample_corridor_random_sequence(corridor, u_nom, horizon), "corridor_random"))
+        return results[:limit]
+
+    def _sample_corridor_random_sequence(self, corridor: Dict[str, Any], u_nom: Action, horizon: int) -> np.ndarray:
+        cfg = self.mpc_config
+        target_offset = float(corridor.get("target_lateral_offset", 0.0))
+        direction = 0.0 if abs(target_offset) < self.config.small_tolerance else math.copysign(1.0, target_offset)
+        steer_mean = direction * min(cfg.max_steer, cfg.nudge_steer + 0.25 * abs(direction))
+        acc_mean = max(cfg.creep_acc, min(cfg.max_acc, float(corridor.get("target_speed", 1.0)) * 0.45))
+        nominal = np.asarray([acc_mean, steer_mean], dtype=np.float64)
+        prev = nominal.copy()
+        sequence = []
+        alpha = max(0.0, min(1.0, float(cfg.random_smoothing_alpha)))
+        for _ in range(horizon):
+            raw = self.rng.normal(
+                loc=nominal,
+                scale=np.asarray([max(0.4, cfg.random_acc_std * 0.4), max(0.08, cfg.random_steer_std * 0.6)]),
+            )
+            smoothed = prev + alpha * (raw - prev)
+            clipped = np.asarray(self._clip_action(smoothed), dtype=np.float64)
+            sequence.append(clipped)
+            prev = clipped
+        return np.asarray(sequence, dtype=np.float64)
+
     def _generate_recovery_candidate_sequences(self, u_nom: Action, u_cbf: Optional[Action] = None) -> List[np.ndarray]:
         horizon = max(1, int(self.mpc_config.horizon_steps))
         max_candidates = max(1, int(self.mpc_config.num_samples))
@@ -991,13 +1428,17 @@ class RSSMPCFilter(RSSCBFFilter):
         sequence: np.ndarray,
         u_nom: Action,
         u_cbf: Action,
+        corridor: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        corridor = corridor or {}
         rollout_state = copy.deepcopy(state)
         rollout_obj = copy.deepcopy(obj)
         margins: List[float] = []
         lateral_clearance_margins: List[float] = []
+        road_boundary_margins: List[float] = []
         speeds: List[float] = []
         initial_lateral_clearance = self._lateral_clearance_margin(state, obj)
+        initial_ego = self._ego(state)
 
         for action in sequence:
             rollout_state, rollout_obj = self._simulate_next_state_and_object(
@@ -1005,15 +1446,20 @@ class RSSMPCFilter(RSSCBFFilter):
             )
             margin = self._rss_margin_for_object(rollout_state, rollout_obj, object_kind)
             lateral_clearance_margin = self._lateral_clearance_margin(rollout_state, rollout_obj)
+            road_boundary_margin = self._road_boundary_margin_for_state(state, rollout_state)
             margins.append(float(margin))
             lateral_clearance_margins.append(float(lateral_clearance_margin))
+            road_boundary_margins.append(float(road_boundary_margin))
             speeds.append(self._ego_speed(rollout_state))
 
         final_margin = margins[-1] if margins else current_margin
         min_margin = min([current_margin] + margins) if margins else current_margin
         final_lateral_clearance = lateral_clearance_margins[-1] if lateral_clearance_margins else -math.inf
         min_lateral_clearance = min(lateral_clearance_margins) if lateral_clearance_margins else -math.inf
-        progress = self._longitudinal_progress(self._ego(state), self._ego(rollout_state))
+        min_road_boundary_margin = min(road_boundary_margins) if road_boundary_margins else self._current_road_boundary_margin(state)
+        final_road_boundary_margin = road_boundary_margins[-1] if road_boundary_margins else self._current_road_boundary_margin(state)
+        progress = self._longitudinal_progress(initial_ego, self._ego(rollout_state))
+        final_lateral_offset = self._lateral_progress(initial_ego, self._ego(rollout_state))
         final_speed = speeds[-1] if speeds else self._ego_speed(state)
         blocking_object_final = self._front_object_blocks_predicted_path(rollout_state, rollout_obj)
 
@@ -1032,6 +1478,10 @@ class RSSMPCFilter(RSSCBFFilter):
             initial_lateral_clearance=initial_lateral_clearance,
             final_speed=final_speed,
             blocking_object_final=blocking_object_final,
+            corridor=corridor,
+            final_lateral_offset=final_lateral_offset,
+            initial_road_boundary_margin=self._current_road_boundary_margin(state),
+            final_road_boundary_margin=final_road_boundary_margin,
         )
         current_speed = self._ego_speed(state)
         first_acc = float(sequence[0][0]) if len(sequence) else self.mpc_config.strong_brake
@@ -1044,12 +1494,27 @@ class RSSMPCFilter(RSSCBFFilter):
                 and math.isfinite(initial_lateral_clearance)
                 and float(final_lateral_clearance) - float(initial_lateral_clearance) > self.config.small_tolerance
             )
+            target_offset = float(corridor.get("target_lateral_offset", 0.0))
+            corridor_tracking_improves = (
+                abs(target_offset) > self.config.small_tolerance
+                and abs(target_offset - final_lateral_offset) + self.config.small_tolerance < abs(target_offset)
+            )
+            road_margin_improves = final_road_boundary_margin + self.config.small_tolerance > self._current_road_boundary_margin(state)
             is_lateral_recovery = terminal_recovery_reason in {
-                "lateral_bypass_improving",
+                "lateral_clearance_improved",
                 "bypass_clearance_forming",
                 "blocking_object_cleared",
+                "corridor_tracking_improved",
+                "recentered_from_boundary",
             }
-            has_significant_steer = abs(first_steer) >= self.mpc_config.nudge_steer * self.mpc_config.nudge_steer_ratio_threshold
+            steer_toward_corridor = (
+                abs(target_offset) > self.config.small_tolerance
+                and first_steer * target_offset > self.config.small_tolerance
+            )
+            has_significant_steer = (
+                abs(first_steer) >= self.mpc_config.nudge_steer * self.mpc_config.nudge_steer_ratio_threshold
+                and (steer_toward_corridor or abs(target_offset) <= self.config.small_tolerance)
+            )
             if first_acc >= self.mpc_config.guard_override_min_acc:
                 first_step_recovery_feasible = True
                 first_step_recovery_reason = "first_acc_sufficient"
@@ -1059,6 +1524,12 @@ class RSSMPCFilter(RSSCBFFilter):
             elif lateral_improves:
                 first_step_recovery_feasible = True
                 first_step_recovery_reason = "lateral_clearance_improves"
+            elif corridor_tracking_improves:
+                first_step_recovery_feasible = True
+                first_step_recovery_reason = "corridor_tracking_improves"
+            elif road_margin_improves:
+                first_step_recovery_feasible = True
+                first_step_recovery_reason = "road_boundary_margin_improves"
             elif is_lateral_recovery:
                 first_step_recovery_feasible = True
                 first_step_recovery_reason = "terminal_lateral_recovery"
@@ -1070,10 +1541,12 @@ class RSSMPCFilter(RSSCBFFilter):
             -self.config.small_tolerance <= speed <= self.mpc_config.v_max + self.config.small_tolerance
             for speed in speeds
         )
+        road_boundary_safe = min_road_boundary_margin >= float(corridor.get("road_boundary_margin", self.mpc_config.corridor_road_boundary_margin))
         progress_feasible = progress >= -self.config.small_tolerance
         feasible = bool(
             rss_feasible
             and speed_feasible
+            and road_boundary_safe
             and progress_feasible
             and terminal_recoverable
             and first_step_recovery_feasible
@@ -1088,10 +1561,15 @@ class RSSMPCFilter(RSSCBFFilter):
             margins=margins,
             lateral_clearance_margins=lateral_clearance_margins,
             progress=progress,
+            corridor=corridor,
+            final_lateral_offset=final_lateral_offset,
+            min_road_boundary_margin=min_road_boundary_margin,
         )
 
         if not first_step_recovery_feasible:
             reason = "recovery_first_step_no_progress"
+        elif not road_boundary_safe:
+            reason = "rollout_road_boundary_unsafe"
         elif not speed_feasible:
             reason = "rollout_speed_out_of_bounds"
         elif not progress_feasible:
@@ -1101,12 +1579,17 @@ class RSSMPCFilter(RSSCBFFilter):
             "sequence": sequence,
             "feasible": feasible,
             "cost": cost,
+            "corridor_cost": cost,
             "rss_margin_current": current_margin,
             "rss_margin_min_pred": min_margin,
             "rss_margin_final_pred": final_margin,
             "rss_lateral_clearance_min_pred": min_lateral_clearance,
             "rss_lateral_clearance_final_pred": final_lateral_clearance,
+            "road_boundary_margin_min_pred": min_road_boundary_margin,
+            "road_boundary_margin_final_pred": final_road_boundary_margin,
+            "road_boundary_safe": road_boundary_safe,
             "initial_lateral_clearance": initial_lateral_clearance,
+            "final_lateral_offset": final_lateral_offset,
             "final_speed": final_speed,
             "predicted_progress": progress,
             "recovery_used": recovery_used,
@@ -1116,7 +1599,12 @@ class RSSMPCFilter(RSSCBFFilter):
             "recovery_margin_improvement": recovery_margin_improvement,
             "blocking_object_final": blocking_object_final,
             "reason": reason,
+            "first_step_recovery_feasible": first_step_recovery_feasible,
             "first_step_recovery_reason": first_step_recovery_reason,
+            "corridor": corridor,
+            "corridor_type": corridor.get("corridor_type", ""),
+            "corridor_target_lateral_offset": corridor.get("target_lateral_offset", math.nan),
+            "corridor_target_speed": corridor.get("target_speed", math.nan),
         }
 
     def _evaluate_guarded_first_action(self, state: State, evaluation: Dict[str, Any]) -> Dict[str, Any]:
@@ -1156,12 +1644,22 @@ class RSSMPCFilter(RSSCBFFilter):
                 - float(evaluation["rss_lateral_clearance_min_pred"]) > self.config.small_tolerance
             )
             is_lateral_terminal_recovery = evaluation.get("terminal_recovery_reason") in {
-                "lateral_bypass_improving",
+                "lateral_clearance_improved",
                 "bypass_clearance_forming",
                 "blocking_object_cleared",
+                "corridor_tracking_improved",
+                "recentered_from_boundary",
             }
             guard_safe = (progress_guarded or lateral_recovery
                           or lateral_clearance_improves or is_lateral_terminal_recovery)
+
+        guard_reject_reason = ""
+        if not guard_safe:
+            guard_reject_reason = (
+                "cbf_fallback_no_safe_candidate"
+                if guard_fallback
+                else "first_step_recovery_rejected_after_cbf_guard"
+            )
 
         return {
             "guard_safe": bool(guard_safe),
@@ -1173,6 +1671,9 @@ class RSSMPCFilter(RSSCBFFilter):
             "cbf_guard_delta": float(guard_delta),
             "cbf_guard_override_used": bool(guard_override_used),
             "cbf_guard_override_reason": guard_override_reason,
+            "certified_recovery_override_used": bool(guard_override_used),
+            "certified_recovery_override_reason": guard_override_reason,
+            "guard_reject_reason": guard_reject_reason,
         }
 
     def _guard_override_for_certified_recovery(
@@ -1192,6 +1693,12 @@ class RSSMPCFilter(RSSCBFFilter):
         """
         current_speed = self._ego_speed(state)
         if current_speed > self.mpc_config.stuck_speed_threshold:
+            return False, ""
+        if not bool(evaluation.get("terminal_recoverable", False)):
+            return False, ""
+        if not bool(evaluation.get("road_boundary_safe", False)):
+            return False, ""
+        if str((evaluation.get("corridor") or {}).get("corridor_type", "")) == "minimum_risk_stop":
             return False, ""
         if guard_mode not in {"rss_cbf_intervention", "rss_cbf_recovery", "fallback_no_safe_candidate"}:
             return False, ""
@@ -1217,13 +1724,17 @@ class RSSMPCFilter(RSSCBFFilter):
         )
         if not certified_margin:
             return False, ""
+        if float(evaluation.get("road_boundary_margin_min_pred", -math.inf)) < self.mpc_config.corridor_road_boundary_margin:
+            return False, ""
 
         progress = float(evaluation.get("predicted_progress", 0.0))
         lateral_clearance = float(evaluation.get("rss_lateral_clearance_final_pred", -math.inf))
         lateral_improving = evaluation.get("terminal_recovery_reason") in {
             "blocking_object_cleared",
             "bypass_clearance_forming",
-            "lateral_bypass_improving",
+            "lateral_clearance_improved",
+            "corridor_tracking_improved",
+            "recentered_from_boundary",
         }
         if progress <= self.config.small_tolerance and not lateral_improving:
             return False, ""
@@ -1266,8 +1777,12 @@ class RSSMPCFilter(RSSCBFFilter):
         margins: Sequence[float],
         lateral_clearance_margins: Sequence[float],
         progress: float,
+        corridor: Optional[Dict[str, Any]] = None,
+        final_lateral_offset: float = 0.0,
+        min_road_boundary_margin: float = math.inf,
     ) -> float:
         cfg = self.mpc_config
+        corridor = corridor or {}
         nominal = np.asarray(u_nom, dtype=np.float64)
         deltas = sequence - nominal
         intervention_cost = float(np.sum(np.sum(deltas * deltas, axis=1)))
@@ -1304,8 +1819,22 @@ class RSSMPCFilter(RSSCBFFilter):
             ]
             if finite_clearances:
                 lateral_clearance_reward = max(0.0, float(finite_clearances[-1]))
+        target_offset = float(corridor.get("target_lateral_offset", 0.0))
+        corridor_lateral_cost = (float(final_lateral_offset) - target_offset) ** 2
+        target_clearance = float(corridor.get("target_clearance", cfg.corridor_target_clearance))
+        final_clearance = lateral_clearance_margins[-1] if lateral_clearance_margins else -math.inf
+        clearance_cost = max(0.0, target_clearance - float(final_clearance)) ** 2 if math.isfinite(final_clearance) else 0.0
+        road_cost = max(0.0, float(corridor.get("road_boundary_margin", cfg.corridor_road_boundary_margin)) - float(min_road_boundary_margin)) ** 2
+        corridor_switch_cost = 0.0
+        corridor_type = str(corridor.get("corridor_type", ""))
+        if self.active_recovery_corridor and corridor_type and corridor_type != self.active_recovery_corridor:
+            corridor_switch_cost += cfg.corridor_switch_penalty
+            if {corridor_type, self.active_recovery_corridor} == {"left_offset", "right_offset"}:
+                corridor_switch_cost += cfg.corridor_switch_penalty * max(1, self.recovery_side_switch_cooldown)
+        if corridor_type == self.active_recovery_corridor and corridor_type:
+            corridor_switch_cost -= cfg.corridor_keep_margin
 
-        return (
+        cost = (
             cfg.recovery_w_intervention * intervention_cost
             + cfg.w_smooth * smooth_cost
             + cfg.recovery_w_cbf_anchor * cbf_anchor_cost
@@ -1315,7 +1844,12 @@ class RSSMPCFilter(RSSCBFFilter):
             + cfg.w_brake * brake_penalty
             + cfg.w_stall * stall_penalty
             - cfg.w_lateral_clearance * lateral_clearance_reward
+            + cfg.w_corridor_lateral * corridor_lateral_cost
+            + cfg.w_corridor_clearance * clearance_cost
+            + cfg.w_road_boundary * road_cost
+            + corridor_switch_cost
         )
+        return float(cost)
 
     def _terminal_recoverability(
         self,
@@ -1327,12 +1861,25 @@ class RSSMPCFilter(RSSCBFFilter):
         initial_lateral_clearance: float,
         final_speed: float,
         blocking_object_final: bool,
+        corridor: Optional[Dict[str, Any]] = None,
+        final_lateral_offset: float = 0.0,
+        initial_road_boundary_margin: float = math.inf,
+        final_road_boundary_margin: float = math.inf,
     ) -> Tuple[bool, str]:
         if not rss_feasible:
             return False, "rss_not_feasible"
 
+        corridor = corridor or {}
+        if corridor.get("corridor_type") == "minimum_risk_stop":
+            if rss_feasible and final_speed <= max(self.mpc_config.stuck_speed_threshold, 0.5):
+                return True, "minimum_risk_condition"
+            return False, "minimum_risk_stop_not_reached"
+
         margin_improvement = final_margin - current_margin
         lateral_improvement = final_lateral_clearance - initial_lateral_clearance
+        target_offset = float(corridor.get("target_lateral_offset", 0.0))
+        corridor_tracking_improvement = abs(target_offset) - abs(target_offset - float(final_lateral_offset))
+        road_margin_improvement = float(final_road_boundary_margin) - float(initial_road_boundary_margin)
         if progress >= self.mpc_config.recovery_progress_threshold:
             return True, "progress_recovered"
         if margin_improvement >= self.mpc_config.recovery_margin_improvement_threshold:
@@ -1342,7 +1889,13 @@ class RSSMPCFilter(RSSCBFFilter):
         if final_lateral_clearance >= self.mpc_config.recovery_lateral_clearance_threshold:
             return True, "bypass_clearance_forming"
         if lateral_improvement >= self.mpc_config.recovery_lateral_improvement_threshold:
-            return True, "lateral_bypass_improving"
+            return True, "lateral_clearance_improved"
+        if abs(target_offset) > self.config.small_tolerance and corridor_tracking_improvement >= self.mpc_config.recovery_lateral_improvement_threshold:
+            return True, "corridor_tracking_improved"
+        if corridor.get("corridor_type") == "recenter" and road_margin_improvement > self.config.small_tolerance:
+            return True, "recentered_from_boundary"
+        if final_margin >= self.mpc_config.guard_override_margin_buffer and final_speed >= self.mpc_config.recovery_terminal_speed_threshold:
+            return True, "handoff_to_rl_safe"
         if final_speed >= self.mpc_config.recovery_terminal_speed_threshold and final_margin >= self.mpc_config.safety_margin_tolerance:
             return True, "terminal_speed_recovered"
         if initial_lateral_clearance < 0 and lateral_improvement > self.config.small_tolerance:
@@ -1486,12 +2039,41 @@ class RSSMPCFilter(RSSCBFFilter):
                 "mpc_guard_rejected": 0,
                 "cbf_guard_override_used": False,
                 "cbf_guard_override_reason": "",
+                "certified_recovery_override_used": False,
+                "certified_recovery_override_reason": "",
+                "guard_reject_reason": "",
                 "recovery_hold_used": False,
                 "mpc_failure_reason": "",
+                "mpc_num_corridors": 0,
+                "mpc_num_rss_feasible": 0,
+                "mpc_num_road_safe": 0,
+                "mpc_num_terminal_recoverable": 0,
+                "mpc_num_guard_rejected": 0,
                 "mpc_no_rss_feasible_count": 0,
+                "mpc_no_road_safe_count": 0,
                 "mpc_no_terminal_recoverable_count": 0,
                 "mpc_guard_rejected_count": 0,
                 "mpc_terminal_candidate_count": 0,
+                "active_recovery_corridor": self.active_recovery_corridor,
+                "selected_recovery_corridor": "",
+                "previous_recovery_corridor": self.previous_recovery_corridor,
+                "corridor_switch_used": False,
+                "corridor_switch_reason": "",
+                "left_corridor_available": False,
+                "right_corridor_available": False,
+                "forward_corridor_available": False,
+                "recenter_corridor_available": False,
+                "drivable_corridor_available": False,
+                "no_left_corridor": True,
+                "no_right_corridor": True,
+                "no_forward_corridor": True,
+                "no_recenter_corridor": True,
+                "road_boundary_active": False,
+                "corridor_target_lateral_offset": math.nan,
+                "corridor_target_speed": math.nan,
+                "corridor_cost": math.nan,
+                "corridor_terminal_recoverable": False,
+                "first_step_recovery_feasible": False,
                 "first_step_recovery_reason": "",
                 "recovery_horizon_steps_used": self.mpc_config.horizon_steps,
                 "recovery_candidate_family": "",
