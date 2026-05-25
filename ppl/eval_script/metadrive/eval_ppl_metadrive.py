@@ -33,6 +33,7 @@ from ppl.ppl import PPL
 from ppl.sb3.td3.policies import TD3Policy
 from ppl.utils.print_dict_utils import pretty_print, RecorderEnv
 from ppl.utils.rss_cbf_filter import RSSCBFConfig, RSSCBFFilter
+from ppl.utils.rss_mpc_filter import RSSMPCConfig, RSSMPCFilter
 from ppl.utils.train_eval_config import baseline_eval_config
 
 EVAL_ENV_START = baseline_eval_config["start_seed"]  # Evaluation seeds start from the shared eval config.
@@ -102,8 +103,9 @@ def make_rss_cbf_step_record(
     internal_action_safe,
     rss_info,
     env_info=None,
+    method="ppl_rss_cbf",
 ):
-    """Flatten one RSS-CBF runtime assurance decision for step-level CSV logging."""
+    """Flatten one runtime assurance decision for step-level CSV logging."""
     env_info = env_info or {}
     rss_info = rss_info or {}
     action_delta = float(
@@ -114,7 +116,7 @@ def make_rss_cbf_step_record(
     )
     return dict(
         ckpt_index=ckpt_index,
-        method="ppl_rss_cbf",
+        method=method,
         env_id=env_id,
         episode=episode,
         episode_in_env=episode_in_env,
@@ -122,6 +124,28 @@ def make_rss_cbf_step_record(
         mode=rss_info.get("mode", "unknown"),
         reason=rss_info.get("reason", ""),
         rss_margin=rss_info.get("rss_margin", np.nan),
+        rss_margin_current=rss_info.get("rss_margin_current", rss_info.get("rss_margin", np.nan)),
+        rss_margin_min_pred=rss_info.get("rss_margin_min_pred", np.nan),
+        rss_margin_final_pred=rss_info.get("rss_margin_final_pred", np.nan),
+        rss_lateral_clearance_min_pred=rss_info.get("rss_lateral_clearance_min_pred", np.nan),
+        rss_lateral_clearance_final_pred=rss_info.get("rss_lateral_clearance_final_pred", np.nan),
+        predicted_progress=rss_info.get("predicted_progress", np.nan),
+        mpc_success=rss_info.get("mpc_success", np.nan),
+        mpc_num_candidates=rss_info.get("mpc_num_candidates", np.nan),
+        mpc_num_feasible=rss_info.get("mpc_num_feasible", np.nan),
+        mpc_best_cost=rss_info.get("mpc_best_cost", np.nan),
+        fallback_used=rss_info.get("fallback_used", False),
+        cbf_mode=rss_info.get("cbf_mode", ""),
+        cbf_reason=rss_info.get("cbf_reason", ""),
+        cbf_action_delta=rss_info.get("cbf_action_delta", np.nan),
+        cbf_acc_safe=rss_info.get("cbf_acc_safe", np.nan),
+        cbf_steer_safe=rss_info.get("cbf_steer_safe", np.nan),
+        cbf_reference_mode=rss_info.get("cbf_reference_mode", ""),
+        cbf_reference_action_delta=rss_info.get("cbf_reference_action_delta", np.nan),
+        cbf_reference_acc_safe=rss_info.get("cbf_reference_acc_safe", np.nan),
+        cbf_reference_steer_safe=rss_info.get("cbf_reference_steer_safe", np.nan),
+        cbf_guard_used=rss_info.get("cbf_guard_used", False),
+        cbf_guard_delta=rss_info.get("cbf_guard_delta", np.nan),
         dynamic_vehicle_detected=rss_info.get("dynamic_vehicle_detected", False),
         action_delta=action_delta,
         acc_nominal=rss_info.get("acc_nominal", np.nan),
@@ -155,7 +179,7 @@ def make_rss_cbf_step_record(
 
 
 def summarize_rss_cbf_steps(step_records):
-    """Create checkpoint-level RSS-CBF diagnostics for console output."""
+    """Create checkpoint-level runtime assurance diagnostics for console output."""
     if not step_records:
         return dict(
             total_steps=0,
@@ -163,6 +187,9 @@ def summarize_rss_cbf_steps(step_records):
             changed_rate=0.0,
             modes={},
             cost_by_mode={},
+            avg_mpc_num_feasible=0.0,
+            fallback_count=0,
+            cbf_guard_count=0,
         )
 
     modes = [record["mode"] for record in step_records]
@@ -174,12 +201,27 @@ def summarize_rss_cbf_steps(step_records):
         if pd.notna(cost):
             mode = record.get("mode", "unknown")
             cost_by_mode[mode] = cost_by_mode.get(mode, 0.0) + float(cost)
+
+    feasible_values = [
+        float(record.get("mpc_num_feasible"))
+        for record in step_records
+        if pd.notna(record.get("mpc_num_feasible", np.nan))
+    ]
+    fallback_count = sum(
+        1
+        for record in step_records
+        if record.get("fallback_used", False) or record.get("mode") == "rss_mpc_fallback_to_cbf"
+    )
+    cbf_guard_count = sum(1 for record in step_records if record.get("cbf_guard_used", False))
     return dict(
         total_steps=len(step_records),
         changed_actions=changed_actions,
         changed_rate=changed_actions / max(len(step_records), 1),
         modes=mode_counts,
         cost_by_mode=cost_by_mode,
+        avg_mpc_num_feasible=float(np.mean(feasible_values)) if feasible_values else 0.0,
+        fallback_count=fallback_count,
+        cbf_guard_count=cbf_guard_count,
     )
 
 
@@ -192,6 +234,7 @@ def evaluate_ppl_once(
     total_env_num=50,
     deterministic=True,
     rss_cbf=False,
+    rss_mpc=False,
     rss_cbf_diagnostics=False,
     eval_max_steps_per_episode=3000,
     eval_env_start=EVAL_ENV_START,
@@ -227,6 +270,9 @@ def evaluate_ppl_once(
         print("=====\nCheckpoint not found: {}\n=====".format(zip_path))
         return None
 
+    if rss_cbf and rss_mpc:
+        raise ValueError("Use only one runtime assurance mode: --rss_cbf or --rss_mpc")
+
     os.makedirs(folder_name, exist_ok=True)
 
     env = make_metadrive_env(use_render, eval_env_start=eval_env_start)
@@ -237,15 +283,24 @@ def evaluate_ppl_once(
         env.close()
         return None
 
-    method = "ppl_rss_cbf" if rss_cbf else "ppl"
+    method = "ppl_rss_mpc" if rss_mpc else ("ppl_rss_cbf" if rss_cbf else "ppl")
     rss_filter = None
-    save_rss_cbf_step_csv = bool(rss_cbf or rss_cbf_diagnostics)
-    if rss_cbf:
+    runtime_label = ""
+    step_file_tag = ""
+    save_runtime_step_csv = bool(rss_cbf or rss_mpc or rss_cbf_diagnostics)
+    if rss_mpc:
+        rss_filter = RSSMPCFilter(RSSMPCConfig())
+        runtime_label = "RSS-MPC"
+        step_file_tag = "rss_mpc"
+        print("[RSS-MPC] Runtime assurance enabled. Step diagnostics will be saved.")
+    elif rss_cbf:
         rss_filter = RSSCBFFilter(RSSCBFConfig())
+        runtime_label = "RSS-CBF"
+        step_file_tag = "rss_cbf"
         print("[RSS-CBF] Runtime assurance enabled. Step diagnostics will be saved.")
 
     saved_results = []
-    rss_cbf_step_records = []
+    runtime_step_records = []
     ep_velocities = []
     rss_adapter_error_printed = False
     rss_total_steps = 0
@@ -301,7 +356,7 @@ def evaluate_ppl_once(
                         "adapter_error": str(error),
                     }
                     if not rss_adapter_error_printed:
-                        print("[RSS-CBF] Adapter failed once; continuing without filtering. Error: {}".format(error))
+                        print("[{}] Adapter failed once; continuing without filtering. Error: {}".format(runtime_label, error))
                         rss_adapter_error_printed = True
 
                 rss_total_steps += 1
@@ -313,7 +368,7 @@ def evaluate_ppl_once(
             o, r, d, info = env.step(action)
             step_count += 1
 
-            if rss_filter is not None and save_rss_cbf_step_csv:
+            if rss_filter is not None and save_runtime_step_csv:
                 record = make_rss_cbf_step_record(
                     ckpt_index=ckpt_index,
                     env_id=eval_env_start + env_index,
@@ -326,8 +381,9 @@ def evaluate_ppl_once(
                     internal_action_safe=internal_action_safe,
                     rss_info=rss_info,
                     env_info=info,
+                    method=method,
                 )
-                rss_cbf_step_records.append(record)
+                runtime_step_records.append(record)
 
             if info:
                 ep_velocities.append(info.get("velocity", 0))
@@ -378,9 +434,9 @@ def evaluate_ppl_once(
                 # Backup CSV
                 tmp_path = osp.join(folder_name, "{}_tmp.csv".format(ckpt_name))
                 df.to_csv(tmp_path)
-                if rss_filter is not None and save_rss_cbf_step_csv and rss_cbf_step_records:
-                    tmp_step_path = osp.join(folder_name, "{}_rss_cbf_steps_tmp.csv".format(ckpt_name))
-                    pd.DataFrame(rss_cbf_step_records).to_csv(tmp_step_path, index=False)
+                if rss_filter is not None and save_runtime_step_csv and runtime_step_records:
+                    tmp_step_path = osp.join(folder_name, "{}_{}_steps_tmp.csv".format(ckpt_name, step_file_tag))
+                    pd.DataFrame(runtime_step_records).to_csv(tmp_step_path, index=False)
 
                 step_count = 0
 
@@ -430,24 +486,40 @@ def evaluate_ppl_once(
     df.to_csv(final_path)
     print("Final results saved to: {}".format(final_path))
 
-    if rss_filter is not None and save_rss_cbf_step_csv:
-        step_path = osp.join(folder_name, "{}_rss_cbf_steps.csv".format(ckpt_name))
-        pd.DataFrame(rss_cbf_step_records).to_csv(step_path, index=False)
-        print("RSS-CBF step-level results saved to: {}".format(step_path))
+    if rss_filter is not None and save_runtime_step_csv:
+        step_path = osp.join(folder_name, "{}_{}_steps.csv".format(ckpt_name, step_file_tag))
+        pd.DataFrame(runtime_step_records).to_csv(step_path, index=False)
+        print("{} step-level results saved to: {}".format(runtime_label, step_path))
 
     if rss_filter is not None:
-        rss_summary = summarize_rss_cbf_steps(rss_cbf_step_records)
+        rss_summary = summarize_rss_cbf_steps(runtime_step_records)
         changed_rate = rss_changed_steps / max(rss_total_steps, 1)
-        print(
-            "[RSS-CBF] total_steps={} changed_actions={} changed_rate={:.4f} "
-            "modes={} cost_by_mode={}".format(
-                rss_total_steps,
-                rss_changed_steps,
-                changed_rate,
-                rss_summary["modes"] if rss_cbf_step_records else rss_mode_counts,
-                rss_summary["cost_by_mode"],
+        if rss_mpc:
+            print(
+                "[RSS-MPC] total_steps={} changed_actions={} changed_rate={:.4f} "
+                "modes={} cost_by_mode={} avg_mpc_num_feasible={:.2f} "
+                "fallback_count={} cbf_guard_count={}".format(
+                    rss_total_steps,
+                    rss_changed_steps,
+                    changed_rate,
+                    rss_summary["modes"] if runtime_step_records else rss_mode_counts,
+                    rss_summary["cost_by_mode"],
+                    rss_summary["avg_mpc_num_feasible"],
+                    rss_summary["fallback_count"],
+                    rss_summary["cbf_guard_count"],
+                )
             )
-        )
+        else:
+            print(
+                "[RSS-CBF] total_steps={} changed_actions={} changed_rate={:.4f} "
+                "modes={} cost_by_mode={}".format(
+                    rss_total_steps,
+                    rss_changed_steps,
+                    changed_rate,
+                    rss_summary["modes"] if runtime_step_records else rss_mode_counts,
+                    rss_summary["cost_by_mode"],
+                )
+            )
 
     df["model_name"] = ckpt_name
     return df
@@ -525,12 +597,20 @@ if __name__ == "__main__":
         help="Enable RSS-CBF runtime assurance safety filter.",
     )
     parser.add_argument(
+        "--rss_mpc",
+        action="store_true",
+        help="Enable RSS-MPC runtime assurance safety filter.",
+    )
+    parser.add_argument(
         "--rss_cbf_diagnostics",
         action="store_true",
         help="Save RSS-CBF step-level diagnostics. Enabled automatically by --rss_cbf.",
     )
 
     args = parser.parse_args()
+
+    if args.rss_cbf and args.rss_mpc:
+        raise ValueError("Use only one runtime assurance mode: --rss_cbf or --rss_mpc")
 
     deterministic = not args.stochastic
 
@@ -547,6 +627,7 @@ if __name__ == "__main__":
             total_env_num=args.total_env_num,
             deterministic=deterministic,
             rss_cbf=args.rss_cbf,
+            rss_mpc=args.rss_mpc,
             rss_cbf_diagnostics=args.rss_cbf_diagnostics,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
@@ -566,6 +647,7 @@ if __name__ == "__main__":
             total_env_num=args.total_env_num,
             deterministic=deterministic,
             rss_cbf=args.rss_cbf,
+            rss_mpc=args.rss_mpc,
             rss_cbf_diagnostics=args.rss_cbf_diagnostics,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
@@ -589,6 +671,7 @@ if __name__ == "__main__":
                 total_env_num=args.total_env_num,
                 deterministic=deterministic,
                 rss_cbf=args.rss_cbf,
+                rss_mpc=args.rss_mpc,
                 rss_cbf_diagnostics=args.rss_cbf_diagnostics,
                 eval_max_steps_per_episode=args.eval_max_steps_per_episode,
                 eval_env_start=args.eval_start_seed,

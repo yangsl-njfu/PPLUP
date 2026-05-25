@@ -2,25 +2,32 @@
 
 param(
     [switch]$RSSCBF,
+    [switch]$RSSMPC,
     [switch]$RSSCBFDiagnostics
 )
 
 # ========== Configuration ==========
 $MODEL_DIR = "E:\CodeProject\CodexExp01\PPL-main\runs\PPL\PPL_0ee03603\models"
-$METHOD = if ($RSSCBF) { "ppl_rss_cbf" } else { "ppl" }
-$RESULT_DIR = if ($RSSCBF) { "evaluation_results\PPL_0ee03603_rss_cbf_test" } else { "evaluation_results\PPL_0ee03603-enhanced" }
-$START_STEP = 8000
+if ($RSSCBF -and $RSSMPC) {
+    throw "Use only one runtime assurance mode: -RSSCBF or -RSSMPC"
+}
+$METHOD = if ($RSSMPC) { "ppl_rss_mpc" } elseif ($RSSCBF) { "ppl_rss_cbf" } else { "ppl" }
+$RESULT_DIR = if ($RSSMPC) { "evaluation_results\PPL_0ee03603_rss_mpc" } elseif ($RSSCBF) { "evaluation_results\PPL_0ee03603_rss_cbf_test" } else { "evaluation_results\PPL_0ee03603-enhanced" }
+$START_STEP = 6000
 $END_STEP = 10000
 $STEP_INTERVAL = 200
 $NUM_EP_IN_ONE_ENV = 1
 $TOTAL_ENV_NUM = 50
 
-$RSS_CBF_ARGS = @()
+$RA_ARGS = @()
 if ($RSSCBF) {
-    $RSS_CBF_ARGS += "--rss_cbf"
+    $RA_ARGS += "--rss_cbf"
+}
+if ($RSSMPC) {
+    $RA_ARGS += "--rss_mpc"
 }
 if ($RSSCBFDiagnostics -or $RSSCBF) {
-    $RSS_CBF_ARGS += "--rss_cbf_diagnostics"
+    $RA_ARGS += "--rss_cbf_diagnostics"
 }
 
 # ========== Start Evaluation ==========
@@ -29,6 +36,7 @@ Write-Host "Model Directory: $MODEL_DIR" -ForegroundColor White
 Write-Host "Result Directory: $RESULT_DIR" -ForegroundColor White
 Write-Host "Method: $METHOD" -ForegroundColor White
 Write-Host "RSS-CBF Runtime Assurance: $RSSCBF" -ForegroundColor White
+Write-Host "RSS-MPC Runtime Assurance: $RSSMPC" -ForegroundColor White
 Write-Host "Step Range: $START_STEP -> $END_STEP (interval $STEP_INTERVAL)" -ForegroundColor White
 Write-Host "Episodes per Env: $NUM_EP_IN_ONE_ENV, Total Envs: $TOTAL_ENV_NUM" -ForegroundColor White
 Write-Host ""
@@ -49,7 +57,7 @@ for ($step = $START_STEP; $step -le $END_STEP; $step += $STEP_INTERVAL) {
     if (Test-Path $model_path) {
         try {
             Write-Host "[$current_count/$total_ckpts] Evaluating checkpoint $step ..." -ForegroundColor Green
-            python -m ppl.eval_script.metadrive.eval_ppl_metadrive --path "$MODEL_DIR" --ckpt_index $step --ret_save_folder "$RESULT_DIR" --num_ep_in_one_env $NUM_EP_IN_ONE_ENV --total_env_num $TOTAL_ENV_NUM @RSS_CBF_ARGS
+            python -m ppl.eval_script.metadrive.eval_ppl_metadrive --path "$MODEL_DIR" --ckpt_index $step --ret_save_folder "$RESULT_DIR" --num_ep_in_one_env $NUM_EP_IN_ONE_ENV --total_env_num $TOTAL_ENV_NUM @RA_ARGS
             if ($LASTEXITCODE -ne 0) {
                 throw "Python evaluation failed for checkpoint $step with exit code $LASTEXITCODE"
             }
@@ -124,7 +132,10 @@ if (Test-Path $MERGED_CSV) {
 
 Write-Host "`nCleaning up temporary checkpoint episode CSV files..." -ForegroundColor Cyan
 $temp_files = Get-ChildItem -Path $RESULT_DIR -Filter "checkpoint_*.csv" | Where-Object {
-    $_.Name -notlike "*_rss_cbf_steps.csv" -and $_.Name -notlike "*_rss_cbf_steps_tmp.csv"
+    $_.Name -notlike "*_rss_cbf_steps.csv" -and
+    $_.Name -notlike "*_rss_cbf_steps_tmp.csv" -and
+    $_.Name -notlike "*_rss_mpc_steps.csv" -and
+    $_.Name -notlike "*_rss_mpc_steps_tmp.csv"
 }
 $deleted_count = 0
 foreach ($file in $temp_files) {
@@ -138,4 +149,7 @@ Write-Host "1. Detailed data: $MERGED_CSV" -ForegroundColor Yellow
 Write-Host "2. Summary data: $SUMMARY_CSV" -ForegroundColor Yellow
 if ($RSSCBF) {
     Write-Host "3. RSS-CBF step diagnostics: $RESULT_DIR\checkpoint_XXXX_rss_cbf_steps.csv" -ForegroundColor Yellow
+}
+if ($RSSMPC) {
+    Write-Host "3. RSS-MPC step diagnostics: $RESULT_DIR\checkpoint_XXXX_rss_mpc_steps.csv" -ForegroundColor Yellow
 }
