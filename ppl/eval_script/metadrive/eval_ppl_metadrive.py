@@ -155,7 +155,10 @@ def make_rss_cbf_step_record(
         deadlock_window_progress=rss_info.get("deadlock_window_progress", np.nan),
         deadlock_window_avg_speed=rss_info.get("deadlock_window_avg_speed", np.nan),
         deadlock_cbf_active_ratio=rss_info.get("deadlock_cbf_active_ratio", np.nan),
+        deadlock_front_active_ratio=rss_info.get("deadlock_front_active_ratio", np.nan),
+        deadlock_avg_cbf_delta=rss_info.get("deadlock_avg_cbf_delta", np.nan),
         deadlock_cbf_fallback_ratio=rss_info.get("deadlock_cbf_fallback_ratio", np.nan),
+        deadlock_route_completion=rss_info.get("deadlock_route_completion", np.nan),
         deadlock_reason=rss_info.get("deadlock_reason", ""),
         terminal_recoverable=rss_info.get("terminal_recoverable", False),
         terminal_recovery_reason=rss_info.get("terminal_recovery_reason", ""),
@@ -165,6 +168,9 @@ def make_rss_cbf_step_record(
         minimum_risk_stop_used=rss_info.get("minimum_risk_stop_used", False),
         mpc_terminal_feasible=rss_info.get("mpc_terminal_feasible", np.nan),
         mpc_guard_rejected=rss_info.get("mpc_guard_rejected", np.nan),
+        cbf_guard_override_used=rss_info.get("cbf_guard_override_used", False),
+        cbf_guard_override_reason=rss_info.get("cbf_guard_override_reason", ""),
+        recovery_hold_used=rss_info.get("recovery_hold_used", False),
         dynamic_vehicle_detected=rss_info.get("dynamic_vehicle_detected", False),
         action_delta=action_delta,
         acc_nominal=rss_info.get("acc_nominal", np.nan),
@@ -332,6 +338,7 @@ def evaluate_ppl_once(
         ep_count = 0
         step_count = 0
         ep_times = []
+        runtime_step_flush_interval = 100
 
         env_index = 0
         num_ep_in = 0
@@ -407,6 +414,9 @@ def evaluate_ppl_once(
                     method=method,
                 )
                 runtime_step_records.append(record)
+                if step_count % runtime_step_flush_interval == 0:
+                    tmp_step_path = osp.join(folder_name, "{}_{}_steps_tmp.csv".format(ckpt_name, step_file_tag))
+                    pd.DataFrame(runtime_step_records).to_csv(tmp_step_path, index=False)
 
             if info:
                 ep_velocities.append(info.get("velocity", 0))

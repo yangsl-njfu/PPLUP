@@ -76,6 +76,12 @@ class RSSMPCConfig(RSSCBFConfig):
     guard_delta_cost_weight: float = 25.0
     guard_brake_cost_weight: float = 20.0
     guard_stall_brake_cost: float = 100.0
+    guard_eval_top_k: int = 8
+    guard_override_margin_buffer: float = 2.0
+    guard_override_fallback_margin_buffer: float = 4.0
+    guard_override_min_acc: float = 0.2
+    recovery_hold_steps: int = 3
+    recovery_hold_margin_buffer: float = 4.0
     creep_acc: float = 0.6
     nudge_steer: float = 0.35
     bypass_steer: float = 0.8
@@ -115,12 +121,16 @@ class RSSMPCFilter(RSSCBFFilter):
         self.deadlock_history: Deque[Dict[str, Any]] = deque(maxlen=self.mpc_config.deadlock_window_steps)
         self.deadlock_counter = 0
         self._last_route_completion = math.nan
+        self._held_recovery_action: Optional[Action] = None
+        self._held_recovery_ttl = 0
 
     def reset(self) -> None:
         """Clear rolling deadlock state at episode reset."""
         self.deadlock_history.clear()
         self.deadlock_counter = 0
         self._last_route_completion = math.nan
+        self._held_recovery_action = None
+        self._held_recovery_ttl = 0
 
     def update_after_step(self, env_info: Optional[Dict[str, Any]]) -> None:
         """Optionally attach post-step route progress to the newest history sample."""
@@ -217,6 +227,47 @@ class RSSMPCFilter(RSSCBFFilter):
             )
 
         if not deadlock_info["deadlock_risk"]:
+            held_recovery = self._take_held_recovery_action(current_margin)
+            if held_recovery is not None and cbf_info.get("mode") == "fallback_no_safe_candidate":
+                return held_recovery, self._make_mpc_info(
+                    state=state,
+                    obj=obj,
+                    object_kind=object_kind,
+                    mode="rss_mpc_recovery",
+                    reason="mpc_recovery_hold_no_deadlock_large_margin",
+                    u_original=u_original,
+                    u_safe=held_recovery,
+                    d_front=d_front,
+                    d_rss=d_rss,
+                    rss_margin_current=current_margin,
+                    dynamic_vehicle_detected=dynamic_detected,
+                    obstacle_detected=static_detected,
+                    mpc_success=True,
+                    mpc_num_candidates=0,
+                    mpc_num_feasible=0,
+                    mpc_best_cost=math.nan,
+                    rss_margin_min_pred=math.nan,
+                    rss_margin_final_pred=math.nan,
+                    rss_lateral_clearance_min_pred=math.nan,
+                    rss_lateral_clearance_final_pred=math.nan,
+                    predicted_progress=math.nan,
+                    fallback_used=False,
+                    cbf_info=cbf_info,
+                    cbf_reference_info=cbf_info,
+                    cbf_guard_used=False,
+                    cbf_guard_delta=0.0,
+                    extra_info=self._merge_recovery_info(
+                        deadlock_info,
+                        {
+                            "mpc_called": False,
+                            "mpc_call_reason": "held_recovery_after_deadlock",
+                            "cbf_guard_override_used": True,
+                            "cbf_guard_override_reason": "held_certified_recovery_action_with_large_rss_margin",
+                            "recovery_hold_used": True,
+                        },
+                    ),
+                )
+
             if cbf_info.get("mode") == "fallback_no_safe_candidate":
                 u_cbf_only = self._minimum_risk_stop(u_original)
                 cbf_only_mode = "minimum_risk_stop"
@@ -265,6 +316,7 @@ class RSSMPCFilter(RSSCBFFilter):
         feasible_count = 0
         terminal_feasible_count = 0
         guard_rejected_count = 0
+        terminal_feasible_candidates: List[Dict[str, Any]] = []
 
         for sequence in candidates:
             evaluation = self._evaluate_sequence(
@@ -279,6 +331,11 @@ class RSSMPCFilter(RSSCBFFilter):
             if not evaluation["feasible"]:
                 continue
             terminal_feasible_count += 1
+            terminal_feasible_candidates.append(evaluation)
+
+        guard_eval_limit = max(1, int(self.mpc_config.guard_eval_top_k))
+        terminal_feasible_candidates.sort(key=lambda item: item["cost"])
+        for evaluation in terminal_feasible_candidates[:guard_eval_limit]:
             guard_eval = self._evaluate_guarded_first_action(state, evaluation)
             if not guard_eval["guard_safe"]:
                 guard_rejected_count += 1
@@ -288,6 +345,8 @@ class RSSMPCFilter(RSSCBFFilter):
             feasible_count += 1
             if best is None or evaluation["cost"] < best["cost"]:
                 best = evaluation
+        if best is None and len(terminal_feasible_candidates) > guard_eval_limit:
+            guard_rejected_count += len(terminal_feasible_candidates) - guard_eval_limit
 
         if best is not None:
             u_mpc = self._clip_action(best["u_mpc_first"])
@@ -295,8 +354,14 @@ class RSSMPCFilter(RSSCBFFilter):
             guard_info = best["guard_info"]
             cbf_guard_delta = best["cbf_guard_delta"]
             cbf_guard_used = best["cbf_guard_used"]
-            mode = "rss_mpc_cbf_guard" if cbf_guard_used else "rss_mpc_recovery"
-            reason = "cbf_guard_projected_mpc_recovery" if cbf_guard_used else "mpc_recovery_sequence"
+            guard_override_used = best.get("cbf_guard_override_used", False)
+            if guard_override_used:
+                mode = "rss_mpc_recovery"
+                reason = "mpc_recovery_large_margin_guard_override"
+                self._remember_recovery_action(u_safe)
+            else:
+                mode = "rss_mpc_cbf_guard" if cbf_guard_used else "rss_mpc_recovery"
+                reason = "cbf_guard_projected_mpc_recovery" if cbf_guard_used else "mpc_recovery_sequence"
             return u_safe, self._make_mpc_info(
                 state=state,
                 obj=obj,
@@ -336,6 +401,51 @@ class RSSMPCFilter(RSSCBFFilter):
                         "blocking_object_final": best["blocking_object_final"],
                         "mpc_terminal_feasible": terminal_feasible_count,
                         "mpc_guard_rejected": guard_rejected_count,
+                        "cbf_guard_override_used": guard_override_used,
+                        "cbf_guard_override_reason": best.get("cbf_guard_override_reason", ""),
+                    },
+                ),
+            )
+
+        held_recovery = self._take_held_recovery_action(current_margin)
+        if held_recovery is not None and cbf_info.get("mode") == "fallback_no_safe_candidate":
+            return held_recovery, self._make_mpc_info(
+                state=state,
+                obj=obj,
+                object_kind=object_kind,
+                mode="rss_mpc_recovery",
+                reason="mpc_recovery_hold_large_margin",
+                u_original=u_original,
+                u_safe=held_recovery,
+                d_front=d_front,
+                d_rss=d_rss,
+                rss_margin_current=current_margin,
+                dynamic_vehicle_detected=dynamic_detected,
+                obstacle_detected=static_detected,
+                mpc_success=True,
+                mpc_num_candidates=len(candidates),
+                mpc_num_feasible=0,
+                mpc_best_cost=math.nan,
+                rss_margin_min_pred=math.nan,
+                rss_margin_final_pred=math.nan,
+                rss_lateral_clearance_min_pred=math.nan,
+                rss_lateral_clearance_final_pred=math.nan,
+                predicted_progress=math.nan,
+                fallback_used=False,
+                cbf_info=cbf_info,
+                cbf_reference_info=cbf_info,
+                cbf_guard_used=False,
+                cbf_guard_delta=0.0,
+                extra_info=self._merge_recovery_info(
+                    deadlock_info,
+                    {
+                        "mpc_called": True,
+                        "mpc_call_reason": "deadlock_risk",
+                        "mpc_terminal_feasible": terminal_feasible_count,
+                        "mpc_guard_rejected": guard_rejected_count,
+                        "cbf_guard_override_used": True,
+                        "cbf_guard_override_reason": "held_certified_recovery_action_with_large_rss_margin",
+                        "recovery_hold_used": True,
                     },
                 ),
             )
@@ -398,6 +508,20 @@ class RSSMPCFilter(RSSCBFFilter):
 
     def _minimum_risk_stop(self, u_nom: Action) -> Action:
         return self._clip_action([self.mpc_config.strong_brake, u_nom[1]])
+
+    def _remember_recovery_action(self, action: Sequence[float]) -> None:
+        self._held_recovery_action = self._clip_action(action)
+        self._held_recovery_ttl = max(0, int(self.mpc_config.recovery_hold_steps))
+
+    def _take_held_recovery_action(self, current_margin: float) -> Optional[Action]:
+        if self._held_recovery_action is None or self._held_recovery_ttl <= 0:
+            return None
+        if not math.isfinite(current_margin) or current_margin < self.mpc_config.recovery_hold_margin_buffer:
+            self._held_recovery_action = None
+            self._held_recovery_ttl = 0
+            return None
+        self._held_recovery_ttl -= 1
+        return self._clip_action(self._held_recovery_action)
 
     def _update_deadlock_detector(
         self,
@@ -699,25 +823,39 @@ class RSSMPCFilter(RSSCBFFilter):
             final_speed=final_speed,
             blocking_object_final=blocking_object_final,
         )
+        current_speed = self._ego_speed(state)
+        first_acc = float(sequence[0][0]) if len(sequence) else self.mpc_config.strong_brake
+        first_step_recovery_feasible = True
+        if current_speed <= self.mpc_config.stuck_speed_threshold:
+            first_step_recovery_feasible = first_acc >= self.mpc_config.guard_override_min_acc
+
         speed_feasible = all(
             -self.config.small_tolerance <= speed <= self.mpc_config.v_max + self.config.small_tolerance
             for speed in speeds
         )
         progress_feasible = progress >= -self.config.small_tolerance
-        feasible = bool(rss_feasible and speed_feasible and progress_feasible and terminal_recoverable)
+        feasible = bool(
+            rss_feasible
+            and speed_feasible
+            and progress_feasible
+            and terminal_recoverable
+            and first_step_recovery_feasible
+        )
 
         cost = self._sequence_cost(
             sequence=sequence,
             u_nom=u_nom,
             u_cbf=u_cbf,
-            current_speed=self._ego_speed(state),
+            current_speed=current_speed,
             speeds=speeds,
             margins=margins,
             lateral_clearance_margins=lateral_clearance_margins,
             progress=progress,
         )
 
-        if not speed_feasible:
+        if not first_step_recovery_feasible:
+            reason = "recovery_first_step_no_progress"
+        elif not speed_feasible:
             reason = "rollout_speed_out_of_bounds"
         elif not progress_feasible:
             reason = "rollout_negative_progress"
@@ -726,6 +864,7 @@ class RSSMPCFilter(RSSCBFFilter):
             "sequence": sequence,
             "feasible": feasible,
             "cost": cost,
+            "rss_margin_current": current_margin,
             "rss_margin_min_pred": min_margin,
             "rss_margin_final_pred": final_margin,
             "rss_lateral_clearance_min_pred": min_lateral_clearance,
@@ -748,29 +887,103 @@ class RSSMPCFilter(RSSCBFFilter):
         guard_delta = self._action_norm(u_guarded, u_mpc)
         guard_mode = guard_info.get("mode", "")
         guard_fallback = guard_mode == "fallback_no_safe_candidate"
+        guard_override_used, guard_override_reason = self._guard_override_for_certified_recovery(
+            state=state,
+            evaluation=evaluation,
+            u_mpc=u_mpc,
+            u_guarded=u_guarded,
+            guard_mode=guard_mode,
+        )
+        u_effective = u_mpc if guard_override_used else u_guarded
 
-        guarded_acc = float(u_guarded[0])
+        guarded_acc = float(u_effective[0])
         current_speed = self._ego_speed(state)
         guard_cost = self.mpc_config.guard_delta_cost_weight * guard_delta * guard_delta
-        guard_cost += self.mpc_config.guard_brake_cost_weight * max(0.0, -guarded_acc) ** 2
+        guard_cost += self.mpc_config.guard_brake_cost_weight * max(0.0, -float(u_guarded[0])) ** 2
         if current_speed <= self.mpc_config.stuck_speed_threshold and guarded_acc <= self.mpc_config.comfort_brake:
             guard_cost += self.mpc_config.guard_stall_brake_cost
+        if guard_override_used:
+            guard_cost *= 0.1
 
-        guard_safe = not guard_fallback
+        guard_safe = guard_override_used or not guard_fallback
         if guard_safe and current_speed <= self.mpc_config.stuck_speed_threshold:
-            progress_guarded = guarded_acc > self.mpc_config.comfort_brake
-            lateral_recovery = abs(float(u_guarded[1])) >= min(0.25, self.mpc_config.nudge_steer)
+            progress_guarded = guarded_acc >= self.mpc_config.guard_override_min_acc
+            lateral_recovery = abs(float(u_effective[1])) >= min(0.25, self.mpc_config.nudge_steer)
             guard_safe = progress_guarded or lateral_recovery
 
         return {
             "guard_safe": bool(guard_safe),
             "guard_cost": float(guard_cost),
             "u_mpc_first": u_mpc,
-            "u_guarded_first": u_guarded,
+            "u_guarded_first": u_effective,
             "guard_info": guard_info,
-            "cbf_guard_used": guard_delta > self.mpc_config.action_change_tolerance,
+            "cbf_guard_used": (not guard_override_used) and guard_delta > self.mpc_config.action_change_tolerance,
             "cbf_guard_delta": float(guard_delta),
+            "cbf_guard_override_used": bool(guard_override_used),
+            "cbf_guard_override_reason": guard_override_reason,
         }
+
+    def _guard_override_for_certified_recovery(
+        self,
+        state: State,
+        evaluation: Dict[str, Any],
+        u_mpc: Action,
+        u_guarded: Action,
+        guard_mode: str,
+    ) -> Tuple[bool, str]:
+        """Permit MPC-certified creep when one-step CBF is overly conservative.
+
+        RSS-CBF requires the margin to be non-decreasing, which can freeze a
+        stopped vehicle behind a static blocker even when the RSS buffer remains
+        large. In deadlock recovery only, the MPC horizon can certify that a
+        small forward/bypass action keeps all predicted RSS margins positive.
+        """
+        current_speed = self._ego_speed(state)
+        if current_speed > self.mpc_config.stuck_speed_threshold:
+            return False, ""
+        if guard_mode not in {"rss_cbf_intervention", "rss_cbf_recovery", "fallback_no_safe_candidate"}:
+            return False, ""
+        if float(u_mpc[0]) < self.mpc_config.guard_override_min_acc:
+            return False, ""
+        if guard_mode != "fallback_no_safe_candidate" and float(u_guarded[0]) >= self.mpc_config.guard_override_min_acc:
+            return False, ""
+
+        margin_buffer = (
+            self.mpc_config.guard_override_fallback_margin_buffer
+            if guard_mode == "fallback_no_safe_candidate"
+            else self.mpc_config.guard_override_margin_buffer
+        )
+        min_margin = float(evaluation.get("rss_margin_min_pred", -math.inf))
+        final_margin = float(evaluation.get("rss_margin_final_pred", -math.inf))
+        current_margin = float(evaluation.get("rss_margin_current", math.inf))
+        certified_margin = (
+            math.isfinite(min_margin)
+            and math.isfinite(final_margin)
+            and min_margin >= margin_buffer
+            and final_margin >= margin_buffer
+            and current_margin >= margin_buffer
+        )
+        if not certified_margin:
+            return False, ""
+
+        progress = float(evaluation.get("predicted_progress", 0.0))
+        lateral_clearance = float(evaluation.get("rss_lateral_clearance_final_pred", -math.inf))
+        lateral_improving = evaluation.get("terminal_recovery_reason") in {
+            "blocking_object_cleared",
+            "bypass_clearance_forming",
+            "lateral_bypass_improving",
+        }
+        if progress <= self.config.small_tolerance and not lateral_improving:
+            return False, ""
+
+        if lateral_improving:
+            prefix = "mpc_certified_cbf_fallback" if guard_mode == "fallback_no_safe_candidate" else "mpc_certified"
+            return True, "{}_lateral_recovery_with_large_rss_margin".format(prefix)
+        if lateral_clearance >= self.mpc_config.recovery_lateral_clearance_threshold:
+            prefix = "mpc_certified_cbf_fallback" if guard_mode == "fallback_no_safe_candidate" else "mpc_certified"
+            return True, "{}_clearance_recovery_with_large_rss_margin".format(prefix)
+        prefix = "mpc_certified_cbf_fallback" if guard_mode == "fallback_no_safe_candidate" else "mpc_certified"
+        return True, "{}_creep_with_large_rss_margin".format(prefix)
 
     def _rss_sequence_feasibility(
         self,
@@ -1014,6 +1227,9 @@ class RSSMPCFilter(RSSCBFFilter):
                 "minimum_risk_stop_used": False,
                 "mpc_terminal_feasible": 0,
                 "mpc_guard_rejected": 0,
+                "cbf_guard_override_used": False,
+                "cbf_guard_override_reason": "",
+                "recovery_hold_used": False,
             }
         )
         if extra_info:
