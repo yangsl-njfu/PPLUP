@@ -146,6 +146,25 @@ def make_rss_cbf_step_record(
         cbf_reference_steer_safe=rss_info.get("cbf_reference_steer_safe", np.nan),
         cbf_guard_used=rss_info.get("cbf_guard_used", False),
         cbf_guard_delta=rss_info.get("cbf_guard_delta", np.nan),
+        selective_mpc_enabled=rss_info.get("selective_mpc_enabled", False),
+        mpc_called=rss_info.get("mpc_called", False),
+        mpc_call_reason=rss_info.get("mpc_call_reason", ""),
+        deadlock_risk=rss_info.get("deadlock_risk", False),
+        deadlock_score=rss_info.get("deadlock_score", np.nan),
+        deadlock_counter=rss_info.get("deadlock_counter", 0),
+        deadlock_window_progress=rss_info.get("deadlock_window_progress", np.nan),
+        deadlock_window_avg_speed=rss_info.get("deadlock_window_avg_speed", np.nan),
+        deadlock_cbf_active_ratio=rss_info.get("deadlock_cbf_active_ratio", np.nan),
+        deadlock_cbf_fallback_ratio=rss_info.get("deadlock_cbf_fallback_ratio", np.nan),
+        deadlock_reason=rss_info.get("deadlock_reason", ""),
+        terminal_recoverable=rss_info.get("terminal_recoverable", False),
+        terminal_recovery_reason=rss_info.get("terminal_recovery_reason", ""),
+        recovery_progress=rss_info.get("recovery_progress", np.nan),
+        recovery_margin_improvement=rss_info.get("recovery_margin_improvement", np.nan),
+        blocking_object_final=rss_info.get("blocking_object_final", False),
+        minimum_risk_stop_used=rss_info.get("minimum_risk_stop_used", False),
+        mpc_terminal_feasible=rss_info.get("mpc_terminal_feasible", np.nan),
+        mpc_guard_rejected=rss_info.get("mpc_guard_rejected", np.nan),
         dynamic_vehicle_detected=rss_info.get("dynamic_vehicle_detected", False),
         action_delta=action_delta,
         acc_nominal=rss_info.get("acc_nominal", np.nan),
@@ -317,6 +336,8 @@ def evaluate_ppl_once(
         env_index = 0
         num_ep_in = 0
         o = reset_eval_env(env, eval_env_start + env_index)
+        if rss_filter is not None and hasattr(rss_filter, "reset"):
+            rss_filter.reset()
 
         while True:
             action = policy_function(o, deterministic=deterministic)[0]
@@ -366,6 +387,8 @@ def evaluate_ppl_once(
                     rss_changed_steps += 1
 
             o, r, d, info = env.step(action)
+            if rss_filter is not None and hasattr(rss_filter, "update_after_step"):
+                rss_filter.update_after_step(info)
             step_count += 1
 
             if rss_filter is not None and save_runtime_step_csv:
@@ -448,6 +471,8 @@ def evaluate_ppl_once(
                         break
 
                 o = reset_eval_env(env, eval_env_start + env_index)
+                if rss_filter is not None and hasattr(rss_filter, "reset"):
+                    rss_filter.reset()
 
     except Exception as e:
         raise e

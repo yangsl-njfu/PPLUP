@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import copy
 import math
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -55,6 +56,35 @@ class RSSMPCConfig(RSSCBFConfig):
     w_stall: float = 80.0
     w_cbf_anchor: float = 0.3
 
+    deadlock_window_steps: int = 20
+    deadlock_min_window_steps: int = 10
+    deadlock_speed_threshold: float = 0.8
+    deadlock_progress_threshold: float = 0.5
+    deadlock_cbf_active_ratio_threshold: float = 0.7
+    deadlock_front_active_ratio_threshold: float = 0.7
+    deadlock_cbf_delta_threshold: float = 0.5
+    deadlock_cbf_fallback_ratio_threshold: float = 0.5
+    deadlock_score_threshold: float = 0.75
+    deadlock_counter_threshold: int = 3
+    near_goal_route_completion: float = 0.97
+
+    recovery_progress_threshold: float = 1.2
+    recovery_margin_improvement_threshold: float = 0.5
+    recovery_lateral_clearance_threshold: float = -0.2
+    recovery_lateral_improvement_threshold: float = 0.5
+    recovery_terminal_speed_threshold: float = 1.0
+    guard_delta_cost_weight: float = 25.0
+    guard_brake_cost_weight: float = 20.0
+    guard_stall_brake_cost: float = 100.0
+    creep_acc: float = 0.6
+    nudge_steer: float = 0.35
+    bypass_steer: float = 0.8
+
+    recovery_w_intervention: float = 0.2
+    recovery_w_cbf_anchor: float = 0.05
+    recovery_w_progress: float = 8.0
+    recovery_w_speed: float = 0.1
+
     w_intervention: float = 1.0
     w_smooth: float = 0.5
     w_speed: float = 0.2
@@ -68,10 +98,12 @@ class RSSMPCFilter(RSSCBFFilter):
 
     FORMAL_MODES = {
         "normal",
+        "rss_mpc_cbf_only",
         "rss_mpc_intervention",
         "rss_mpc_recovery",
         "rss_mpc_cbf_guard",
         "rss_mpc_fallback_to_cbf",
+        "minimum_risk_stop",
         "fallback_no_safe_candidate",
     }
 
@@ -80,13 +112,40 @@ class RSSMPCFilter(RSSCBFFilter):
         super().__init__(self.mpc_config)
         self.rss_cbf_filter = RSSCBFFilter(self.mpc_config)
         self.rng = np.random.default_rng(self.mpc_config.random_seed)
+        self.deadlock_history: Deque[Dict[str, Any]] = deque(maxlen=self.mpc_config.deadlock_window_steps)
+        self.deadlock_counter = 0
+        self._last_route_completion = math.nan
+
+    def reset(self) -> None:
+        """Clear rolling deadlock state at episode reset."""
+        self.deadlock_history.clear()
+        self.deadlock_counter = 0
+        self._last_route_completion = math.nan
+
+    def update_after_step(self, env_info: Optional[Dict[str, Any]]) -> None:
+        """Optionally attach post-step route progress to the newest history sample."""
+        env_info = env_info or {}
+        route_completion = env_info.get("route_completion", math.nan)
+        try:
+            route_completion = float(route_completion)
+        except Exception:
+            route_completion = math.nan
+        self._last_route_completion = route_completion
+        if self.deadlock_history:
+            self.deadlock_history[-1]["route_completion"] = route_completion
 
     def filter_action(self, state: State, u_nom: Sequence[float]) -> Tuple[Action, Dict[str, Any]]:
-        """Return the first action of the best RSS-feasible MPC sequence."""
+        """Selective RSS-MPC recovery.
+
+        The normal path is intentionally conservative: safe RL actions pass
+        through unchanged, and unsafe non-deadlocked actions use RSS-CBF only.
+        MPC is called only for CBF-induced safe-but-stuck recovery.
+        """
         u_original = self._clip_action(u_nom)
         cbf_safe, cbf_info = self.rss_cbf_filter.filter_action(state, u_original)
         cbf_safe = self._clip_action(cbf_safe)
         front = self._select_front_rss_object(state)
+        deadlock_info = self._update_deadlock_detector(state, u_original, cbf_safe, cbf_info, front)
 
         if front is None:
             return u_original, self._make_mpc_info(
@@ -102,10 +161,10 @@ class RSSMPCFilter(RSSCBFFilter):
                 rss_margin_current=math.inf,
                 dynamic_vehicle_detected=False,
                 obstacle_detected=False,
-                mpc_success=True,
-                mpc_num_candidates=1,
-                mpc_num_feasible=1,
-                mpc_best_cost=0.0,
+                mpc_success=False,
+                mpc_num_candidates=0,
+                mpc_num_feasible=0,
+                mpc_best_cost=math.nan,
                 rss_margin_min_pred=math.inf,
                 rss_margin_final_pred=math.inf,
                 rss_lateral_clearance_min_pred=math.inf,
@@ -116,12 +175,96 @@ class RSSMPCFilter(RSSCBFFilter):
                 cbf_reference_info=cbf_info,
                 cbf_guard_used=False,
                 cbf_guard_delta=0.0,
+                extra_info=deadlock_info,
             )
 
         object_kind, obj, d_front, d_rss, current_margin, dynamic_detected, static_detected = front
-        candidates = self._generate_candidate_sequences(u_original, cbf_safe)
+        rl_is_rss_safe = self._cbf_indicates_nominal_safe(cbf_info, u_original, cbf_safe)
+        cbf_reference_action = (
+            self._minimum_risk_stop(u_original)
+            if cbf_info.get("mode") == "fallback_no_safe_candidate"
+            else cbf_safe
+        )
+        if rl_is_rss_safe:
+            return u_original, self._make_mpc_info(
+                state=state,
+                obj=obj,
+                object_kind=object_kind,
+                mode="normal",
+                reason="rl_action_rss_safe",
+                u_original=u_original,
+                u_safe=u_original,
+                d_front=d_front,
+                d_rss=d_rss,
+                rss_margin_current=current_margin,
+                dynamic_vehicle_detected=dynamic_detected,
+                obstacle_detected=static_detected,
+                mpc_success=False,
+                mpc_num_candidates=0,
+                mpc_num_feasible=0,
+                mpc_best_cost=math.nan,
+                rss_margin_min_pred=math.nan,
+                rss_margin_final_pred=math.nan,
+                rss_lateral_clearance_min_pred=math.nan,
+                rss_lateral_clearance_final_pred=math.nan,
+                predicted_progress=math.nan,
+                fallback_used=False,
+                cbf_info=cbf_info,
+                cbf_reference_info=cbf_info,
+                cbf_guard_used=False,
+                cbf_guard_delta=0.0,
+                extra_info=deadlock_info,
+            )
+
+        if not deadlock_info["deadlock_risk"]:
+            if cbf_info.get("mode") == "fallback_no_safe_candidate":
+                u_cbf_only = self._minimum_risk_stop(u_original)
+                cbf_only_mode = "minimum_risk_stop"
+                cbf_only_reason = "rss_cbf_no_safe_candidate_minimum_risk_stop"
+                minimum_risk_stop_used = True
+            else:
+                u_cbf_only = cbf_safe
+                cbf_only_mode = "rss_mpc_cbf_only"
+                cbf_only_reason = "rss_cbf_shield_no_deadlock"
+                minimum_risk_stop_used = False
+            return u_cbf_only, self._make_mpc_info(
+                state=state,
+                obj=obj,
+                object_kind=object_kind,
+                mode=cbf_only_mode,
+                reason=cbf_only_reason,
+                u_original=u_original,
+                u_safe=u_cbf_only,
+                d_front=d_front,
+                d_rss=d_rss,
+                rss_margin_current=current_margin,
+                dynamic_vehicle_detected=dynamic_detected,
+                obstacle_detected=static_detected,
+                mpc_success=False,
+                mpc_num_candidates=0,
+                mpc_num_feasible=0,
+                mpc_best_cost=math.nan,
+                rss_margin_min_pred=math.nan,
+                rss_margin_final_pred=math.nan,
+                rss_lateral_clearance_min_pred=math.nan,
+                rss_lateral_clearance_final_pred=math.nan,
+                predicted_progress=math.nan,
+                fallback_used=False,
+                cbf_info=cbf_info,
+                cbf_reference_info=cbf_info,
+                cbf_guard_used=False,
+                cbf_guard_delta=0.0,
+                extra_info=self._merge_recovery_info(
+                    deadlock_info,
+                    {"minimum_risk_stop_used": minimum_risk_stop_used},
+                ),
+            )
+
+        candidates = self._generate_recovery_candidate_sequences(u_original, cbf_reference_action)
         best: Optional[Dict[str, Any]] = None
         feasible_count = 0
+        terminal_feasible_count = 0
+        guard_rejected_count = 0
 
         for sequence in candidates:
             evaluation = self._evaluate_sequence(
@@ -131,33 +274,29 @@ class RSSMPCFilter(RSSCBFFilter):
                 current_margin=current_margin,
                 sequence=sequence,
                 u_nom=u_original,
-                u_cbf=cbf_safe,
+                u_cbf=cbf_reference_action,
             )
             if not evaluation["feasible"]:
                 continue
+            terminal_feasible_count += 1
+            guard_eval = self._evaluate_guarded_first_action(state, evaluation)
+            if not guard_eval["guard_safe"]:
+                guard_rejected_count += 1
+                continue
+            evaluation.update(guard_eval)
+            evaluation["cost"] += guard_eval["guard_cost"]
             feasible_count += 1
             if best is None or evaluation["cost"] < best["cost"]:
                 best = evaluation
 
         if best is not None:
-            u_mpc = self._clip_action(best["sequence"][0])
-            u_safe, guard_info = self.rss_cbf_filter.filter_action(state, u_mpc)
-            u_safe = self._clip_action(u_safe)
-            cbf_guard_delta = self._action_norm(u_safe, u_mpc)
-            cbf_guard_used = cbf_guard_delta > self.mpc_config.action_change_tolerance
-            action_delta = self._action_norm(u_safe, u_original)
-            if current_margin < -self.config.small_tolerance and best.get("recovery_used", False):
-                mode = "rss_mpc_recovery"
-            elif cbf_guard_used:
-                mode = "rss_mpc_cbf_guard"
-            elif action_delta <= self.mpc_config.action_change_tolerance:
-                mode = "normal"
-            else:
-                mode = "rss_mpc_intervention"
-            reason = best.get("reason", "mpc_feasible_sequence_selected")
-            if cbf_guard_used:
-                reason = "cbf_guard_projected_mpc_action"
-
+            u_mpc = self._clip_action(best["u_mpc_first"])
+            u_safe = self._clip_action(best["u_guarded_first"])
+            guard_info = best["guard_info"]
+            cbf_guard_delta = best["cbf_guard_delta"]
+            cbf_guard_used = best["cbf_guard_used"]
+            mode = "rss_mpc_cbf_guard" if cbf_guard_used else "rss_mpc_recovery"
+            reason = "cbf_guard_projected_mpc_recovery" if cbf_guard_used else "mpc_recovery_sequence"
             return u_safe, self._make_mpc_info(
                 state=state,
                 obj=obj,
@@ -185,16 +324,32 @@ class RSSMPCFilter(RSSCBFFilter):
                 cbf_reference_info=cbf_info,
                 cbf_guard_used=cbf_guard_used,
                 cbf_guard_delta=cbf_guard_delta,
+                extra_info=self._merge_recovery_info(
+                    deadlock_info,
+                    {
+                        "mpc_called": True,
+                        "mpc_call_reason": "deadlock_risk",
+                        "terminal_recoverable": best["terminal_recoverable"],
+                        "terminal_recovery_reason": best["terminal_recovery_reason"],
+                        "recovery_progress": best["recovery_progress"],
+                        "recovery_margin_improvement": best["recovery_margin_improvement"],
+                        "blocking_object_final": best["blocking_object_final"],
+                        "mpc_terminal_feasible": terminal_feasible_count,
+                        "mpc_guard_rejected": guard_rejected_count,
+                    },
+                ),
             )
 
-        if cbf_info.get("mode") == "fallback_no_safe_candidate":
-            u_safe = u_original
-            mode = "fallback_no_safe_candidate"
-            reason = "mpc_no_feasible_sequence_cbf_no_safe_candidate"
-        else:
-            u_safe = self._clip_action(cbf_safe)
+        if cbf_info.get("mode") != "fallback_no_safe_candidate":
+            u_safe = cbf_safe
             mode = "rss_mpc_fallback_to_cbf"
-            reason = "mpc_no_feasible_sequence"
+            reason = "mpc_recovery_failed_fallback_to_cbf"
+            minimum_risk_stop_used = False
+        else:
+            u_safe = self._minimum_risk_stop(u_original)
+            mode = "minimum_risk_stop"
+            reason = "mpc_recovery_failed_minimum_risk_stop"
+            minimum_risk_stop_used = True
 
         info = self._make_mpc_info(
             state=state,
@@ -221,13 +376,193 @@ class RSSMPCFilter(RSSCBFFilter):
             fallback_used=True,
             cbf_info=cbf_info,
             cbf_reference_info=cbf_info,
-            cbf_guard_used=mode == "rss_mpc_fallback_to_cbf",
-            cbf_guard_delta=self._action_norm(u_safe, u_original),
+            cbf_guard_used=False,
+            cbf_guard_delta=0.0,
+            extra_info=self._merge_recovery_info(
+                deadlock_info,
+                {
+                    "mpc_called": True,
+                    "mpc_call_reason": "deadlock_risk",
+                    "minimum_risk_stop_used": minimum_risk_stop_used,
+                    "mpc_terminal_feasible": terminal_feasible_count,
+                    "mpc_guard_rejected": guard_rejected_count,
+                },
+            ),
         )
         info["cbf_info"] = cbf_info
         return u_safe, info
 
-    def _generate_candidate_sequences(self, u_nom: Action, u_cbf: Optional[Action] = None) -> List[np.ndarray]:
+    def _cbf_indicates_nominal_safe(self, cbf_info: Dict[str, Any], u_original: Action, u_cbf: Action) -> bool:
+        cbf_delta = float(cbf_info.get("action_delta", self._action_norm(u_cbf, u_original)))
+        return cbf_info.get("mode") == "normal" and cbf_delta <= self.mpc_config.action_change_tolerance
+
+    def _minimum_risk_stop(self, u_nom: Action) -> Action:
+        return self._clip_action([self.mpc_config.strong_brake, u_nom[1]])
+
+    def _update_deadlock_detector(
+        self,
+        state: State,
+        u_original: Action,
+        u_cbf: Action,
+        cbf_info: Dict[str, Any],
+        front: Optional[Tuple[str, Dict[str, Any], float, float, float, bool, bool]],
+    ) -> Dict[str, Any]:
+        ego = self._ego(state)
+        speed = self._ego_speed(state)
+        cbf_delta = float(cbf_info.get("action_delta", self._action_norm(u_cbf, u_original)))
+        cbf_active = (cbf_info.get("mode") != "normal") or cbf_delta > self.mpc_config.deadlock_cbf_delta_threshold
+        cbf_fallback = cbf_info.get("mode") == "fallback_no_safe_candidate"
+        front_exists = front is not None
+        route_completion = self._last_route_completion
+
+        sample = {
+            "x": float(ego.get("x", 0.0)),
+            "y": float(ego.get("y", 0.0)),
+            "heading": float(ego.get("heading", 0.0)),
+            "speed": speed,
+            "cbf_delta": cbf_delta,
+            "cbf_active": bool(cbf_active),
+            "cbf_fallback": bool(cbf_fallback),
+            "front_exists": bool(front_exists),
+            "route_completion": route_completion,
+        }
+        self.deadlock_history.append(sample)
+        info = self._deadlock_diagnostics()
+        if info["deadlock_candidate"]:
+            self.deadlock_counter += 1
+        else:
+            self.deadlock_counter = max(0, self.deadlock_counter - 1)
+        info["deadlock_counter"] = self.deadlock_counter
+        info["deadlock_risk"] = bool(info["deadlock_candidate"] and self.deadlock_counter >= self.mpc_config.deadlock_counter_threshold)
+        return info
+
+    def _deadlock_diagnostics(self) -> Dict[str, Any]:
+        samples = list(self.deadlock_history)
+        if len(samples) < self.mpc_config.deadlock_min_window_steps:
+            return self._make_deadlock_info(
+                risk=False,
+                candidate=False,
+                score=0.0,
+                progress=0.0,
+                avg_speed=float(np.mean([s["speed"] for s in samples])) if samples else math.nan,
+                active_ratio=0.0,
+                reason="insufficient_deadlock_window",
+            )
+
+        first = samples[0]
+        last = samples[-1]
+        dx = last["x"] - first["x"]
+        dy = last["y"] - first["y"]
+        heading = first.get("heading", 0.0)
+        window_progress = dx * math.cos(heading) + dy * math.sin(heading)
+        avg_speed = float(np.mean([sample["speed"] for sample in samples]))
+        cbf_active_ratio = float(np.mean([1.0 if sample["cbf_active"] else 0.0 for sample in samples]))
+        cbf_fallback_ratio = float(np.mean([1.0 if sample.get("cbf_fallback") else 0.0 for sample in samples]))
+        front_active_ratio = float(np.mean([1.0 if sample["front_exists"] else 0.0 for sample in samples]))
+        avg_cbf_delta = float(np.mean([sample["cbf_delta"] for sample in samples]))
+
+        route_values = [
+            sample["route_completion"]
+            for sample in samples
+            if isinstance(sample.get("route_completion"), (int, float)) and math.isfinite(sample["route_completion"])
+        ]
+        route_completion = route_values[-1] if route_values else math.nan
+        near_goal = math.isfinite(route_completion) and route_completion >= self.mpc_config.near_goal_route_completion
+
+        low_speed_score = max(0.0, min(1.0, 1.0 - avg_speed / max(self.mpc_config.deadlock_speed_threshold, 1e-6)))
+        low_progress_score = max(
+            0.0,
+            min(1.0, 1.0 - max(0.0, window_progress) / max(self.mpc_config.deadlock_progress_threshold, 1e-6)),
+        )
+        cbf_ratio_score = max(0.0, min(1.0, cbf_active_ratio / self.mpc_config.deadlock_cbf_active_ratio_threshold))
+        cbf_delta_score = max(0.0, min(1.0, avg_cbf_delta / self.mpc_config.deadlock_cbf_delta_threshold))
+        front_score = max(0.0, min(1.0, front_active_ratio / self.mpc_config.deadlock_front_active_ratio_threshold))
+        not_done_score = 0.0 if near_goal else 1.0
+        score = float(
+            np.mean([low_speed_score, low_progress_score, cbf_ratio_score, cbf_delta_score, front_score, not_done_score])
+        )
+
+        hard_candidate = (
+            avg_speed <= self.mpc_config.deadlock_speed_threshold
+            and window_progress <= self.mpc_config.deadlock_progress_threshold
+            and cbf_active_ratio >= self.mpc_config.deadlock_cbf_active_ratio_threshold
+            and front_active_ratio >= self.mpc_config.deadlock_front_active_ratio_threshold
+            and avg_cbf_delta >= self.mpc_config.deadlock_cbf_delta_threshold
+            and not near_goal
+        )
+        fallback_candidate = (
+            avg_speed <= self.mpc_config.deadlock_speed_threshold
+            and window_progress <= self.mpc_config.deadlock_progress_threshold
+            and front_active_ratio >= self.mpc_config.deadlock_front_active_ratio_threshold
+            and cbf_fallback_ratio >= self.mpc_config.deadlock_cbf_fallback_ratio_threshold
+            and not near_goal
+        )
+        soft_candidate = hard_candidate and score >= self.mpc_config.deadlock_score_threshold
+        candidate = hard_candidate or fallback_candidate or soft_candidate
+        if fallback_candidate:
+            reason = "cbf_fallback_deadlock_risk"
+        elif candidate:
+            reason = "deadlock_risk"
+        else:
+            reason = "deadlock_conditions_not_met"
+        return self._make_deadlock_info(
+            risk=False,
+            candidate=candidate,
+            score=score,
+            progress=window_progress,
+            avg_speed=avg_speed,
+            active_ratio=cbf_active_ratio,
+            reason=reason,
+            front_ratio=front_active_ratio,
+            avg_cbf_delta=avg_cbf_delta,
+            fallback_ratio=cbf_fallback_ratio,
+            route_completion=route_completion,
+        )
+
+    def _make_deadlock_info(
+        self,
+        risk: bool,
+        candidate: bool,
+        score: float,
+        progress: float,
+        avg_speed: float,
+        active_ratio: float,
+        reason: str,
+        front_ratio: float = 0.0,
+        avg_cbf_delta: float = 0.0,
+        fallback_ratio: float = 0.0,
+        route_completion: float = math.nan,
+    ) -> Dict[str, Any]:
+        return {
+            "selective_mpc_enabled": True,
+            "mpc_called": False,
+            "mpc_call_reason": "",
+            "deadlock_risk": bool(risk),
+            "deadlock_candidate": bool(candidate),
+            "deadlock_score": float(score),
+            "deadlock_counter": self.deadlock_counter,
+            "deadlock_window_progress": float(progress),
+            "deadlock_window_avg_speed": float(avg_speed),
+            "deadlock_cbf_active_ratio": float(active_ratio),
+            "deadlock_front_active_ratio": float(front_ratio),
+            "deadlock_avg_cbf_delta": float(avg_cbf_delta),
+            "deadlock_cbf_fallback_ratio": float(fallback_ratio),
+            "deadlock_route_completion": float(route_completion),
+            "deadlock_reason": reason,
+            "terminal_recoverable": False,
+            "terminal_recovery_reason": "",
+            "recovery_progress": math.nan,
+            "recovery_margin_improvement": math.nan,
+            "blocking_object_final": False,
+            "minimum_risk_stop_used": False,
+        }
+
+    def _merge_recovery_info(self, base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(base)
+        merged.update(updates)
+        return merged
+
+    def _generate_recovery_candidate_sequences(self, u_nom: Action, u_cbf: Optional[Action] = None) -> List[np.ndarray]:
         horizon = max(1, int(self.mpc_config.horizon_steps))
         max_candidates = max(1, int(self.mpc_config.num_samples))
         sequences: List[np.ndarray] = []
@@ -243,52 +578,48 @@ class RSSMPCFilter(RSSCBFFilter):
                 sequences.append(sequence)
 
         acc_nom, steer_nom = u_nom
+        acc_cbf, steer_cbf = self._clip_action(u_cbf if u_cbf is not None else u_nom)
 
+        # Deterministic recovery maneuvers are tried before random shooting.
         add_sequence(
-            np.full(horizon, acc_nom, dtype=np.float64),
+            np.full(horizon, acc_cbf, dtype=np.float64),
+            np.full(horizon, steer_cbf, dtype=np.float64),
+        )
+        add_sequence(
+            np.linspace(acc_nom, acc_cbf, horizon),
+            np.linspace(steer_nom, steer_cbf, horizon),
+        )
+        add_sequence(
+            np.full(horizon, self.mpc_config.comfort_brake, dtype=np.float64),
             np.full(horizon, steer_nom, dtype=np.float64),
         )
-
-        if u_cbf is not None:
-            acc_cbf, steer_cbf = self._clip_action(u_cbf)
+        add_sequence(
+            np.full(horizon, self.mpc_config.strong_brake, dtype=np.float64),
+            np.full(horizon, 0.0, dtype=np.float64),
+        )
+        add_sequence(
+            np.full(horizon, self.mpc_config.creep_acc, dtype=np.float64),
+            np.full(horizon, steer_nom, dtype=np.float64),
+        )
+        for steer in (self.mpc_config.nudge_steer, -self.mpc_config.nudge_steer):
             add_sequence(
-                np.full(horizon, acc_cbf, dtype=np.float64),
-                np.full(horizon, steer_cbf, dtype=np.float64),
+                np.full(horizon, self.mpc_config.creep_acc, dtype=np.float64),
+                np.full(horizon, steer, dtype=np.float64),
+            )
+        for steer in (self.mpc_config.bypass_steer, -self.mpc_config.bypass_steer):
+            add_sequence(
+                np.full(horizon, self.mpc_config.creep_acc, dtype=np.float64),
+                np.full(horizon, steer, dtype=np.float64),
+            )
+            straighten = np.concatenate(
+                [
+                    np.full(max(1, horizon // 2), steer, dtype=np.float64),
+                    np.linspace(steer, 0.0, horizon - max(1, horizon // 2)),
+                ]
             )
             add_sequence(
-                np.linspace(acc_nom, acc_cbf, horizon),
-                np.linspace(steer_nom, steer_cbf, horizon),
-            )
-            for steer_bias in (-0.25, 0.25):
-                add_sequence(
-                    np.full(horizon, acc_cbf, dtype=np.float64),
-                    np.full(horizon, steer_cbf + steer_bias, dtype=np.float64),
-                )
-
-        for target_acc in (self.mpc_config.comfort_brake, self.mpc_config.strong_brake):
-            add_sequence(
-                np.linspace(acc_nom, target_acc, horizon),
-                np.full(horizon, steer_nom, dtype=np.float64),
-            )
-
-        for steer_bias in (-0.25, -0.1, 0.1, 0.25):
-            for acc_value in (acc_nom, 0.0, self.mpc_config.comfort_brake):
-                add_sequence(
-                    np.full(horizon, acc_value, dtype=np.float64),
-                    np.full(horizon, steer_nom + steer_bias, dtype=np.float64),
-                )
-
-        for steer_target in (-1.0, -0.8, -0.5, 0.5, 0.8, 1.0):
-            for acc_value in (self.mpc_config.max_acc, 1.0, 0.0):
-                add_sequence(
-                    np.full(horizon, acc_value, dtype=np.float64),
-                    np.full(horizon, steer_target, dtype=np.float64),
-                )
-
-        for steer_target in (-1.0, 1.0):
-            add_sequence(
-                np.linspace(max(acc_nom, 0.0), self.mpc_config.max_acc, horizon),
-                np.linspace(steer_nom, steer_target, horizon),
+                np.full(horizon, self.mpc_config.creep_acc, dtype=np.float64),
+                straighten,
             )
 
         while len(sequences) < max_candidates:
@@ -332,6 +663,7 @@ class RSSMPCFilter(RSSCBFFilter):
         margins: List[float] = []
         lateral_clearance_margins: List[float] = []
         speeds: List[float] = []
+        initial_lateral_clearance = self._lateral_clearance_margin(state, obj)
 
         for action in sequence:
             rollout_state, rollout_obj = self._simulate_next_state_and_object(
@@ -348,18 +680,31 @@ class RSSMPCFilter(RSSCBFFilter):
         final_lateral_clearance = lateral_clearance_margins[-1] if lateral_clearance_margins else -math.inf
         min_lateral_clearance = min(lateral_clearance_margins) if lateral_clearance_margins else -math.inf
         progress = self._longitudinal_progress(self._ego(state), self._ego(rollout_state))
+        final_speed = speeds[-1] if speeds else self._ego_speed(state)
+        blocking_object_final = self._front_object_blocks_predicted_path(rollout_state, rollout_obj)
 
         rss_feasible, recovery_used, reason = self._rss_sequence_feasibility(
             current_margin=current_margin,
             min_margin=min_margin,
             final_margin=final_margin,
         )
+        recovery_margin_improvement = final_margin - current_margin
+        terminal_recoverable, terminal_recovery_reason = self._terminal_recoverability(
+            rss_feasible=rss_feasible,
+            progress=progress,
+            current_margin=current_margin,
+            final_margin=final_margin,
+            final_lateral_clearance=final_lateral_clearance,
+            initial_lateral_clearance=initial_lateral_clearance,
+            final_speed=final_speed,
+            blocking_object_final=blocking_object_final,
+        )
         speed_feasible = all(
             -self.config.small_tolerance <= speed <= self.mpc_config.v_max + self.config.small_tolerance
             for speed in speeds
         )
         progress_feasible = progress >= -self.config.small_tolerance
-        feasible = bool(rss_feasible and speed_feasible and progress_feasible)
+        feasible = bool(rss_feasible and speed_feasible and progress_feasible and terminal_recoverable)
 
         cost = self._sequence_cost(
             sequence=sequence,
@@ -387,7 +732,44 @@ class RSSMPCFilter(RSSCBFFilter):
             "rss_lateral_clearance_final_pred": final_lateral_clearance,
             "predicted_progress": progress,
             "recovery_used": recovery_used,
+            "terminal_recoverable": terminal_recoverable,
+            "terminal_recovery_reason": terminal_recovery_reason,
+            "recovery_progress": progress,
+            "recovery_margin_improvement": recovery_margin_improvement,
+            "blocking_object_final": blocking_object_final,
             "reason": reason,
+        }
+
+    def _evaluate_guarded_first_action(self, state: State, evaluation: Dict[str, Any]) -> Dict[str, Any]:
+        """Run the first MPC action through RSS-CBF before accepting a recovery."""
+        u_mpc = self._clip_action(evaluation["sequence"][0])
+        u_guarded, guard_info = self.rss_cbf_filter.filter_action(state, u_mpc)
+        u_guarded = self._clip_action(u_guarded)
+        guard_delta = self._action_norm(u_guarded, u_mpc)
+        guard_mode = guard_info.get("mode", "")
+        guard_fallback = guard_mode == "fallback_no_safe_candidate"
+
+        guarded_acc = float(u_guarded[0])
+        current_speed = self._ego_speed(state)
+        guard_cost = self.mpc_config.guard_delta_cost_weight * guard_delta * guard_delta
+        guard_cost += self.mpc_config.guard_brake_cost_weight * max(0.0, -guarded_acc) ** 2
+        if current_speed <= self.mpc_config.stuck_speed_threshold and guarded_acc <= self.mpc_config.comfort_brake:
+            guard_cost += self.mpc_config.guard_stall_brake_cost
+
+        guard_safe = not guard_fallback
+        if guard_safe and current_speed <= self.mpc_config.stuck_speed_threshold:
+            progress_guarded = guarded_acc > self.mpc_config.comfort_brake
+            lateral_recovery = abs(float(u_guarded[1])) >= min(0.25, self.mpc_config.nudge_steer)
+            guard_safe = progress_guarded or lateral_recovery
+
+        return {
+            "guard_safe": bool(guard_safe),
+            "guard_cost": float(guard_cost),
+            "u_mpc_first": u_mpc,
+            "u_guarded_first": u_guarded,
+            "guard_info": guard_info,
+            "cbf_guard_used": guard_delta > self.mpc_config.action_change_tolerance,
+            "cbf_guard_delta": float(guard_delta),
         }
 
     def _rss_sequence_feasibility(
@@ -459,16 +841,46 @@ class RSSMPCFilter(RSSCBFFilter):
                 lateral_clearance_reward = max(0.0, float(finite_clearances[-1]))
 
         return (
-            cfg.w_intervention * intervention_cost
+            cfg.recovery_w_intervention * intervention_cost
             + cfg.w_smooth * smooth_cost
-            + cfg.w_cbf_anchor * cbf_anchor_cost
-            + cfg.w_speed * speed_cost
-            - cfg.w_progress * float(progress)
+            + cfg.recovery_w_cbf_anchor * cbf_anchor_cost
+            + cfg.recovery_w_speed * speed_cost
+            - cfg.recovery_w_progress * float(progress)
             + cfg.w_rss_violation * rss_violation_penalty
             + cfg.w_brake * brake_penalty
             + cfg.w_stall * stall_penalty
             - cfg.w_lateral_clearance * lateral_clearance_reward
         )
+
+    def _terminal_recoverability(
+        self,
+        rss_feasible: bool,
+        progress: float,
+        current_margin: float,
+        final_margin: float,
+        final_lateral_clearance: float,
+        initial_lateral_clearance: float,
+        final_speed: float,
+        blocking_object_final: bool,
+    ) -> Tuple[bool, str]:
+        if not rss_feasible:
+            return False, "rss_not_feasible"
+
+        margin_improvement = final_margin - current_margin
+        lateral_improvement = final_lateral_clearance - initial_lateral_clearance
+        if progress >= self.mpc_config.recovery_progress_threshold:
+            return True, "progress_recovered"
+        if margin_improvement >= self.mpc_config.recovery_margin_improvement_threshold:
+            return True, "rss_margin_improved"
+        if not blocking_object_final:
+            return True, "blocking_object_cleared"
+        if final_lateral_clearance >= self.mpc_config.recovery_lateral_clearance_threshold:
+            return True, "bypass_clearance_forming"
+        if lateral_improvement >= self.mpc_config.recovery_lateral_improvement_threshold:
+            return True, "lateral_bypass_improving"
+        if final_speed >= self.mpc_config.recovery_terminal_speed_threshold and final_margin >= self.mpc_config.safety_margin_tolerance:
+            return True, "terminal_speed_recovered"
+        return False, "safe_but_no_recovery_progress"
 
     def _simulate_next_state_and_object(
         self,
@@ -537,6 +949,7 @@ class RSSMPCFilter(RSSCBFFilter):
         cbf_reference_info: Optional[Dict[str, Any]] = None,
         cbf_guard_used: bool = False,
         cbf_guard_delta: float = 0.0,
+        extra_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if mode not in self.FORMAL_MODES:
             mode = "rss_mpc_intervention"
@@ -580,6 +993,33 @@ class RSSMPCFilter(RSSCBFFilter):
             "state_debug": self._state_debug(state),
             "blocking_object": self._object_debug(obj, state) if obj is not None else {},
         }
+        info.update(
+            {
+                "selective_mpc_enabled": True,
+                "mpc_called": False,
+                "mpc_call_reason": "",
+                "deadlock_risk": False,
+                "deadlock_score": 0.0,
+                "deadlock_counter": self.deadlock_counter,
+                "deadlock_window_progress": 0.0,
+                "deadlock_window_avg_speed": math.nan,
+                "deadlock_cbf_active_ratio": 0.0,
+                "deadlock_cbf_fallback_ratio": 0.0,
+                "deadlock_reason": "",
+                "terminal_recoverable": False,
+                "terminal_recovery_reason": "",
+                "recovery_progress": math.nan,
+                "recovery_margin_improvement": math.nan,
+                "blocking_object_final": False,
+                "minimum_risk_stop_used": False,
+                "mpc_terminal_feasible": 0,
+                "mpc_guard_rejected": 0,
+            }
+        )
+        if extra_info:
+            info.update(extra_info)
+        if self.deadlock_history:
+            self.deadlock_history[-1]["mode"] = mode
         return self._with_action_debug(info, u_original, u_safe)
 
     def _action_norm(self, action: Sequence[float], reference: Sequence[float]) -> float:
