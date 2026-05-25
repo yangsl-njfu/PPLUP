@@ -30,6 +30,13 @@ class RSSCBFConfig(StaticRSSConfig):
     enable_recovery_mode: bool = True
     intervention_margin_threshold: float = 0.0
 
+    enable_lateral_rss: bool = True
+    lateral_rss_min_clearance: float = 0.3
+    lateral_rss_response_time: float = 0.1
+    lateral_rss_max_lateral_speed: float = 3.0
+    lateral_rss_min_lateral_decel: float = 2.0
+    certified_lateral_escape_margin_buffer: float = 1.0
+
     # RSS-CBF evaluation does not expose bypass or clearance-guard experiments.
     enable_bypass: bool = False
     allow_bypass_before_rss_violation: bool = False
@@ -272,6 +279,56 @@ class RSSCBFFilter(StaticRSSFilter):
             "candidates": candidates,
         }
 
+    def compute_lateral_rss_safe_distance(self, lateral_speed: float = 0.0) -> float:
+        cfg = self.config
+        rho = max(0.0, float(cfg.lateral_rss_response_time))
+        v_lat = max(0.0, abs(float(lateral_speed)))
+        v_response = v_lat + cfg.lateral_rss_max_lateral_speed * rho
+        braking = v_response ** 2 / (2.0 * max(0.1, cfg.lateral_rss_min_lateral_decel))
+        return max(0.0, v_lat * rho + braking + cfg.lateral_rss_min_clearance)
+
+    def compute_lateral_rss_margin(
+        self,
+        state: State,
+        obj: Dict[str, Any],
+    ) -> float:
+        ego = self._ego(state)
+        _, lateral = self._relative_position(ego, obj)
+        lateral_distance = abs(lateral)
+        half_ego = self.config.vehicle_width / 2.0
+        half_obj = self._object_width(obj, self.config.vehicle_width) / 2.0
+        lateral_gap = lateral_distance - half_ego - half_obj
+        lateral_speed = float(ego.get("lateral_speed", 0.0))
+        safe_distance = self.compute_lateral_rss_safe_distance(lateral_speed)
+        return lateral_gap - safe_distance
+
+    def check_path_overlap(
+        self,
+        state: State,
+        obj: Dict[str, Any],
+    ) -> Tuple[bool, float, float]:
+        ego = self._ego(state)
+        _, lateral = self._relative_position(ego, obj)
+        half_ego = self.config.vehicle_width / 2.0 + self.config.obstacle_margin
+        half_obj = self._object_width(obj, self.config.vehicle_width) / 2.0
+        overlap = abs(lateral) < (half_ego + half_obj)
+        lateral_distance = abs(lateral)
+        lateral_margin = lateral_distance - half_ego - half_obj
+        return bool(overlap), float(lateral_distance), float(lateral_margin)
+
+    def check_lateral_deconflicted(
+        self,
+        state: State,
+        obj: Dict[str, Any],
+        lateral_rss_margin: float,
+    ) -> bool:
+        if lateral_rss_margin >= 0.0:
+            return True
+        _, lateral = self._relative_position(self._ego(state), obj)
+        half_ego = self.config.vehicle_width / 2.0 + self.config.obstacle_margin
+        half_obj = self._object_width(obj, self.config.vehicle_width) / 2.0
+        return abs(lateral) >= (half_ego + half_obj)
+
     def _make_rss_cbf_info(
         self,
         state: State,
@@ -316,4 +373,25 @@ class RSSCBFFilter(StaticRSSFilter):
             "candidates": candidates,
             "selected_score": selected.get("progress_score") if isinstance(selected, dict) else math.nan,
         }
+        if obj is not None and self.config.enable_lateral_rss:
+            lat_margin = self.compute_lateral_rss_margin(state, obj)
+            path_overlap, lat_dist, lat_mrg = self.check_path_overlap(state, obj)
+            deconflicted = self.check_lateral_deconflicted(state, obj, lat_margin)
+            info.update({
+                "lateral_rss_margin": float(lat_margin),
+                "front_object_path_overlap": bool(path_overlap),
+                "front_object_lateral_distance": float(lat_dist),
+                "front_object_lateral_margin": float(lat_mrg),
+                "front_object_deconflicted": bool(deconflicted),
+                "longitudinal_constraint_relaxed_by_lateral_escape": bool(deconflicted and not path_overlap),
+            })
+        else:
+            info.update({
+                "lateral_rss_margin": math.nan,
+                "front_object_path_overlap": False,
+                "front_object_lateral_distance": math.nan,
+                "front_object_lateral_margin": math.nan,
+                "front_object_deconflicted": False,
+                "longitudinal_constraint_relaxed_by_lateral_escape": False,
+            })
         return self._with_action_debug(info, u_original, u_safe)

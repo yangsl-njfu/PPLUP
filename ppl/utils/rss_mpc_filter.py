@@ -124,6 +124,12 @@ class RSSMPCConfig(RSSCBFConfig):
     mpc_time_warning_ms: float = 100.0
     mpc_time_critical_ms: float = 500.0
 
+    lateral_rss_deconfliction_threshold: float = 0.0
+    lateral_rss_terminal_safe_threshold: float = 0.0
+    path_overlap_reduction_threshold: float = 0.1
+    certified_lateral_escape_min_margin: float = 1.0
+    certified_lateral_escape_min_lateral_margin: float = 0.0
+
 
 class RSSMPCFilter(RSSCBFFilter):
     """Sampling-based RSS-MPC runtime assurance filter."""
@@ -390,10 +396,10 @@ class RSSMPCFilter(RSSCBFFilter):
         guard_rejected_candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
 
         family_stats: Dict[str, Dict[str, Any]] = {
-            "brake": {"count": 0, "best_cost": math.inf, "terminal_recoverable": False, "guard_rejected": False, "reject_reason": ""},
-            "creep": {"count": 0, "best_cost": math.inf, "terminal_recoverable": False, "guard_rejected": False, "reject_reason": ""},
-            "left": {"count": 0, "best_cost": math.inf, "terminal_recoverable": False, "guard_rejected": False, "reject_reason": ""},
-            "right": {"count": 0, "best_cost": math.inf, "terminal_recoverable": False, "guard_rejected": False, "reject_reason": ""},
+            "brake": {"count": 0, "best_cost": math.inf, "terminal_recoverable": False, "guard_rejected": False, "reject_reason": "", "lateral_rss_safe": False, "road_safe": False, "best_lateral_rss_margin": -math.inf, "escape_available": False},
+            "creep": {"count": 0, "best_cost": math.inf, "terminal_recoverable": False, "guard_rejected": False, "reject_reason": "", "lateral_rss_safe": False, "road_safe": False, "best_lateral_rss_margin": -math.inf, "escape_available": False},
+            "left": {"count": 0, "best_cost": math.inf, "terminal_recoverable": False, "guard_rejected": False, "reject_reason": "", "lateral_rss_safe": False, "road_safe": False, "best_lateral_rss_margin": -math.inf, "escape_available": False},
+            "right": {"count": 0, "best_cost": math.inf, "terminal_recoverable": False, "guard_rejected": False, "reject_reason": "", "lateral_rss_safe": False, "road_safe": False, "best_lateral_rss_margin": -math.inf, "escape_available": False},
         }
 
         for idx, sequence in enumerate(candidates):
@@ -440,6 +446,15 @@ class RSSMPCFilter(RSSCBFFilter):
             if evaluation["cost"] < family_stats[category]["best_cost"]:
                 family_stats[category]["best_cost"] = evaluation["cost"]
             family_stats[category]["terminal_recoverable"] = True
+            if evaluation.get("road_boundary_safe", False):
+                family_stats[category]["road_safe"] = True
+            final_lat_rss = float(evaluation.get("final_lateral_rss_margin", -math.inf))
+            if math.isfinite(final_lat_rss) and final_lat_rss > family_stats[category]["best_lateral_rss_margin"]:
+                family_stats[category]["best_lateral_rss_margin"] = final_lat_rss
+            if math.isfinite(final_lat_rss) and final_lat_rss >= self.mpc_config.lateral_rss_terminal_safe_threshold:
+                family_stats[category]["lateral_rss_safe"] = True
+            if category in ("left", "right") and evaluation.get("road_boundary_safe", False):
+                family_stats[category]["escape_available"] = True
 
         terminal_feasible_candidates.sort(key=lambda item: item["cost"])
         guard_passed: List[Dict[str, Any]] = []
@@ -532,6 +547,20 @@ class RSSMPCFilter(RSSCBFFilter):
                 "best_right_guard_rejected": family_stats["right"]["guard_rejected"],
                 "left_reject_reason": family_stats["left"]["reject_reason"],
                 "right_reject_reason": family_stats["right"]["reject_reason"],
+                "best_left_lateral_rss_margin": family_stats["left"]["best_lateral_rss_margin"] if math.isfinite(family_stats["left"]["best_lateral_rss_margin"]) else math.nan,
+                "best_right_lateral_rss_margin": family_stats["right"]["best_lateral_rss_margin"] if math.isfinite(family_stats["right"]["best_lateral_rss_margin"]) else math.nan,
+                "right_candidate_generated": family_stats["right"]["count"] > 0,
+                "left_candidate_generated": family_stats["left"]["count"] > 0,
+                "right_road_safe": family_stats["right"]["road_safe"],
+                "left_road_safe": family_stats["left"]["road_safe"],
+                "right_lateral_rss_safe": family_stats["right"]["lateral_rss_safe"],
+                "left_lateral_rss_safe": family_stats["left"]["lateral_rss_safe"],
+                "right_escape_available": family_stats["right"]["escape_available"],
+                "left_escape_available": family_stats["left"]["escape_available"],
+                "right_escape_reject_reason": family_stats["right"]["reject_reason"],
+                "left_escape_reject_reason": family_stats["left"]["reject_reason"],
+                "right_steer_value_used": -self.mpc_config.nudge_steer,
+                "left_steer_value_used": self.mpc_config.nudge_steer,
                 "brake_selected_reason": "",
                 "mpc_time_ms": mpc_time_ms,
                 "candidate_generation_time_ms": gen_time_ms,
@@ -651,6 +680,21 @@ class RSSMPCFilter(RSSCBFFilter):
                         "corridor_terminal_recoverable": best.get("terminal_recoverable", False),
                         "first_step_recovery_feasible": best.get("first_step_recovery_feasible", False),
                         "brake_selected_reason": brake_selected_reason,
+                        "selected_steer_before_guard": float(best.get("mpc_action_before_guard", [math.nan, math.nan])[1]) if isinstance(best.get("mpc_action_before_guard"), list) else math.nan,
+                        "selected_steer_after_guard": float(best.get("action_after_guard", [math.nan, math.nan])[1]) if isinstance(best.get("action_after_guard"), list) else math.nan,
+                        "certified_lateral_escape_used": best.get("certified_lateral_escape_used", False),
+                        "certified_lateral_escape_side": best.get("certified_lateral_escape_side", ""),
+                        "certified_lateral_escape_reason": best.get("certified_lateral_escape_reason", ""),
+                        "guard_rejected_lateral_escape": best.get("guard_rejected_lateral_escape", False),
+                        "mpc_action_before_guard": best.get("mpc_action_before_guard", [math.nan, math.nan]),
+                        "action_after_guard": best.get("action_after_guard", [math.nan, math.nan]),
+                        "initial_lateral_rss_margin": best.get("initial_lateral_rss_margin", math.nan),
+                        "final_lateral_rss_margin": best.get("final_lateral_rss_margin", math.nan),
+                        "lateral_rss_improvement": best.get("lateral_rss_improvement", 0.0),
+                        "path_overlap_reduced": best.get("path_overlap_reduced", False),
+                        "terminal_deconflicted": best.get("terminal_deconflicted", False),
+                        "first_step_lateral_margin_improves": best.get("first_step_lateral_margin_improves", False),
+                        "first_step_path_overlap_reduces": best.get("first_step_path_overlap_reduces", False),
                         **corridor_memory_info,
                     },
                 ),
@@ -1741,9 +1785,13 @@ class RSSMPCFilter(RSSCBFFilter):
         rollout_obj = copy.deepcopy(obj)
         margins: List[float] = []
         lateral_clearance_margins: List[float] = []
+        lateral_rss_margins: List[float] = []
         road_boundary_margins: List[float] = []
         speeds: List[float] = []
+        path_overlaps: List[bool] = []
         initial_lateral_clearance = self._lateral_clearance_margin(state, obj)
+        initial_lateral_rss_margin = self._lateral_rss_margin_for_object(state, obj)
+        initial_path_overlap = self._front_object_path_overlap(state, obj)
         initial_ego = self._ego(state)
 
         for action in sequence:
@@ -1752,16 +1800,27 @@ class RSSMPCFilter(RSSCBFFilter):
             )
             margin = self._rss_margin_for_object(rollout_state, rollout_obj, object_kind)
             lateral_clearance_margin = self._lateral_clearance_margin(rollout_state, rollout_obj)
+            lateral_rss_margin = self._lateral_rss_margin_for_object(rollout_state, rollout_obj)
             road_boundary_margin = self._road_boundary_margin_for_state(state, rollout_state)
             margins.append(float(margin))
             lateral_clearance_margins.append(float(lateral_clearance_margin))
+            lateral_rss_margins.append(float(lateral_rss_margin))
             road_boundary_margins.append(float(road_boundary_margin))
             speeds.append(self._ego_speed(rollout_state))
+            path_overlaps.append(self._front_object_path_overlap(rollout_state, rollout_obj))
 
         final_margin = margins[-1] if margins else current_margin
         min_margin = min([current_margin] + margins) if margins else current_margin
         final_lateral_clearance = lateral_clearance_margins[-1] if lateral_clearance_margins else -math.inf
         min_lateral_clearance = min(lateral_clearance_margins) if lateral_clearance_margins else -math.inf
+        final_lateral_rss_margin = lateral_rss_margins[-1] if lateral_rss_margins else -math.inf
+        min_lateral_rss_margin = min(lateral_rss_margins) if lateral_rss_margins else -math.inf
+        final_path_overlap = path_overlaps[-1] if path_overlaps else initial_path_overlap
+        lateral_rss_improvement = (final_lateral_rss_margin - initial_lateral_rss_margin) if (
+            math.isfinite(final_lateral_rss_margin) and math.isfinite(initial_lateral_rss_margin)
+        ) else 0.0
+        path_overlap_reduced = initial_path_overlap and not final_path_overlap
+        terminal_deconflicted = self._is_lateral_deconflicted(rollout_state, rollout_obj)
         min_road_boundary_margin = min(road_boundary_margins) if road_boundary_margins else self._current_road_boundary_margin(state)
         final_road_boundary_margin = road_boundary_margins[-1] if road_boundary_margins else self._current_road_boundary_margin(state)
         progress = self._longitudinal_progress(initial_ego, self._ego(rollout_state))
@@ -1788,6 +1847,12 @@ class RSSMPCFilter(RSSCBFFilter):
             final_lateral_offset=final_lateral_offset,
             initial_road_boundary_margin=self._current_road_boundary_margin(state),
             final_road_boundary_margin=final_road_boundary_margin,
+            final_lateral_rss_margin=final_lateral_rss_margin,
+            initial_lateral_rss_margin=initial_lateral_rss_margin,
+            lateral_rss_improvement=lateral_rss_improvement,
+            path_overlap_reduced=path_overlap_reduced,
+            terminal_deconflicted=terminal_deconflicted,
+            final_path_overlap=final_path_overlap,
         )
         current_speed = self._ego_speed(state)
         first_acc = float(sequence[0][0]) if len(sequence) else self.mpc_config.strong_brake
@@ -1812,6 +1877,12 @@ class RSSMPCFilter(RSSCBFFilter):
                 "blocking_object_cleared",
                 "corridor_tracking_improved",
                 "recentered_from_boundary",
+                "lateral_rss_margin_improved",
+                "path_overlap_reduced",
+                "front_object_deconflicted",
+                "lateral_escape_safe",
+                "right_escape_deconflicted",
+                "left_escape_deconflicted",
             }
             steer_toward_corridor = (
                 abs(target_offset) > self.config.small_tolerance
@@ -1839,6 +1910,15 @@ class RSSMPCFilter(RSSCBFFilter):
             elif is_lateral_recovery:
                 first_step_recovery_feasible = True
                 first_step_recovery_reason = "terminal_lateral_recovery"
+            elif lateral_rss_improvement > self.config.small_tolerance:
+                first_step_recovery_feasible = True
+                first_step_recovery_reason = "first_step_lateral_rss_margin_improves"
+            elif path_overlap_reduced:
+                first_step_recovery_feasible = True
+                first_step_recovery_reason = "first_step_path_overlap_reduces"
+            elif terminal_deconflicted:
+                first_step_recovery_feasible = True
+                first_step_recovery_reason = "first_step_lateral_deconflicted"
             else:
                 first_step_recovery_feasible = False
                 first_step_recovery_reason = "first_step_no_progress"
@@ -1909,6 +1989,15 @@ class RSSMPCFilter(RSSCBFFilter):
             "reason": reason,
             "first_step_recovery_feasible": first_step_recovery_feasible,
             "first_step_recovery_reason": first_step_recovery_reason,
+            "initial_lateral_rss_margin": initial_lateral_rss_margin,
+            "final_lateral_rss_margin": final_lateral_rss_margin,
+            "lateral_rss_improvement": lateral_rss_improvement,
+            "initial_path_overlap": initial_path_overlap,
+            "final_path_overlap": final_path_overlap,
+            "path_overlap_reduced": path_overlap_reduced,
+            "terminal_deconflicted": terminal_deconflicted,
+            "first_step_lateral_margin_improves": lateral_rss_improvement > self.config.small_tolerance if current_speed <= self.mpc_config.stuck_speed_threshold else False,
+            "first_step_path_overlap_reduces": path_overlap_reduced if current_speed <= self.mpc_config.stuck_speed_threshold else False,
             "corridor": corridor,
             "corridor_type": corridor.get("corridor_type", ""),
             "corridor_target_lateral_offset": corridor.get("target_lateral_offset", math.nan),
@@ -1930,7 +2019,20 @@ class RSSMPCFilter(RSSCBFFilter):
             u_guarded=u_guarded,
             guard_mode=guard_mode,
         )
-        u_effective = u_mpc if guard_override_used else u_guarded
+
+        certified_lateral_escape_used = False
+        certified_lateral_escape_side = ""
+        certified_lateral_escape_reason = ""
+        if not guard_override_used:
+            certified_lateral_escape_used, certified_lateral_escape_side, certified_lateral_escape_reason = (
+                self._check_certified_lateral_escape(state, evaluation, u_mpc, u_guarded, guard_mode)
+            )
+
+        if certified_lateral_escape_used:
+            guard_override_used = True
+            guard_override_reason = certified_lateral_escape_reason
+
+        u_effective = u_mpc if (guard_override_used or certified_lateral_escape_used) else u_guarded
 
         guarded_acc = float(u_effective[0])
         current_speed = self._ego_speed(state)
@@ -1938,10 +2040,10 @@ class RSSMPCFilter(RSSCBFFilter):
         guard_cost += self.mpc_config.guard_brake_cost_weight * max(0.0, -float(u_guarded[0])) ** 2
         if current_speed <= self.mpc_config.stuck_speed_threshold and guarded_acc <= self.mpc_config.comfort_brake:
             guard_cost += self.mpc_config.guard_stall_brake_cost
-        if guard_override_used:
+        if guard_override_used or certified_lateral_escape_used:
             guard_cost *= 0.1
 
-        guard_safe = guard_override_used or not guard_fallback
+        guard_safe = guard_override_used or certified_lateral_escape_used or not guard_fallback
         if guard_safe and current_speed <= self.mpc_config.stuck_speed_threshold:
             progress_guarded = guarded_acc >= self.mpc_config.guard_override_min_acc
             lateral_recovery = abs(float(u_effective[1])) >= min(0.25, self.mpc_config.nudge_steer)
@@ -1957,17 +2059,28 @@ class RSSMPCFilter(RSSCBFFilter):
                 "blocking_object_cleared",
                 "corridor_tracking_improved",
                 "recentered_from_boundary",
+                "lateral_rss_margin_improved",
+                "path_overlap_reduced",
+                "front_object_deconflicted",
+                "lateral_escape_safe",
+                "right_escape_deconflicted",
+                "left_escape_deconflicted",
             }
+            lateral_rss_improves = float(evaluation.get("lateral_rss_improvement", 0.0)) > self.config.small_tolerance
+            path_overlap_reducing = bool(evaluation.get("path_overlap_reduced", False))
+            terminal_deconflicted = bool(evaluation.get("terminal_deconflicted", False))
             guard_safe = (progress_guarded or lateral_recovery
-                          or lateral_clearance_improves or is_lateral_terminal_recovery)
+                          or lateral_clearance_improves or is_lateral_terminal_recovery
+                          or lateral_rss_improves or path_overlap_reducing or terminal_deconflicted)
 
         guard_reject_reason = ""
         if not guard_safe:
-            guard_reject_reason = (
-                "cbf_fallback_no_safe_candidate"
-                if guard_fallback
-                else "first_step_recovery_rejected_after_cbf_guard"
-            )
+            if guard_fallback:
+                guard_reject_reason = "cbf_fallback_no_safe_candidate"
+            elif certified_lateral_escape_used:
+                guard_reject_reason = "lateral_escape_guard_rejected"
+            else:
+                guard_reject_reason = "first_step_recovery_rejected_after_cbf_guard"
 
         return {
             "guard_safe": bool(guard_safe),
@@ -1975,13 +2088,19 @@ class RSSMPCFilter(RSSCBFFilter):
             "u_mpc_first": u_mpc,
             "u_guarded_first": u_effective,
             "guard_info": guard_info,
-            "cbf_guard_used": (not guard_override_used) and guard_delta > self.mpc_config.action_change_tolerance,
+            "cbf_guard_used": (not guard_override_used and not certified_lateral_escape_used) and guard_delta > self.mpc_config.action_change_tolerance,
             "cbf_guard_delta": float(guard_delta),
             "cbf_guard_override_used": bool(guard_override_used),
             "cbf_guard_override_reason": guard_override_reason,
             "certified_recovery_override_used": bool(guard_override_used),
             "certified_recovery_override_reason": guard_override_reason,
+            "certified_lateral_escape_used": bool(certified_lateral_escape_used),
+            "certified_lateral_escape_side": certified_lateral_escape_side,
+            "certified_lateral_escape_reason": certified_lateral_escape_reason,
+            "guard_rejected_lateral_escape": bool(certified_lateral_escape_used and not guard_safe),
             "guard_reject_reason": guard_reject_reason,
+            "mpc_action_before_guard": [float(u_mpc[0]), float(u_mpc[1])],
+            "action_after_guard": [float(u_effective[0]), float(u_effective[1])],
         }
 
     def _guard_override_for_certified_recovery(
@@ -2043,6 +2162,12 @@ class RSSMPCFilter(RSSCBFFilter):
             "lateral_clearance_improved",
             "corridor_tracking_improved",
             "recentered_from_boundary",
+            "lateral_rss_margin_improved",
+            "path_overlap_reduced",
+            "front_object_deconflicted",
+            "lateral_escape_safe",
+            "right_escape_deconflicted",
+            "left_escape_deconflicted",
         }
         if progress <= self.config.small_tolerance and not lateral_improving:
             return False, ""
@@ -2055,6 +2180,79 @@ class RSSMPCFilter(RSSCBFFilter):
             return True, "{}_clearance_recovery_with_large_rss_margin".format(prefix)
         prefix = "mpc_certified_cbf_fallback" if guard_mode == "fallback_no_safe_candidate" else "mpc_certified"
         return True, "{}_creep_with_large_rss_margin".format(prefix)
+
+    def _check_certified_lateral_escape(
+        self,
+        state: State,
+        evaluation: Dict[str, Any],
+        u_mpc: Action,
+        u_guarded: Action,
+        guard_mode: str,
+    ) -> Tuple[bool, str, str]:
+        current_speed = self._ego_speed(state)
+        if current_speed > self.mpc_config.stuck_speed_threshold * 3:
+            return False, "", ""
+        if not bool(evaluation.get("terminal_recoverable", False)):
+            return False, "", ""
+        if not bool(evaluation.get("road_boundary_safe", False)):
+            return False, "", ""
+        if guard_mode not in {"rss_cbf_intervention", "rss_cbf_recovery", "fallback_no_safe_candidate"}:
+            return False, "", ""
+
+        lateral_rss_improvement = float(evaluation.get("lateral_rss_improvement", 0.0))
+        path_overlap_reduced = bool(evaluation.get("path_overlap_reduced", False))
+        terminal_deconflicted = bool(evaluation.get("terminal_deconflicted", False))
+        final_lateral_rss_margin = float(evaluation.get("final_lateral_rss_margin", -math.inf))
+        terminal_reason = str(evaluation.get("terminal_recovery_reason", ""))
+
+        is_lateral_escape_reason = terminal_reason in {
+            "lateral_rss_margin_improved",
+            "path_overlap_reduced",
+            "front_object_deconflicted",
+            "lateral_escape_safe",
+            "right_escape_deconflicted",
+            "left_escape_deconflicted",
+            "lateral_clearance_improved",
+            "bypass_clearance_forming",
+            "blocking_object_cleared",
+        }
+        if not is_lateral_escape_reason:
+            return False, "", ""
+
+        current_margin = float(evaluation.get("rss_margin_current", math.inf))
+        min_margin = float(evaluation.get("rss_margin_min_pred", -math.inf))
+        if math.isfinite(min_margin) and min_margin < -self.mpc_config.safety_margin_tolerance:
+            return False, "", ""
+
+        min_road_boundary = float(evaluation.get("road_boundary_margin_min_pred", -math.inf))
+        if min_road_boundary < self.mpc_config.corridor_road_boundary_margin:
+            return False, "", ""
+
+        lateral_safe = (
+            (math.isfinite(final_lateral_rss_margin) and final_lateral_rss_margin >= self.mpc_config.lateral_rss_terminal_safe_threshold)
+            or lateral_rss_improvement > self.mpc_config.path_overlap_reduction_threshold
+            or path_overlap_reduced
+            or terminal_deconflicted
+        )
+        if not lateral_safe:
+            return False, "", ""
+
+        escape_side = ""
+        final_lateral_offset = float(evaluation.get("final_lateral_offset", 0.0))
+        if final_lateral_offset < -self.config.small_tolerance:
+            escape_side = "right"
+        elif final_lateral_offset > self.config.small_tolerance:
+            escape_side = "left"
+
+        reason = "certified_lateral_escape"
+        if escape_side:
+            reason = "certified_{}_lateral_escape".format(escape_side)
+        if path_overlap_reduced:
+            reason += "_path_overlap_reduced"
+        elif terminal_deconflicted:
+            reason += "_deconflicted"
+
+        return True, escape_side, reason
 
     def _rss_sequence_feasibility(
         self,
@@ -2200,6 +2398,12 @@ class RSSMPCFilter(RSSCBFFilter):
         final_lateral_offset: float = 0.0,
         initial_road_boundary_margin: float = math.inf,
         final_road_boundary_margin: float = math.inf,
+        final_lateral_rss_margin: float = -math.inf,
+        initial_lateral_rss_margin: float = -math.inf,
+        lateral_rss_improvement: float = 0.0,
+        path_overlap_reduced: bool = False,
+        terminal_deconflicted: bool = False,
+        final_path_overlap: bool = True,
     ) -> Tuple[bool, str]:
         if not rss_feasible:
             return False, "rss_not_feasible"
@@ -2215,12 +2419,31 @@ class RSSMPCFilter(RSSCBFFilter):
         target_offset = float(corridor.get("target_lateral_offset", 0.0))
         corridor_tracking_improvement = abs(target_offset) - abs(target_offset - float(final_lateral_offset))
         road_margin_improvement = float(final_road_boundary_margin) - float(initial_road_boundary_margin)
+        is_lateral_escape = abs(target_offset) > self.config.small_tolerance or abs(final_lateral_offset) > 0.3
+        escape_side = "right" if final_lateral_offset < -self.config.small_tolerance else ("left" if final_lateral_offset > self.config.small_tolerance else "")
+
         if progress >= self.mpc_config.recovery_progress_threshold:
             return True, "progress_recovered"
         if margin_improvement >= self.mpc_config.recovery_margin_improvement_threshold:
             return True, "rss_margin_improved"
         if not blocking_object_final:
             return True, "blocking_object_cleared"
+
+        if lateral_rss_improvement > self.mpc_config.path_overlap_reduction_threshold:
+            return True, "lateral_rss_margin_improved"
+        if path_overlap_reduced:
+            return True, "path_overlap_reduced"
+        if terminal_deconflicted and not final_path_overlap:
+            return True, "front_object_deconflicted"
+
+        if is_lateral_escape and terminal_deconflicted:
+            if final_lateral_rss_margin >= self.mpc_config.lateral_rss_terminal_safe_threshold:
+                if escape_side == "right":
+                    return True, "right_escape_deconflicted"
+                elif escape_side == "left":
+                    return True, "left_escape_deconflicted"
+                return True, "lateral_escape_safe"
+
         if final_lateral_clearance >= self.mpc_config.recovery_lateral_clearance_threshold:
             return True, "bypass_clearance_forming"
         if lateral_improvement >= self.mpc_config.recovery_lateral_improvement_threshold:
@@ -2264,10 +2487,29 @@ class RSSMPCFilter(RSSCBFFilter):
         return self._distance_to_obstacle_front(state, obj) - self._rss_cbf_distance(state, obj, object_kind)
 
     def _front_object_blocks_predicted_path(self, state: State, obj: Dict[str, Any]) -> bool:
-        longitudinal, _ = self._relative_position(self._ego(state), obj)
+        longitudinal, lateral = self._relative_position(self._ego(state), obj)
         if longitudinal <= 0.0:
             return False
-        return self._lateral_clearance_margin(state, obj) < 0.0
+        lateral_margin = self._lateral_clearance_margin(state, obj)
+        if lateral_margin >= 0.0:
+            return False
+        return True
+
+    def _front_object_path_overlap(self, state: State, obj: Dict[str, Any]) -> bool:
+        _, lateral = self._relative_position(self._ego(state), obj)
+        half_ego = self.config.vehicle_width / 2.0 + self.config.obstacle_margin
+        half_obj = self._object_width(obj, self.config.vehicle_width) / 2.0
+        return abs(lateral) < (half_ego + half_obj)
+
+    def _lateral_rss_margin_for_object(self, state: State, obj: Dict[str, Any]) -> float:
+        return self.compute_lateral_rss_margin(state, obj)
+
+    def _is_lateral_deconflicted(self, state: State, obj: Dict[str, Any]) -> bool:
+        lateral_margin = self._lateral_clearance_margin(state, obj)
+        if lateral_margin >= self.mpc_config.lateral_rss_deconfliction_threshold:
+            return True
+        lat_rss_margin = self._lateral_rss_margin_for_object(state, obj)
+        return lat_rss_margin >= self.mpc_config.lateral_rss_terminal_safe_threshold
 
     def _lateral_clearance_margin(self, state: State, obj: Dict[str, Any]) -> float:
         _, lateral = self._relative_position(self._ego(state), obj)
@@ -2435,6 +2677,39 @@ class RSSMPCFilter(RSSCBFFilter):
                 "num_total_candidates": 0,
                 "num_random_candidates": 0,
                 "num_structured_candidates": 0,
+                "lateral_rss_margin": math.nan,
+                "front_object_path_overlap": False,
+                "front_object_lateral_distance": math.nan,
+                "front_object_lateral_margin": math.nan,
+                "front_object_deconflicted": False,
+                "longitudinal_constraint_relaxed_by_lateral_escape": False,
+                "initial_lateral_rss_margin": math.nan,
+                "final_lateral_rss_margin": math.nan,
+                "lateral_rss_improvement": 0.0,
+                "initial_path_overlap": False,
+                "final_path_overlap": False,
+                "path_overlap_reduced": False,
+                "terminal_deconflicted": False,
+                "first_step_lateral_margin_improves": False,
+                "first_step_path_overlap_reduces": False,
+                "certified_lateral_escape_used": False,
+                "certified_lateral_escape_side": "",
+                "certified_lateral_escape_reason": "",
+                "guard_rejected_lateral_escape": False,
+                "mpc_action_before_guard": [math.nan, math.nan],
+                "action_after_guard": [math.nan, math.nan],
+                "right_steer_value_used": math.nan,
+                "left_steer_value_used": math.nan,
+                "selected_steer_before_guard": math.nan,
+                "selected_steer_after_guard": math.nan,
+                "right_road_safe": False,
+                "left_road_safe": False,
+                "right_lateral_rss_safe": False,
+                "left_lateral_rss_safe": False,
+                "right_escape_available": False,
+                "left_escape_available": False,
+                "right_escape_reject_reason": "",
+                "left_escape_reject_reason": "",
             }
         )
         if extra_info:
