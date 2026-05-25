@@ -31,6 +31,7 @@ class RSSMPCConfig(RSSCBFConfig):
     """Stable defaults for RSS-MPC runtime assurance evaluation."""
 
     horizon_steps: int = 10
+    recovery_horizon_steps: int = 20
     dt: float = 0.1
     num_samples: int = 64
     min_acc: float = -5.0
@@ -84,6 +85,7 @@ class RSSMPCConfig(RSSCBFConfig):
     recovery_hold_margin_buffer: float = 4.0
     creep_acc: float = 0.6
     nudge_steer: float = 0.35
+    nudge_steer_ratio_threshold: float = 0.5
     bypass_steer: float = 0.8
 
     recovery_w_intervention: float = 0.2
@@ -123,6 +125,7 @@ class RSSMPCFilter(RSSCBFFilter):
         self._last_route_completion = math.nan
         self._held_recovery_action: Optional[Action] = None
         self._held_recovery_ttl = 0
+        self._last_candidate_families: List[str] = []
 
     def reset(self) -> None:
         """Clear rolling deadlock state at episode reset."""
@@ -131,6 +134,7 @@ class RSSMPCFilter(RSSCBFFilter):
         self._last_route_completion = math.nan
         self._held_recovery_action = None
         self._held_recovery_ttl = 0
+        self._last_candidate_families = []
 
     def update_after_step(self, env_info: Optional[Dict[str, Any]]) -> None:
         """Optionally attach post-step route progress to the newest history sample."""
@@ -311,14 +315,24 @@ class RSSMPCFilter(RSSCBFFilter):
                 ),
             )
 
-        candidates = self._generate_recovery_candidate_sequences(u_original, cbf_reference_action)
+        recovery_horizon = max(1, int(self.mpc_config.recovery_horizon_steps))
+        original_horizon = self.mpc_config.horizon_steps
+        self.mpc_config.horizon_steps = recovery_horizon
+        try:
+            candidates = self._generate_recovery_candidate_sequences(u_original, cbf_reference_action)
+        finally:
+            self.mpc_config.horizon_steps = original_horizon
+
         best: Optional[Dict[str, Any]] = None
         feasible_count = 0
         terminal_feasible_count = 0
+        no_rss_feasible_count = 0
+        no_terminal_recoverable_count = 0
         guard_rejected_count = 0
         terminal_feasible_candidates: List[Dict[str, Any]] = []
+        guard_rejected_candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
 
-        for sequence in candidates:
+        for idx, sequence in enumerate(candidates):
             evaluation = self._evaluate_sequence(
                 state=state,
                 obj=obj,
@@ -328,7 +342,20 @@ class RSSMPCFilter(RSSCBFFilter):
                 u_nom=u_original,
                 u_cbf=cbf_reference_action,
             )
-            if not evaluation["feasible"]:
+            if idx < len(self._last_candidate_families):
+                evaluation["recovery_candidate_family"] = self._last_candidate_families[idx]
+            else:
+                evaluation["recovery_candidate_family"] = "unknown"
+            rss_feasible, _, _ = self._rss_sequence_feasibility(
+                current_margin=current_margin,
+                min_margin=evaluation["rss_margin_min_pred"],
+                final_margin=evaluation["rss_margin_final_pred"],
+            )
+            if not rss_feasible:
+                no_rss_feasible_count += 1
+                continue
+            if not evaluation["terminal_recoverable"]:
+                no_terminal_recoverable_count += 1
                 continue
             terminal_feasible_count += 1
             terminal_feasible_candidates.append(evaluation)
@@ -339,6 +366,7 @@ class RSSMPCFilter(RSSCBFFilter):
             guard_eval = self._evaluate_guarded_first_action(state, evaluation)
             if not guard_eval["guard_safe"]:
                 guard_rejected_count += 1
+                guard_rejected_candidates.append((evaluation, guard_eval))
                 continue
             evaluation.update(guard_eval)
             evaluation["cost"] += guard_eval["guard_cost"]
@@ -346,7 +374,41 @@ class RSSMPCFilter(RSSCBFFilter):
             if best is None or evaluation["cost"] < best["cost"]:
                 best = evaluation
         if best is None and len(terminal_feasible_candidates) > guard_eval_limit:
-            guard_rejected_count += len(terminal_feasible_candidates) - guard_eval_limit
+            for evaluation in terminal_feasible_candidates[guard_eval_limit:]:
+                guard_eval = self._evaluate_guarded_first_action(state, evaluation)
+                if not guard_eval["guard_safe"]:
+                    guard_rejected_count += 1
+                    guard_rejected_candidates.append((evaluation, guard_eval))
+                    continue
+                evaluation.update(guard_eval)
+                evaluation["cost"] += guard_eval["guard_cost"]
+                feasible_count += 1
+                if best is None or evaluation["cost"] < best["cost"]:
+                    best = evaluation
+
+        total_candidates = len(candidates)
+        if best is not None:
+            failure_reason = ""
+        elif no_rss_feasible_count == total_candidates:
+            failure_reason = "no_rss_feasible_candidate"
+        elif terminal_feasible_count == 0:
+            failure_reason = "no_terminal_recoverable_candidate"
+        elif feasible_count == 0:
+            failure_reason = "terminal_candidates_guard_rejected"
+        elif feasible_count == 0 and terminal_feasible_count == 0:
+            failure_reason = "no_drivable_recovery_corridor"
+        else:
+            failure_reason = "horizon_too_short_or_no_progress"
+
+        def _diagnostics_block() -> Dict[str, Any]:
+            return {
+                "mpc_failure_reason": failure_reason,
+                "mpc_no_rss_feasible_count": no_rss_feasible_count,
+                "mpc_no_terminal_recoverable_count": no_terminal_recoverable_count,
+                "mpc_guard_rejected_count": guard_rejected_count,
+                "mpc_terminal_candidate_count": terminal_feasible_count,
+                "recovery_horizon_steps_used": recovery_horizon,
+            }
 
         if best is not None:
             u_mpc = self._clip_action(best["u_mpc_first"])
@@ -376,7 +438,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 dynamic_vehicle_detected=dynamic_detected,
                 obstacle_detected=static_detected,
                 mpc_success=True,
-                mpc_num_candidates=len(candidates),
+                mpc_num_candidates=total_candidates,
                 mpc_num_feasible=feasible_count,
                 mpc_best_cost=best["cost"],
                 rss_margin_min_pred=best["rss_margin_min_pred"],
@@ -403,6 +465,9 @@ class RSSMPCFilter(RSSCBFFilter):
                         "mpc_guard_rejected": guard_rejected_count,
                         "cbf_guard_override_used": guard_override_used,
                         "cbf_guard_override_reason": best.get("cbf_guard_override_reason", ""),
+                        "first_step_recovery_reason": best.get("first_step_recovery_reason", ""),
+                        "recovery_candidate_family": best.get("recovery_candidate_family", ""),
+                        **_diagnostics_block(),
                     },
                 ),
             )
@@ -423,7 +488,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 dynamic_vehicle_detected=dynamic_detected,
                 obstacle_detected=static_detected,
                 mpc_success=True,
-                mpc_num_candidates=len(candidates),
+                mpc_num_candidates=total_candidates,
                 mpc_num_feasible=0,
                 mpc_best_cost=math.nan,
                 rss_margin_min_pred=math.nan,
@@ -446,20 +511,93 @@ class RSSMPCFilter(RSSCBFFilter):
                         "cbf_guard_override_used": True,
                         "cbf_guard_override_reason": "held_certified_recovery_action_with_large_rss_margin",
                         "recovery_hold_used": True,
+                        **_diagnostics_block(),
                     },
                 ),
             )
+
+        # Try guard override on guard-rejected terminal candidates with large margin
+        if (guard_rejected_candidates
+                and math.isfinite(current_margin)
+                and current_margin >= self.mpc_config.guard_override_fallback_margin_buffer):
+            guard_rejected_candidates.sort(
+                key=lambda item: item[0].get("cost", 1e9)
+            )
+            for evaluation, guard_eval in guard_rejected_candidates:
+                guard_info = guard_eval.get("guard_info", {})
+                guard_mode = guard_info.get("mode", "")
+                override_used, override_reason = self._guard_override_for_certified_recovery(
+                    state=state,
+                    evaluation=evaluation,
+                    u_mpc=self._clip_action(evaluation["sequence"][0]),
+                    u_guarded=guard_eval.get("u_guarded_first", guard_eval.get("u_mpc_first")),
+                    guard_mode=guard_mode,
+                )
+                if override_used:
+                    u_safe = self._clip_action(evaluation["sequence"][0])
+                    self._remember_recovery_action(u_safe)
+                    return u_safe, self._make_mpc_info(
+                        state=state,
+                        obj=obj,
+                        object_kind=object_kind,
+                        mode="rss_mpc_recovery",
+                        reason="mpc_recovery_guard_rejected_override",
+                        u_original=u_original,
+                        u_safe=u_safe,
+                        d_front=d_front,
+                        d_rss=d_rss,
+                        rss_margin_current=current_margin,
+                        dynamic_vehicle_detected=dynamic_detected,
+                        obstacle_detected=static_detected,
+                        mpc_success=True,
+                        mpc_num_candidates=total_candidates,
+                        mpc_num_feasible=1,
+                        mpc_best_cost=evaluation.get("cost", math.nan),
+                        rss_margin_min_pred=evaluation["rss_margin_min_pred"],
+                        rss_margin_final_pred=evaluation["rss_margin_final_pred"],
+                        rss_lateral_clearance_min_pred=evaluation["rss_lateral_clearance_min_pred"],
+                        rss_lateral_clearance_final_pred=evaluation["rss_lateral_clearance_final_pred"],
+                        predicted_progress=evaluation["predicted_progress"],
+                        fallback_used=False,
+                        cbf_info=guard_info,
+                        cbf_reference_info=cbf_info,
+                        cbf_guard_used=False,
+                        cbf_guard_delta=0.0,
+                        extra_info=self._merge_recovery_info(
+                            deadlock_info,
+                            {
+                                "mpc_called": True,
+                                "mpc_call_reason": "deadlock_risk",
+                                "terminal_recoverable": evaluation["terminal_recoverable"],
+                                "terminal_recovery_reason": evaluation["terminal_recovery_reason"],
+                                "recovery_progress": evaluation["recovery_progress"],
+                                "recovery_margin_improvement": evaluation["recovery_margin_improvement"],
+                                "blocking_object_final": evaluation["blocking_object_final"],
+                                "mpc_terminal_feasible": terminal_feasible_count,
+                                "mpc_guard_rejected": guard_rejected_count,
+                                "cbf_guard_override_used": True,
+                                "cbf_guard_override_reason": override_reason,
+                                "first_step_recovery_reason": evaluation.get("first_step_recovery_reason", ""),
+                                "recovery_candidate_family": evaluation.get("recovery_candidate_family", ""),
+                                **_diagnostics_block(),
+                            },
+                        ),
+                    )
 
         if cbf_info.get("mode") != "fallback_no_safe_candidate":
             u_safe = cbf_safe
             mode = "rss_mpc_fallback_to_cbf"
             reason = "mpc_recovery_failed_fallback_to_cbf"
             minimum_risk_stop_used = False
+            if feasible_count == 0 and terminal_feasible_count > 0:
+                failure_reason = failure_reason or "terminal_candidates_guard_rejected"
         else:
             u_safe = self._minimum_risk_stop(u_original)
             mode = "minimum_risk_stop"
             reason = "mpc_recovery_failed_minimum_risk_stop"
             minimum_risk_stop_used = True
+            if feasible_count == 0 and terminal_feasible_count > 0:
+                failure_reason = "fallback_to_minimum_risk_stop"
 
         info = self._make_mpc_info(
             state=state,
@@ -475,7 +613,7 @@ class RSSMPCFilter(RSSCBFFilter):
             dynamic_vehicle_detected=dynamic_detected,
             obstacle_detected=static_detected,
             mpc_success=False,
-            mpc_num_candidates=len(candidates),
+            mpc_num_candidates=total_candidates,
             mpc_num_feasible=0,
             mpc_best_cost=math.nan,
             rss_margin_min_pred=math.nan,
@@ -496,6 +634,7 @@ class RSSMPCFilter(RSSCBFFilter):
                     "minimum_risk_stop_used": minimum_risk_stop_used,
                     "mpc_terminal_feasible": terminal_feasible_count,
                     "mpc_guard_rejected": guard_rejected_count,
+                    **_diagnostics_block(),
                 },
             ),
         )
@@ -690,8 +829,9 @@ class RSSMPCFilter(RSSCBFFilter):
         horizon = max(1, int(self.mpc_config.horizon_steps))
         max_candidates = max(1, int(self.mpc_config.num_samples))
         sequences: List[np.ndarray] = []
+        families: List[str] = []
 
-        def add_sequence(acc_values: Sequence[float], steer_values: Sequence[float]) -> None:
+        def add_sequence(acc_values: Sequence[float], steer_values: Sequence[float], family: str = "") -> None:
             if len(sequences) >= max_candidates:
                 return
             sequence = np.asarray(
@@ -700,40 +840,51 @@ class RSSMPCFilter(RSSCBFFilter):
             )
             if sequence.shape == (horizon, 2):
                 sequences.append(sequence)
+                families.append(family)
 
         acc_nom, steer_nom = u_nom
         acc_cbf, steer_cbf = self._clip_action(u_cbf if u_cbf is not None else u_nom)
+        cfg = self.mpc_config
 
-        # Deterministic recovery maneuvers are tried before random shooting.
+        # --- Baseline deterministic candidates ---
         add_sequence(
             np.full(horizon, acc_cbf, dtype=np.float64),
             np.full(horizon, steer_cbf, dtype=np.float64),
+            "cbf_continuous",
         )
         add_sequence(
             np.linspace(acc_nom, acc_cbf, horizon),
             np.linspace(steer_nom, steer_cbf, horizon),
+            "interpolate_to_cbf",
         )
         add_sequence(
-            np.full(horizon, self.mpc_config.comfort_brake, dtype=np.float64),
+            np.full(horizon, cfg.comfort_brake, dtype=np.float64),
             np.full(horizon, steer_nom, dtype=np.float64),
+            "comfort_brake",
         )
         add_sequence(
-            np.full(horizon, self.mpc_config.strong_brake, dtype=np.float64),
+            np.full(horizon, cfg.strong_brake, dtype=np.float64),
             np.full(horizon, 0.0, dtype=np.float64),
+            "strong_brake_straight",
         )
+
+        # --- Creep candidates ---
         add_sequence(
-            np.full(horizon, self.mpc_config.creep_acc, dtype=np.float64),
+            np.full(horizon, cfg.creep_acc, dtype=np.float64),
             np.full(horizon, steer_nom, dtype=np.float64),
+            "creep_nominal",
         )
-        for steer in (self.mpc_config.nudge_steer, -self.mpc_config.nudge_steer):
+        for steer in (cfg.nudge_steer, -cfg.nudge_steer):
             add_sequence(
-                np.full(horizon, self.mpc_config.creep_acc, dtype=np.float64),
+                np.full(horizon, cfg.creep_acc, dtype=np.float64),
                 np.full(horizon, steer, dtype=np.float64),
+                "creep_nudge",
             )
-        for steer in (self.mpc_config.bypass_steer, -self.mpc_config.bypass_steer):
+        for steer in (cfg.bypass_steer, -cfg.bypass_steer):
             add_sequence(
-                np.full(horizon, self.mpc_config.creep_acc, dtype=np.float64),
+                np.full(horizon, cfg.creep_acc, dtype=np.float64),
                 np.full(horizon, steer, dtype=np.float64),
+                "creep_bypass",
             )
             straighten = np.concatenate(
                 [
@@ -742,14 +893,73 @@ class RSSMPCFilter(RSSCBFFilter):
                 ]
             )
             add_sequence(
-                np.full(horizon, self.mpc_config.creep_acc, dtype=np.float64),
+                np.full(horizon, cfg.creep_acc, dtype=np.float64),
                 straighten,
+                "bypass_then_straighten",
+            )
+
+        # --- Maneuver-biased recovery candidates (deadlock recovery only) ---
+        # Steer first half, then creep straight (steer-before-creep)
+        for steer in (cfg.bypass_steer, -cfg.bypass_steer):
+            half = max(1, horizon // 2)
+            resteer = np.concatenate([
+                np.full(half, steer, dtype=np.float64),
+                np.full(horizon - half, 0.0, dtype=np.float64),
+            ])
+            add_sequence(np.full(horizon, cfg.creep_acc, dtype=np.float64), resteer, "steer_first_then_creep")
+
+        # Brake one step, then bypass (create space before turning)
+        for steer in (cfg.bypass_steer, -cfg.bypass_steer):
+            if horizon >= 2:
+                acc_seq = np.concatenate([
+                    [cfg.strong_brake],
+                    np.full(horizon - 1, cfg.creep_acc, dtype=np.float64),
+                ])
+                steer_seq = np.concatenate([
+                    [0.0],
+                    np.full(horizon - 1, steer, dtype=np.float64),
+                ])
+                add_sequence(acc_seq, steer_seq, "brake1_then_bypass")
+
+        # Brake two steps, then bypass
+        for steer in (cfg.bypass_steer, -cfg.bypass_steer):
+            if horizon >= 3:
+                acc_seq = np.concatenate([
+                    np.full(2, cfg.strong_brake, dtype=np.float64),
+                    np.full(horizon - 2, cfg.creep_acc, dtype=np.float64),
+                ])
+                steer_seq = np.concatenate([
+                    np.full(2, 0.0, dtype=np.float64),
+                    np.full(horizon - 2, steer, dtype=np.float64),
+                ])
+                add_sequence(acc_seq, steer_seq, "brake2_then_bypass")
+
+        # Recenter maneuver (gradually steer to zero, creep forward)
+        if abs(steer_nom) > cfg.action_change_tolerance:
+            add_sequence(
+                np.full(horizon, cfg.creep_acc, dtype=np.float64),
+                np.linspace(steer_nom, 0.0, horizon),
+                "recenter_maneuver",
+            )
+
+        # Slow nudge with comfort brake
+        for steer in (cfg.nudge_steer, -cfg.nudge_steer):
+            add_sequence(
+                np.full(horizon, cfg.comfort_brake, dtype=np.float64),
+                np.full(horizon, steer, dtype=np.float64),
+                "comfort_brake_nudge",
             )
 
         while len(sequences) < max_candidates:
             sequences.append(self._sample_random_sequence(u_nom, horizon))
+            families.append("random_shooting")
 
-        return sequences[:max_candidates]
+        # Attach family metadata as a non-numeric attribute via object array trick
+        # Store family info on each sequence container
+        sequences_with_families = sequences[:max_candidates]
+        self._last_candidate_families = families[:max_candidates]
+
+        return sequences_with_families
 
     def _sample_random_sequence(self, u_nom: Action, horizon: int) -> np.ndarray:
         alpha = max(0.0, min(1.0, float(self.mpc_config.random_smoothing_alpha)))
@@ -825,9 +1035,36 @@ class RSSMPCFilter(RSSCBFFilter):
         )
         current_speed = self._ego_speed(state)
         first_acc = float(sequence[0][0]) if len(sequence) else self.mpc_config.strong_brake
+        first_steer = float(sequence[0][1]) if len(sequence) else 0.0
         first_step_recovery_feasible = True
+        first_step_recovery_reason = ""
         if current_speed <= self.mpc_config.stuck_speed_threshold:
-            first_step_recovery_feasible = first_acc >= self.mpc_config.guard_override_min_acc
+            lateral_improves = (
+                math.isfinite(final_lateral_clearance)
+                and math.isfinite(initial_lateral_clearance)
+                and float(final_lateral_clearance) - float(initial_lateral_clearance) > self.config.small_tolerance
+            )
+            is_lateral_recovery = terminal_recovery_reason in {
+                "lateral_bypass_improving",
+                "bypass_clearance_forming",
+                "blocking_object_cleared",
+            }
+            has_significant_steer = abs(first_steer) >= self.mpc_config.nudge_steer * self.mpc_config.nudge_steer_ratio_threshold
+            if first_acc >= self.mpc_config.guard_override_min_acc:
+                first_step_recovery_feasible = True
+                first_step_recovery_reason = "first_acc_sufficient"
+            elif has_significant_steer:
+                first_step_recovery_feasible = True
+                first_step_recovery_reason = "first_steer_significant"
+            elif lateral_improves:
+                first_step_recovery_feasible = True
+                first_step_recovery_reason = "lateral_clearance_improves"
+            elif is_lateral_recovery:
+                first_step_recovery_feasible = True
+                first_step_recovery_reason = "terminal_lateral_recovery"
+            else:
+                first_step_recovery_feasible = False
+                first_step_recovery_reason = "first_step_no_progress"
 
         speed_feasible = all(
             -self.config.small_tolerance <= speed <= self.mpc_config.v_max + self.config.small_tolerance
@@ -869,6 +1106,8 @@ class RSSMPCFilter(RSSCBFFilter):
             "rss_margin_final_pred": final_margin,
             "rss_lateral_clearance_min_pred": min_lateral_clearance,
             "rss_lateral_clearance_final_pred": final_lateral_clearance,
+            "initial_lateral_clearance": initial_lateral_clearance,
+            "final_speed": final_speed,
             "predicted_progress": progress,
             "recovery_used": recovery_used,
             "terminal_recoverable": terminal_recoverable,
@@ -877,6 +1116,7 @@ class RSSMPCFilter(RSSCBFFilter):
             "recovery_margin_improvement": recovery_margin_improvement,
             "blocking_object_final": blocking_object_final,
             "reason": reason,
+            "first_step_recovery_reason": first_step_recovery_reason,
         }
 
     def _evaluate_guarded_first_action(self, state: State, evaluation: Dict[str, Any]) -> Dict[str, Any]:
@@ -909,7 +1149,19 @@ class RSSMPCFilter(RSSCBFFilter):
         if guard_safe and current_speed <= self.mpc_config.stuck_speed_threshold:
             progress_guarded = guarded_acc >= self.mpc_config.guard_override_min_acc
             lateral_recovery = abs(float(u_effective[1])) >= min(0.25, self.mpc_config.nudge_steer)
-            guard_safe = progress_guarded or lateral_recovery
+            lateral_clearance_improves = (
+                math.isfinite(evaluation.get("rss_lateral_clearance_final_pred", -math.inf))
+                and math.isfinite(evaluation.get("rss_lateral_clearance_min_pred", -math.inf))
+                and float(evaluation["rss_lateral_clearance_final_pred"])
+                - float(evaluation["rss_lateral_clearance_min_pred"]) > self.config.small_tolerance
+            )
+            is_lateral_terminal_recovery = evaluation.get("terminal_recovery_reason") in {
+                "lateral_bypass_improving",
+                "bypass_clearance_forming",
+                "blocking_object_cleared",
+            }
+            guard_safe = (progress_guarded or lateral_recovery
+                          or lateral_clearance_improves or is_lateral_terminal_recovery)
 
         return {
             "guard_safe": bool(guard_safe),
@@ -1093,6 +1345,11 @@ class RSSMPCFilter(RSSCBFFilter):
             return True, "lateral_bypass_improving"
         if final_speed >= self.mpc_config.recovery_terminal_speed_threshold and final_margin >= self.mpc_config.safety_margin_tolerance:
             return True, "terminal_speed_recovered"
+        if initial_lateral_clearance < 0 and lateral_improvement > self.config.small_tolerance:
+            return True, "lateral_clearance_improving_from_negative"
+        if (math.isfinite(final_margin) and final_margin >= self.mpc_config.guard_override_margin_buffer
+                and margin_improvement >= -self.config.small_tolerance):
+            return True, "rss_margin_maintained_large_buffer"
         return False, "safe_but_no_recovery_progress"
 
     def _simulate_next_state_and_object(
@@ -1230,6 +1487,14 @@ class RSSMPCFilter(RSSCBFFilter):
                 "cbf_guard_override_used": False,
                 "cbf_guard_override_reason": "",
                 "recovery_hold_used": False,
+                "mpc_failure_reason": "",
+                "mpc_no_rss_feasible_count": 0,
+                "mpc_no_terminal_recoverable_count": 0,
+                "mpc_guard_rejected_count": 0,
+                "mpc_terminal_candidate_count": 0,
+                "first_step_recovery_reason": "",
+                "recovery_horizon_steps_used": self.mpc_config.horizon_steps,
+                "recovery_candidate_family": "",
             }
         )
         if extra_info:
