@@ -129,6 +129,9 @@ class RSSMPCConfig(RSSCBFConfig):
     path_overlap_reduction_threshold: float = 0.1
     certified_lateral_escape_min_margin: float = 1.0
     certified_lateral_escape_min_lateral_margin: float = 0.0
+    lateral_creep_immediate_margin_threshold: float = -2.0
+    lateral_creep_allow_negative_immediate_margin: bool = True
+    lateral_creep_no_collision_distance: float = 1.5
 
 
 class RSSMPCFilter(RSSCBFFilter):
@@ -527,7 +530,7 @@ class RSSMPCFilter(RSSCBFFilter):
 
         def _lateral_escape_failure_reason() -> str:
             if family_stats["left"]["count"] <= 0 and family_stats["right"]["count"] <= 0:
-                return "no_lateral_escape_generated"
+                return "lateral_creep_not_generated"
             for side in ("right", "left"):
                 stats = family_stats[side]
                 if stats["count"] <= 0:
@@ -535,11 +538,11 @@ class RSSMPCFilter(RSSCBFFilter):
                 if not stats["road_safe"]:
                     return "{}_escape_not_road_safe".format(side)
                 if not stats["lateral_rss_safe"]:
-                    return "{}_escape_lateral_rss_unsafe".format(side)
+                    return "lateral_creep_rss_unsafe"
                 if not stats["terminal_recoverable"]:
-                    return "{}_escape_not_terminal_recoverable".format(side)
+                    return "lateral_creep_terminal_not_recoverable"
                 if stats["guard_rejected"]:
-                    return "{}_escape_guard_rejected".format(side)
+                    return "lateral_creep_guard_suppressed_throttle"
             return ""
 
         lateral_failure_reason = _lateral_escape_failure_reason()
@@ -628,8 +631,17 @@ class RSSMPCFilter(RSSCBFFilter):
                 "creep_suppression_reason": "",
                 "selected_acc_before_guard": math.nan,
                 "selected_acc_after_guard": math.nan,
+                "selected_steer_before_guard": math.nan,
+                "selected_steer_after_guard": math.nan,
+                "selected_throttle_before_guard": math.nan,
+                "selected_throttle_after_guard": math.nan,
+                "selected_brake_before_guard": math.nan,
+                "selected_brake_after_guard": math.nan,
+                "cbf_guard_delta": 0.0,
                 "invalid_lateral_escape_no_creep": False,
+                "only_steering_no_creep": False,
                 "brake_selected_reason": "",
+                "lateral_creep_failure_reason": lateral_failure_reason,
                 "mpc_time_ms": mpc_time_ms,
                 "candidate_generation_time_ms": gen_time_ms,
                 "candidate_evaluation_time_ms": eval_time_ms,
@@ -694,6 +706,13 @@ class RSSMPCFilter(RSSCBFFilter):
             guard_after = best.get("action_after_guard", [math.nan, math.nan])
             selected_acc_before = float(mpc_before[0]) if isinstance(mpc_before, list) else math.nan
             selected_acc_after = float(guard_after[0]) if isinstance(guard_after, list) else math.nan
+            selected_steer_before = float(mpc_before[1]) if isinstance(mpc_before, list) else math.nan
+            selected_steer_after = float(guard_after[1]) if isinstance(guard_after, list) else math.nan
+            selected_throttle_before = float(best.get("selected_throttle_before_guard", math.nan))
+            selected_throttle_after = float(best.get("selected_throttle_after_guard", math.nan))
+            selected_brake_before = float(best.get("selected_brake_before_guard", math.nan))
+            selected_brake_after = float(best.get("selected_brake_after_guard", math.nan))
+            only_steering_no_creep = bool(best.get("only_steering_no_creep", False))
             lateral_escape_throttle_suppressed = (
                 best_category in ("left", "right")
                 and math.isfinite(selected_acc_before) and selected_acc_before > 0
@@ -701,7 +720,9 @@ class RSSMPCFilter(RSSCBFFilter):
             )
             creep_suppression_reason = ""
             if lateral_escape_throttle_suppressed:
-                creep_suppression_reason = "guard_overrode_creep_acc_to_brake"
+                creep_suppression_reason = best.get("creep_suppression_reason_guard", "guard_overrode_creep_acc_to_brake")
+            if only_steering_no_creep and not lateral_escape_throttle_suppressed:
+                creep_suppression_reason = "only_steering_no_creep_detected"
 
             if best_category == "brake":
                 if not family_stats["left"]["terminal_recoverable"] and not family_stats["right"]["terminal_recoverable"]:
@@ -719,6 +740,8 @@ class RSSMPCFilter(RSSCBFFilter):
                                   family_stats["right"]["escape_available"]))
                 else:
                     brake_selected_reason = "brake_lower_cost"
+            elif best_category in ("left", "right") and only_steering_no_creep:
+                brake_selected_reason = "lateral_escape_only_steering_no_creep"
 
             return u_safe, self._make_mpc_info(
                 state=state,
@@ -783,8 +806,13 @@ class RSSMPCFilter(RSSCBFFilter):
                         "corridor_terminal_recoverable": best.get("terminal_recoverable", False),
                         "first_step_recovery_feasible": best.get("first_step_recovery_feasible", False),
                         "brake_selected_reason": brake_selected_reason,
-                        "selected_steer_before_guard": float(best.get("mpc_action_before_guard", [math.nan, math.nan])[1]) if isinstance(best.get("mpc_action_before_guard"), list) else math.nan,
-                        "selected_steer_after_guard": float(best.get("action_after_guard", [math.nan, math.nan])[1]) if isinstance(best.get("action_after_guard"), list) else math.nan,
+                        "selected_steer_before_guard": selected_steer_before,
+                        "selected_steer_after_guard": selected_steer_after,
+                        "selected_throttle_before_guard": selected_throttle_before,
+                        "selected_throttle_after_guard": selected_throttle_after,
+                        "selected_brake_before_guard": selected_brake_before,
+                        "selected_brake_after_guard": selected_brake_after,
+                        "cbf_guard_delta": cbf_guard_delta,
                         "certified_lateral_escape_used": best.get("certified_lateral_escape_used", False),
                         "certified_lateral_escape_side": best.get("certified_lateral_escape_side", ""),
                         "certified_lateral_escape_reason": best.get("certified_lateral_escape_reason", ""),
@@ -819,8 +847,12 @@ class RSSMPCFilter(RSSCBFFilter):
                         "creep_suppression_reason": creep_suppression_reason,
                         "selected_acc_before_guard": selected_acc_before,
                         "selected_acc_after_guard": selected_acc_after,
+                        "only_steering_no_creep": only_steering_no_creep,
+                        "invalid_lateral_escape_no_creep": bool(best.get("invalid_lateral_escape_no_creep", False)),
                         "creep_acc_value_used": self.mpc_config.creep_acc,
-                        "action_mapping_note": "lateral_creep" if best_category in ("left", "right") else best_category,
+                        "right_steer_value_used": -self.mpc_config.nudge_steer,
+                        "left_steer_value_used": self.mpc_config.nudge_steer,
+                        "action_mapping_note": "internal_acc_steer_positive_acc_is_throttle" if best_category in ("left", "right") else best_category,
                         **corridor_memory_info,
                     },
                 ),
@@ -1036,6 +1068,7 @@ class RSSMPCFilter(RSSCBFFilter):
                     "minimum_risk_stop_used": minimum_risk_stop_used,
                     "mpc_terminal_feasible": terminal_feasible_count,
                     "mpc_guard_rejected": guard_rejected_count,
+                    "lateral_creep_failure_reason": lateral_failure_reason,
                     **_diagnostics_block(),
                 },
             ),
@@ -2034,6 +2067,14 @@ class RSSMPCFilter(RSSCBFFilter):
         current_speed = self._ego_speed(state)
         first_acc = float(sequence[0][0]) if len(sequence) else self.mpc_config.strong_brake
         first_steer = float(sequence[0][1]) if len(sequence) else 0.0
+        candidate_family = str(corridor.get("corridor_type", ""))
+        is_lateral_escape_family = any(
+            k in candidate_family for k in ("left_offset", "right_offset")
+        ) or abs(float(corridor.get("target_lateral_offset", 0.0))) > self.config.small_tolerance
+        invalid_lateral_escape_no_creep = bool(
+            is_lateral_escape_family
+            and first_acc <= 0.0
+        )
         first_step_recovery_feasible = True
         first_step_recovery_reason = ""
         if current_speed <= self.mpc_config.stuck_speed_threshold:
@@ -2196,6 +2237,7 @@ class RSSMPCFilter(RSSCBFFilter):
             "corridor_type": corridor.get("corridor_type", ""),
             "corridor_target_lateral_offset": corridor.get("target_lateral_offset", math.nan),
             "corridor_target_speed": corridor.get("target_speed", math.nan),
+            "invalid_lateral_escape_no_creep": invalid_lateral_escape_no_creep,
         }
 
     def _evaluate_guarded_first_action(self, state: State, evaluation: Dict[str, Any]) -> Dict[str, Any]:
@@ -2258,9 +2300,43 @@ class RSSMPCFilter(RSSCBFFilter):
             lateral_rss_improves = float(evaluation.get("lateral_rss_improvement", 0.0)) > self.config.small_tolerance
             path_overlap_reducing = bool(evaluation.get("path_overlap_reduced", False))
             terminal_deconflicted = bool(evaluation.get("terminal_deconflicted", False))
+            first_steer_toward_escape = (
+                abs(float(u_mpc[1])) >= self.mpc_config.nudge_steer * self.mpc_config.nudge_steer_ratio_threshold
+            )
+            lateral_distance_increases = bool(evaluation.get("first_step_lateral_distance_increases", False))
             guard_safe = (progress_guarded or lateral_recovery
                           or lateral_clearance_improves or is_lateral_terminal_recovery
-                          or lateral_rss_improves or path_overlap_reducing or terminal_deconflicted)
+                          or lateral_rss_improves or path_overlap_reducing or terminal_deconflicted
+                          or (first_steer_toward_escape and (lateral_rss_improves or path_overlap_reducing or lateral_distance_increases)))
+
+        mpc_acc = float(u_mpc[0])
+        effective_acc = float(u_effective[0])
+        mpc_throttle = max(0.0, mpc_acc / max(self.config.max_acc, 1e-6))
+        effective_throttle = max(0.0, effective_acc / max(self.config.max_acc, 1e-6))
+        mpc_brake = max(0.0, -mpc_acc / max(abs(self.config.min_acc), 1e-6))
+        effective_brake = max(0.0, -effective_acc / max(abs(self.config.min_acc), 1e-6))
+        candidate_category = self._family_category(str(evaluation.get("recovery_candidate_family", "")))
+        only_steering_no_creep = bool(
+            candidate_category in ("left", "right")
+            and abs(float(u_effective[1])) > 0.05
+            and effective_acc <= 0.0
+            and mpc_acc > 0.0
+        )
+        lateral_escape_throttle_suppressed_guard = bool(
+            candidate_category in ("left", "right")
+            and mpc_acc > 0.0
+            and effective_acc <= 0.0
+        )
+        creep_suppression_reason_guard = ""
+        if lateral_escape_throttle_suppressed_guard:
+            if guard_fallback:
+                creep_suppression_reason_guard = "cbf_fallback_no_safe_candidate_suppressed_creep"
+            elif guard_mode == "rss_cbf_recovery":
+                creep_suppression_reason_guard = "cbf_recovery_projected_acc_to_brake"
+            elif guard_mode == "rss_cbf_intervention":
+                creep_suppression_reason_guard = "cbf_intervention_projected_acc_to_zero"
+            else:
+                creep_suppression_reason_guard = "guard_overrode_creep_acc_to_brake"
 
         guard_reject_reason = ""
         if not guard_safe:
@@ -2298,6 +2374,13 @@ class RSSMPCFilter(RSSCBFFilter):
             "guard_reject_reason": guard_reject_reason,
             "mpc_action_before_guard": [float(u_mpc[0]), float(u_mpc[1])],
             "action_after_guard": [float(u_effective[0]), float(u_effective[1])],
+            "selected_throttle_before_guard": float(mpc_throttle),
+            "selected_throttle_after_guard": float(effective_throttle),
+            "selected_brake_before_guard": float(mpc_brake),
+            "selected_brake_after_guard": float(effective_brake),
+            "only_steering_no_creep": only_steering_no_creep,
+            "lateral_escape_throttle_suppressed_guard": lateral_escape_throttle_suppressed_guard,
+            "creep_suppression_reason_guard": creep_suppression_reason_guard,
         }
 
     def _guard_override_for_certified_recovery(
@@ -2468,8 +2551,23 @@ class RSSMPCFilter(RSSCBFFilter):
         min_margin = float(evaluation.get("rss_margin_min_pred", -math.inf))
         if not math.isfinite(min_margin) and min_margin != math.inf:
             return False, "", ""
-        if not bool(evaluation.get("immediate_longitudinal_margin_safe", False)):
+        immediate_margin = float(evaluation.get("first_step_rss_margin_pred",
+                                     evaluation.get("immediate_longitudinal_margin_safe", False)))
+        immediate_longitudinal_margin_safe = bool(evaluation.get("immediate_longitudinal_margin_safe", False))
+        if not immediate_longitudinal_margin_safe:
+            first_step_margin = float(evaluation.get("first_step_rss_margin_pred", -math.inf))
+            if math.isfinite(first_step_margin):
+                immediate_longitudinal_margin_safe = first_step_margin >= self.mpc_config.lateral_creep_immediate_margin_threshold
+            else:
+                min_pred = float(evaluation.get("rss_margin_min_pred", -math.inf))
+                if math.isfinite(min_pred):
+                    immediate_longitudinal_margin_safe = min_pred >= self.mpc_config.lateral_creep_immediate_margin_threshold
+        if not self.mpc_config.lateral_creep_allow_negative_immediate_margin and not immediate_longitudinal_margin_safe:
             return False, "", ""
+        if not immediate_longitudinal_margin_safe:
+            d_front = float(evaluation.get("rss_margin_current", math.inf))
+            if math.isfinite(d_front) and d_front < self.mpc_config.lateral_creep_no_collision_distance:
+                return False, "", ""
 
         min_road_boundary = float(evaluation.get("road_boundary_margin_min_pred", -math.inf))
         if min_road_boundary < self.mpc_config.corridor_road_boundary_margin:
@@ -2699,6 +2797,21 @@ class RSSMPCFilter(RSSCBFFilter):
             if escape_side == "left":
                 return True, "left_escape_deconflicted"
             return True, "front_object_deconflicted"
+
+        if is_lateral_escape and road_boundary_safe and terminal_lateral_separation_safe:
+            if lateral_margin_improved and predicted_path_overlap_reducing:
+                if escape_side == "right":
+                    return True, "right_escape_deconflicted"
+                if escape_side == "left":
+                    return True, "left_escape_deconflicted"
+                return True, "lateral_escape_safe"
+            if path_overlap_reduced and terminal_deconflicted:
+                if escape_side == "right":
+                    return True, "right_escape_deconflicted"
+                if escape_side == "left":
+                    return True, "left_escape_deconflicted"
+                return True, "lateral_escape_safe"
+
         if progress >= self.mpc_config.recovery_progress_threshold:
             return True, "progress_recovered"
         if margin_improvement >= self.mpc_config.recovery_margin_improvement_threshold:
@@ -3018,9 +3131,17 @@ class RSSMPCFilter(RSSCBFFilter):
                 "creep_suppression_reason": "",
                 "selected_acc_before_guard": math.nan,
                 "selected_acc_after_guard": math.nan,
+                "selected_steer_before_guard": math.nan,
+                "selected_steer_after_guard": math.nan,
+                "selected_throttle_before_guard": math.nan,
+                "selected_throttle_after_guard": math.nan,
+                "selected_brake_before_guard": math.nan,
+                "selected_brake_after_guard": math.nan,
                 "creep_acc_value_used": math.nan,
                 "action_mapping_note": "",
                 "invalid_lateral_escape_no_creep": False,
+                "only_steering_no_creep": False,
+                "lateral_creep_failure_reason": "",
             }
         )
         if obj is not None and self.config.enable_lateral_rss:

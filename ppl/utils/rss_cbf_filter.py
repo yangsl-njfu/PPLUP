@@ -37,6 +37,8 @@ class RSSCBFConfig(StaticRSSConfig):
     lateral_rss_max_lateral_speed: float = 3.0
     lateral_rss_min_lateral_decel: float = 2.0
     certified_lateral_escape_margin_buffer: float = 1.0
+    certified_lateral_creep_critical_margin: float = -1.5
+    certified_lateral_creep_max_acc: float = 1.0
 
     # RSS-CBF evaluation does not expose bypass or clearance-guard experiments.
     enable_bypass: bool = False
@@ -260,7 +262,17 @@ class RSSCBFFilter(StaticRSSFilter):
         if not self.config.enable_recovery_mode:
             return min_margin >= -self.config.small_tolerance
 
-        if self._clip_action(action)[0] > self.config.small_tolerance:
+        clipped_acc = self._clip_action(action)[0]
+        if clipped_acc > self.config.small_tolerance:
+            is_lateral_creep_pass_through = bool(
+                margins.get("terminal_lateral_separation_safe", False)
+                and margins.get("path_overlap_reducing", False)
+                and min_margin >= float(getattr(self.config, "certified_lateral_creep_critical_margin", -1.5))
+                and clipped_acc <= float(getattr(self.config, "certified_lateral_creep_max_acc", 1.0)) + self.config.small_tolerance
+                and abs(float(action[1])) > 0.05
+            )
+            if is_lateral_creep_pass_through:
+                return True
             return False
 
         margin_improvement = float(margins.get("margin_improvement", final_margin - current_margin))
