@@ -2888,31 +2888,52 @@ class RSSMPCFilter(RSSCBFFilter):
             else:
                 relaxed_terminal_reason = "lateral_escape_safe"
 
+        lateral_certified_gate = bool(
+            is_lateral_escape
+            and road_safe
+            and critical_safe
+            and positive_creep
+            and first_acc <= max_acc
+            and (
+                terminal_lateral_safe
+                or lateral_margin_improved
+                or path_overlap_reduced
+                or lateral_terminal_reason
+            )
+        )
+
         relaxed_first_step_recovery = bool(evaluation.get("first_step_recovery_feasible", False))
         relaxed_first_step_reason = str(evaluation.get("first_step_recovery_reason", ""))
         if (
             not relaxed_first_step_recovery
-            and not invalid_no_creep
-            and low_speed_creep
+            and lateral_certified_gate
             and steer_toward_escape
-            and road_safe
-            and critical_safe
             and no_immediate_collision_risk
-            and lateral_recovery_signal
         ):
             relaxed_first_step_recovery = True
             if bool(evaluation.get("first_step_lateral_margin_improves", False)):
                 relaxed_first_step_reason = "first_step_lateral_rss_margin_improves"
             elif bool(evaluation.get("first_step_path_overlap_reduces", False)):
                 relaxed_first_step_reason = "first_step_path_overlap_reduces"
-            elif lateral_distance_increases:
-                relaxed_first_step_reason = "first_step_lateral_distance_increases"
             elif path_overlap_reduced:
                 relaxed_first_step_reason = "first_step_path_overlap_reduces"
             elif lateral_terminal_reason:
                 relaxed_first_step_reason = "terminal_lateral_recovery"
             else:
                 relaxed_first_step_reason = "lateral_escape_first_step_certified"
+
+        if lateral_certified_gate:
+            relaxed_terminal_recoverable = True
+            if candidate_side == "right":
+                relaxed_terminal_reason = "right_escape_deconflicted"
+            elif candidate_side == "left":
+                relaxed_terminal_reason = "left_escape_deconflicted"
+            elif path_overlap_reduced:
+                relaxed_terminal_reason = "path_overlap_reduced"
+            elif lateral_margin_improved:
+                relaxed_terminal_reason = "lateral_rss_margin_improved"
+            else:
+                relaxed_terminal_reason = "lateral_escape_safe"
 
         result.update({
             "is_lateral_escape": True,
@@ -2950,11 +2971,9 @@ class RSSMPCFilter(RSSCBFFilter):
             reject_reason = "lateral_escape_rejected_by_critical_margin"
         elif not no_immediate_collision_risk:
             reject_reason = "lateral_escape_immediate_collision_risk"
-        elif not lateral_recovery_signal and not lateral_safe_or_improving:
+        elif not (terminal_lateral_safe or lateral_margin_improved or path_overlap_reduced or lateral_terminal_reason):
             reject_reason = "lateral_escape_lateral_rss_unsafe"
-        elif not path_overlap_reduced and not lateral_distance_increases and not lateral_terminal_reason and not terminal_lateral_safe:
-            reject_reason = "lateral_escape_path_overlap_not_reduced"
-        elif not relaxed_terminal_recoverable:
+        elif not lateral_certified_gate:
             reject_reason = "lateral_escape_terminal_not_recoverable"
 
         if reject_reason:
@@ -2984,21 +3003,8 @@ class RSSMPCFilter(RSSCBFFilter):
         elif lateral_margin_improved and not path_overlap_reduced:
             reason = "lateral_rss_margin_improved"
 
-        lateral_certified_gate = bool(
-            road_safe
-            and critical_safe
-            and positive_creep
-            and first_acc <= max_acc
-            and (
-                lateral_rss_safe
-                or lateral_margin_improved
-                or path_overlap_reduced
-                or terminal_lateral_safe
-                or lateral_distance_increases
-                or lateral_terminal_reason
-            )
-        )
         result.update({
+            "lateral_certified_gate": lateral_certified_gate,
             "lateral_certified_gate": lateral_certified_gate,
             "lateral_escape_certified": lateral_certified_gate,
             "lateral_escape_certification_reason": reason,
@@ -3038,20 +3044,16 @@ class RSSMPCFilter(RSSCBFFilter):
         if guard_mode not in {"rss_cbf_intervention", "rss_cbf_recovery", "fallback_no_safe_candidate"}:
             return False, "", ""
 
+        if not bool(evaluation.get("lateral_certified_gate", False)):
+            return False, "", ""
         path_overlap_reduced = bool(evaluation.get("lateral_escape_path_overlap_reduced", False))
         terminal_deconflicted = bool(evaluation.get("terminal_lateral_deconflicted", evaluation.get("terminal_deconflicted", False)))
         lateral_rss_improvement = float(evaluation.get("lateral_rss_improvement", 0.0))
-        lateral_safe_or_improving = bool(
-            evaluation.get("lateral_escape_lateral_rss_safe", False)
-            or evaluation.get("lateral_escape_lateral_margin_improved", False)
-        )
-        if not lateral_safe_or_improving or not path_overlap_reduced:
-            return False, "", ""
-        if not bool(evaluation.get("terminal_lateral_separation_safe", False)):
-            return False, "", ""
 
         min_road_boundary = float(evaluation.get("road_boundary_margin_min_pred", -math.inf))
         if min_road_boundary < self.mpc_config.corridor_road_boundary_margin:
+            return False, "", ""
+        if float(u_mpc[0]) <= 0.0 or float(u_guarded[0]) > self.config.small_tolerance:
             return False, "", ""
 
         acc = float(u_mpc[0])
