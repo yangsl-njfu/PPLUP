@@ -471,18 +471,22 @@ class RSSMPCFilter(RSSCBFFilter):
             if category in ("left", "right"):
                 evaluation.update(self._evaluate_lateral_escape_gate(state, evaluation))
             else:
+                evaluation.setdefault("is_lateral_escape", False)
+                evaluation.setdefault("lateral_certified_gate", False)
                 evaluation.setdefault("lateral_escape_candidate", False)
                 evaluation.setdefault("lateral_escape_certified", False)
                 evaluation.setdefault("lateral_escape_used_relaxed_longitudinal_gate", False)
                 evaluation.setdefault("longitudinal_constraint_relaxed_by_lateral_escape", False)
 
+            is_lateral_escape = bool(evaluation.get("is_lateral_escape", category in ("left", "right")))
+            lateral_certified_gate = bool(evaluation.get("lateral_certified_gate", evaluation.get("lateral_escape_certified", False)))
             lateral_escape_certified = bool(evaluation.get("lateral_escape_certified", False))
             conservative_safe = bool(evaluation.get("conservative_longitudinal_margin_safe", False))
             critical_safe = bool(evaluation.get("critical_longitudinal_margin_safe", False))
-            if category in ("left", "right"):
-                longitudinal_gate_passed = critical_safe
+            if is_lateral_escape:
+                longitudinal_gate_passed = bool(critical_safe and (rss_feasible or lateral_certified_gate))
             else:
-                longitudinal_gate_passed = conservative_safe
+                longitudinal_gate_passed = bool(rss_feasible and conservative_safe)
             if evaluation["cost"] < family_stats[category]["best_cost"]:
                 family_stats[category]["best_cost"] = evaluation["cost"]
             if evaluation.get("road_boundary_safe", False):
@@ -513,7 +517,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 family_stats[category]["terminal_recoverable"] = True
                 if not family_stats[category]["terminal_reason"]:
                     family_stats[category]["terminal_reason"] = str(evaluation.get("terminal_recovery_reason", ""))
-            if category in ("left", "right"):
+            if is_lateral_escape:
                 if evaluation.get("road_boundary_safe", False) and terminal_lateral_safe:
                     family_stats[category]["escape_available"] = True
                 reject_reason = str(evaluation.get("lateral_escape_reject_reason", ""))
@@ -526,21 +530,13 @@ class RSSMPCFilter(RSSCBFFilter):
                 elif not evaluation["terminal_recoverable"]:
                     _set_family_reject_reason(category, "lateral_escape_terminal_not_recoverable")
 
-            if category in ("left", "right"):
-                if not critical_safe:
-                    no_rss_feasible_count += 1
-            elif not conservative_safe:
+            if not longitudinal_gate_passed:
                 no_rss_feasible_count += 1
-            if (category in ("left", "right")
+            if (is_lateral_escape
                     and not bool(evaluation.get("conservative_longitudinal_margin_safe", False))
                     and bool(evaluation.get("critical_longitudinal_margin_safe", False))
                     and bool(evaluation.get("road_boundary_safe", False))
-                    and bool(evaluation.get("lateral_escape_low_speed_creep", False))
-                    and bool(evaluation.get("lateral_escape_steer_toward_escape", False))
-                    and bool(evaluation.get("lateral_escape_no_immediate_collision_risk", False))
-                    and (bool(evaluation.get("lateral_escape_lateral_rss_safe", False))
-                         or bool(evaluation.get("lateral_escape_lateral_margin_improved", False))
-                         or bool(evaluation.get("lateral_escape_path_overlap_reduced", False)))):
+                    and bool(evaluation.get("lateral_certified_gate", False))):
                 evaluation["lateral_escape_used_relaxed_longitudinal_gate"] = True
                 family_stats[category]["relaxed_longitudinal_gate_used"] = True
                 if not longitudinal_gate_passed:
@@ -680,6 +676,9 @@ class RSSMPCFilter(RSSCBFFilter):
                 "candidate_family": best.get("recovery_candidate_family", "") if best else "",
                 "selected_candidate_family": best.get("recovery_candidate_family", "") if best else "",
                 "best_candidate_family": best.get("recovery_candidate_family", "") if best else "",
+                "is_lateral_escape": bool(selected_diag.get("is_lateral_escape", False)),
+                "rss_feasible": bool(selected_diag.get("rss_feasible", False)),
+                "lateral_certified_gate": bool(selected_diag.get("lateral_certified_gate", False)),
                 "num_candidates_brake": family_stats["brake"]["count"],
                 "num_candidates_creep": family_stats["creep"]["count"],
                 "num_candidates_left": family_stats["left"]["count"],
@@ -1117,6 +1116,9 @@ class RSSMPCFilter(RSSCBFFilter):
                                 "immediate_longitudinal_margin_safe": evaluation.get("immediate_longitudinal_margin_safe", False),
                                 "conservative_longitudinal_margin_safe": evaluation.get("conservative_longitudinal_margin_safe", False),
                                 "critical_longitudinal_margin_safe": evaluation.get("critical_longitudinal_margin_safe", False),
+                                "is_lateral_escape": evaluation.get("is_lateral_escape", False),
+                                "rss_feasible": evaluation.get("rss_feasible", False),
+                                "lateral_certified_gate": evaluation.get("lateral_certified_gate", False),
                                 "lateral_escape_candidate": evaluation.get("lateral_escape_candidate", False),
                                 "lateral_escape_certified": evaluation.get("lateral_escape_certified", False),
                                 "lateral_escape_certification_reason": evaluation.get("lateral_escape_certification_reason", ""),
@@ -2192,16 +2194,26 @@ class RSSMPCFilter(RSSCBFFilter):
         blocking_object_final = self._front_object_blocks_predicted_path(rollout_state, rollout_obj)
         road_boundary_safe = min_road_boundary_margin >= float(corridor.get("road_boundary_margin", self.mpc_config.corridor_road_boundary_margin))
         first_margin = margins[0] if margins else current_margin
-        conservative_longitudinal_margin_safe = first_margin >= self.mpc_config.safety_margin_tolerance
+        immediate_longitudinal_margin = first_margin
+        if not math.isfinite(immediate_longitudinal_margin):
+            if math.isfinite(current_margin):
+                immediate_longitudinal_margin = float(current_margin)
+            else:
+                immediate_longitudinal_margin = float(min_margin)
+        conservative_longitudinal_margin_safe = bool(
+            immediate_longitudinal_margin == math.inf
+            or (
+                math.isfinite(immediate_longitudinal_margin)
+                and immediate_longitudinal_margin >= self.mpc_config.safety_margin_tolerance
+            )
+        )
         critical_threshold = float(self.mpc_config.lateral_escape_critical_longitudinal_margin)
-
-        def _critical_margin_safe(margin: float) -> bool:
-            return margin == math.inf or (math.isfinite(margin) and margin >= critical_threshold)
-
         critical_longitudinal_margin_safe = bool(
-            _critical_margin_safe(float(current_margin))
-            and _critical_margin_safe(float(first_margin))
-            and _critical_margin_safe(float(min_margin))
+            immediate_longitudinal_margin == math.inf
+            or (
+                math.isfinite(immediate_longitudinal_margin)
+                and immediate_longitudinal_margin >= critical_threshold
+            )
         )
         immediate_longitudinal_margin_safe = conservative_longitudinal_margin_safe
 
@@ -2740,8 +2752,18 @@ class RSSMPCFilter(RSSCBFFilter):
     def _evaluate_lateral_escape_gate(self, state: State, evaluation: Dict[str, Any]) -> Dict[str, Any]:
         family = str(evaluation.get("candidate_family", evaluation.get("recovery_candidate_family", "")))
         candidate_side = self._family_category(family)
-        is_lateral_escape = candidate_side in ("left", "right")
+        lateral_escape_families = {
+            "right_creep_escape",
+            "right_nudge_escape",
+            "right_then_straight_escape",
+            "left_creep_escape",
+            "left_nudge_escape",
+            "left_then_straight_escape",
+        }
+        is_lateral_escape = candidate_side in ("left", "right") or family in lateral_escape_families
         result: Dict[str, Any] = {
+            "is_lateral_escape": False,
+            "lateral_certified_gate": False,
             "lateral_escape_candidate": False,
             "lateral_escape_side": "",
             "lateral_escape_certified": False,
@@ -2893,6 +2915,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 relaxed_first_step_reason = "lateral_escape_first_step_certified"
 
         result.update({
+            "is_lateral_escape": True,
             "lateral_escape_candidate": True,
             "lateral_escape_side": candidate_side,
             "lateral_escape_lateral_rss_safe": lateral_rss_safe,
@@ -2961,14 +2984,29 @@ class RSSMPCFilter(RSSCBFFilter):
         elif lateral_margin_improved and not path_overlap_reduced:
             reason = "lateral_rss_margin_improved"
 
+        lateral_certified_gate = bool(
+            road_safe
+            and critical_safe
+            and positive_creep
+            and first_acc <= max_acc
+            and (
+                lateral_rss_safe
+                or lateral_margin_improved
+                or path_overlap_reduced
+                or terminal_lateral_safe
+                or lateral_distance_increases
+                or lateral_terminal_reason
+            )
+        )
         result.update({
-            "lateral_escape_certified": True,
+            "lateral_certified_gate": lateral_certified_gate,
+            "lateral_escape_certified": lateral_certified_gate,
             "lateral_escape_certification_reason": reason,
             "lateral_escape_used_relaxed_longitudinal_gate": bool(
-                critical_safe and (not bool(evaluation.get("rss_feasible", False)) or not conservative_safe)
+                lateral_certified_gate and (not bool(evaluation.get("rss_feasible", False)) or not conservative_safe)
             ),
             "longitudinal_constraint_relaxed_by_lateral_escape": bool(
-                critical_safe and (not bool(evaluation.get("rss_feasible", False)) or not conservative_safe)
+                lateral_certified_gate and (not bool(evaluation.get("rss_feasible", False)) or not conservative_safe)
             ),
         })
         return result
@@ -3550,6 +3588,9 @@ class RSSMPCFilter(RSSCBFFilter):
                 "immediate_longitudinal_margin_safe": False,
                 "conservative_longitudinal_margin_safe": False,
                 "critical_longitudinal_margin_safe": False,
+                "is_lateral_escape": False,
+                "rss_feasible": False,
+                "lateral_certified_gate": False,
                 "lateral_rss_improvement": 0.0,
                 "initial_path_overlap": False,
                 "final_path_overlap": False,
