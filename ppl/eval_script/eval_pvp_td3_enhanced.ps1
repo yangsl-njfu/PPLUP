@@ -12,7 +12,7 @@ if ($RSSCBF -and $RSSMPC) {
     throw "Use only one runtime assurance mode: -RSSCBF or -RSSMPC"
 }
 $METHOD = if ($RSSMPC) { "ppl_rss_mpc" } elseif ($RSSCBF) { "ppl_rss_cbf" } else { "ppl" }
-$RESULT_DIR = if ($RSSMPC) { "evaluation_results\PPL_0ee03603_rss_mpc" } elseif ($RSSCBF) { "evaluation_results\PPL_0ee03603_rss_cbf_test" } else { "evaluation_results\PPL_0ee03603-enhanced" }
+$RESULT_DIR = if ($RSSMPC) { "evaluation_results\PPL_0ee03603_rss_mpc_1" } elseif ($RSSCBF) { "evaluation_results\PPL_0ee03603_rss_cbf_test" } else { "evaluation_results\PPL_0ee03603-enhanced" }
 $START_STEP = 6000
 $END_STEP = 10000
 $STEP_INTERVAL = 200
