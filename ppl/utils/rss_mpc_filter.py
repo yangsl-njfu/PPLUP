@@ -477,7 +477,10 @@ class RSSMPCFilter(RSSCBFFilter):
                 evaluation.setdefault("longitudinal_constraint_relaxed_by_lateral_escape", False)
 
             lateral_escape_certified = bool(evaluation.get("lateral_escape_certified", False))
-            longitudinal_gate_passed = bool(rss_feasible or lateral_escape_certified)
+            if category in ("left", "right"):
+                longitudinal_gate_passed = bool(evaluation.get("critical_longitudinal_margin_safe", False))
+            else:
+                longitudinal_gate_passed = bool(rss_feasible)
             if evaluation["cost"] < family_stats[category]["best_cost"]:
                 family_stats[category]["best_cost"] = evaluation["cost"]
             if evaluation.get("road_boundary_safe", False):
@@ -728,6 +731,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 "certified_lateral_creep_side": "",
                 "certified_lateral_creep_reason": "",
                 "brake_selected_despite_certified_creep": False,
+                "brake_selected_despite_lateral_escape_available": False,
                 "lateral_escape_throttle_suppressed": False,
                 "lateral_escape_guard_pass_through": bool(selected_diag.get("lateral_escape_guard_pass_through", False)),
                 "lateral_escape_guard_reject_reason": selected_diag.get("lateral_escape_guard_reject_reason", ""),
@@ -835,7 +839,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 elif family_stats["left"]["terminal_recoverable"] or family_stats["right"]["terminal_recoverable"]:
                     brake_selected_reason = "brake_selected_despite_lateral_escape_available"
                     if certified_lateral_creep_available:
-                        print("[RSS-MPC-DEADLOCK] certified lateral creep feasible but brake selected "
+                        print("[RSS-MPC-DEADLOCK] lateral escape feasible but brake selected "
                               "(left_tr={}, right_tr={}, left_avail={}, right_avail={})".format(
                                   family_stats["left"]["terminal_recoverable"],
                                   family_stats["right"]["terminal_recoverable"],
@@ -946,6 +950,7 @@ class RSSMPCFilter(RSSCBFFilter):
                         "certified_lateral_creep_side": certified_lateral_creep_side,
                         "certified_lateral_creep_reason": certified_lateral_creep_reason,
                         "brake_selected_despite_certified_creep": bool(best_category == "brake" and certified_lateral_creep_available),
+                        "brake_selected_despite_lateral_escape_available": bool(best_category == "brake" and brake_selected_reason == "brake_selected_despite_lateral_escape_available"),
                         "lateral_escape_throttle_suppressed": lateral_escape_throttle_suppressed,
                         "creep_suppression_reason": creep_suppression_reason,
                         "selected_acc_before_guard": selected_acc_before,
@@ -1031,6 +1036,13 @@ class RSSMPCFilter(RSSCBFFilter):
                     self._remember_recovery_action(u_safe)
                     corridor_memory_info = self._commit_recovery_corridor(evaluation.get("corridor", {}))
                     ev_category = self._family_category(evaluation.get("recovery_candidate_family", ""))
+                    mpc_before = [float(u_safe[0]), float(u_safe[1])]
+                    selected_acc_before = float(u_safe[0])
+                    selected_acc_after = float(u_safe[0])
+                    selected_steer_before = float(u_safe[1])
+                    selected_steer_after = float(u_safe[1])
+                    selected_throttle = max(0.0, selected_acc_before / max(self.config.max_acc, 1e-6))
+                    selected_brake = max(0.0, -selected_acc_before / max(abs(self.config.min_acc), 1e-6))
                     return u_safe, self._make_mpc_info(
                         state=state,
                         obj=obj,
@@ -1064,6 +1076,9 @@ class RSSMPCFilter(RSSCBFFilter):
                                 "mpc_called": True,
                                 "mpc_call_reason": "deadlock_risk",
                                 **_diagnostics_block(),
+                                "candidate_family": evaluation.get("recovery_candidate_family", ""),
+                                "selected_candidate_family": evaluation.get("recovery_candidate_family", ""),
+                                "best_candidate_family": evaluation.get("recovery_candidate_family", ""),
                                 "terminal_recoverable": evaluation["terminal_recoverable"],
                                 "terminal_recovery_reason": evaluation["terminal_recovery_reason"],
                                 "recovery_progress": evaluation["recovery_progress"],
@@ -1111,6 +1126,16 @@ class RSSMPCFilter(RSSCBFFilter):
                                 "lateral_escape_low_speed_creep": evaluation.get("lateral_escape_low_speed_creep", False),
                                 "lateral_escape_no_immediate_collision_risk": evaluation.get("lateral_escape_no_immediate_collision_risk", False),
                                 "lateral_escape_steer_toward_escape": evaluation.get("lateral_escape_steer_toward_escape", False),
+                                "mpc_action_before_guard": mpc_before,
+                                "action_after_guard": [float(u_safe[0]), float(u_safe[1])],
+                                "selected_acc_before_guard": selected_acc_before,
+                                "selected_acc_after_guard": selected_acc_after,
+                                "selected_steer_before_guard": selected_steer_before,
+                                "selected_steer_after_guard": selected_steer_after,
+                                "selected_throttle_before_guard": selected_throttle,
+                                "selected_throttle_after_guard": selected_throttle,
+                                "selected_brake_before_guard": selected_brake,
+                                "selected_brake_after_guard": selected_brake,
                                 "initial_lateral_rss_margin": evaluation.get("initial_lateral_rss_margin", math.nan),
                                 "final_lateral_rss_margin": evaluation.get("final_lateral_rss_margin", math.nan),
                                 "lateral_rss_improvement": evaluation.get("lateral_rss_improvement", 0.0),
@@ -1139,8 +1164,10 @@ class RSSMPCFilter(RSSCBFFilter):
             if feasible_count == 0 and terminal_feasible_count > 0:
                 failure_reason = "fallback_to_minimum_risk_stop"
 
+        brake_selected_despite_lateral_escape_available = False
         if deadlock_info["deadlock_risk"] and minimum_risk_stop_used:
             lateral_terminal = family_stats["left"]["terminal_recoverable"] or family_stats["right"]["terminal_recoverable"]
+            brake_selected_despite_lateral_escape_available = bool(lateral_terminal)
             if lateral_terminal:
                 self._consecutive_brake_counter += 1
                 print("[RSS-MPC-DEADLOCK] lateral escape feasible but brake selected "
@@ -1188,6 +1215,8 @@ class RSSMPCFilter(RSSCBFFilter):
                     "minimum_risk_stop_used": minimum_risk_stop_used,
                     "mpc_terminal_feasible": terminal_feasible_count,
                     "mpc_guard_rejected": guard_rejected_count,
+                    "brake_selected_reason": "brake_selected_despite_lateral_escape_available" if brake_selected_despite_lateral_escape_available else "",
+                    "brake_selected_despite_lateral_escape_available": brake_selected_despite_lateral_escape_available,
                     "lateral_creep_failure_reason": lateral_failure_reason,
                     **_diagnostics_block(),
                 },
@@ -2487,12 +2516,12 @@ class RSSMPCFilter(RSSCBFFilter):
             lateral_category = self._family_category(str(evaluation.get("recovery_candidate_family", "")))
             if guard_fallback:
                 guard_reject_reason = (
-                    "{}_escape_guard_rejected".format(lateral_category)
+                    "lateral_escape_guard_suppressed_throttle"
                     if lateral_category in ("left", "right")
                     else "cbf_fallback_no_safe_candidate"
                 )
             elif lateral_category in ("left", "right"):
-                guard_reject_reason = "{}_escape_guard_rejected".format(lateral_category)
+                guard_reject_reason = "lateral_escape_guard_suppressed_throttle"
             else:
                 guard_reject_reason = "first_step_recovery_rejected_after_cbf_guard"
 
@@ -3066,7 +3095,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 return True, "left_escape_deconflicted"
             return True, "front_object_deconflicted"
 
-        if is_lateral_escape and road_boundary_safe and terminal_lateral_separation_safe:
+        if is_lateral_escape and road_boundary_safe and terminal_lateral_separation_safe and critical_longitudinal_margin_safe:
             if lateral_margin_improved and predicted_path_overlap_reducing:
                 if escape_side == "right":
                     return True, "right_escape_deconflicted"
@@ -3099,7 +3128,7 @@ class RSSMPCFilter(RSSCBFFilter):
         if terminal_deconflicted and not final_path_overlap:
             return True, "front_object_deconflicted"
 
-        if is_lateral_escape and terminal_deconflicted:
+        if is_lateral_escape and terminal_deconflicted and road_boundary_safe and critical_longitudinal_margin_safe:
             if final_lateral_rss_margin >= self.mpc_config.lateral_rss_terminal_safe_threshold:
                 if escape_side == "right":
                     return True, "right_escape_deconflicted"
@@ -3423,6 +3452,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 "certified_lateral_creep_side": "",
                 "certified_lateral_creep_reason": "",
                 "brake_selected_despite_certified_creep": False,
+                "brake_selected_despite_lateral_escape_available": False,
                 "lateral_escape_throttle_suppressed": False,
                 "creep_suppression_reason": "",
                 "selected_acc_before_guard": math.nan,

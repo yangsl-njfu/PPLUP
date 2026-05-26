@@ -302,6 +302,7 @@ def make_rss_cbf_step_record(
         certified_lateral_creep_side=rss_info.get("certified_lateral_creep_side", ""),
         certified_lateral_creep_reason=rss_info.get("certified_lateral_creep_reason", ""),
         brake_selected_despite_certified_creep=rss_info.get("brake_selected_despite_certified_creep", False),
+        brake_selected_despite_lateral_escape_available=rss_info.get("brake_selected_despite_lateral_escape_available", False),
         lateral_escape_throttle_suppressed=rss_info.get("lateral_escape_throttle_suppressed", False),
         creep_suppression_reason=rss_info.get("creep_suppression_reason", ""),
         selected_acc_before_guard=rss_info.get("selected_acc_before_guard", np.nan),
