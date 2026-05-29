@@ -3028,8 +3028,11 @@ class RSSMPCFilter(RSSCBFFilter):
         current_speed = self._ego_speed(state)
         if current_speed > self.mpc_config.stuck_speed_threshold * 3:
             return False, "", ""
-        candidate_side = self._family_category(str(evaluation.get("recovery_candidate_family", "")))
+        family = str(evaluation.get("recovery_candidate_family", ""))
+        candidate_side = self._family_category(family)
         if candidate_side not in ("left", "right"):
+            return False, "", ""
+        if family not in {"left_then_straight_escape", "right_then_straight_escape"}:
             return False, "", ""
         if not bool(evaluation.get("lateral_escape_certified", False)):
             return False, "", ""
@@ -3062,11 +3065,14 @@ class RSSMPCFilter(RSSCBFFilter):
         if acc > self.mpc_config.lateral_escape_max_acc + self.config.small_tolerance:
             return False, "", ""
         steer_threshold = self.mpc_config.nudge_steer * self.mpc_config.nudge_steer_ratio_threshold
-        if abs(float(u_mpc[1])) < steer_threshold:
+        steer_value = float(u_mpc[1])
+        if abs(steer_value) < steer_threshold:
             return False, "", ""
-        if candidate_side == "right" and float(u_mpc[1]) >= -self.config.small_tolerance:
+        if abs(steer_value) > self.mpc_config.nudge_steer + self.config.small_tolerance:
             return False, "", ""
-        if candidate_side == "left" and float(u_mpc[1]) <= self.config.small_tolerance:
+        if candidate_side == "right" and steer_value >= -self.config.small_tolerance:
+            return False, "", ""
+        if candidate_side == "left" and steer_value <= self.config.small_tolerance:
             return False, "", ""
 
         reason = "certified_{}_lateral_creep".format(candidate_side)
