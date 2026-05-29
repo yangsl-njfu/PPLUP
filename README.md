@@ -132,6 +132,8 @@ small positive throttle + escape-side steering
 
 RSS-MPC 能检测 deadlock，也能生成左右 lateral escape；但 lateral escape 认证逻辑过于依赖前向 critical longitudinal margin。当 static blocking object 距离略小于 RSS 静态安全距离时，系统不允许低速小正加速度横向绕行，导致所有 escape 候选在进入 final guard 前被拒，最终退回 RSS-CBF 的 steer + brake/zero throttle。
 
+简单把 MPC 接在 CBF 后面并不能真正解决死锁，因为 CBF 的一步纵向安全判据会覆盖 MPC 的多步横向恢复证据。
+
 核心链路是：
 
 ```text
@@ -231,4 +233,3 @@ small positive acc/throttle + escape-side steering
 - terminal not recoverable
 - first step rejected
 - final guard rejected
-
