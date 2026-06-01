@@ -1,0 +1,2 @@
+,episode_length,velocity_step_mean,success,episode_reward,episode_cost,crash,crash_vehicle,out_of_road,route_completion,episode,ckpt_index,env_id,num_ep_in_one_env,method
+0,333,6.879890479779228,False,237.35485023859587,1.0,False,False,True,0.6734403972999272,1,6000,1009,1,ppl_rss_mpc

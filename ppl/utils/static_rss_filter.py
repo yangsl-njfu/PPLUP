@@ -767,8 +767,10 @@ class StaticRSSFilter:
         ego = self._metadrive_vehicle_to_dict(vehicle, default_speed=0.0)
         ego["lane_width"] = self._metadrive_current_lane_width(vehicle)
         ego["lane_id"] = self._metadrive_lane_id(vehicle)
+        ego.update(self._metadrive_lane_boundary_info(vehicle))
 
         lanes = self._metadrive_lanes(vehicle)
+        route_corridors = self._metadrive_route_corridors(vehicle)
         objects = self._collect_metadrive_objects(raw_env)
         static_obstacles = []
         vehicles = []
@@ -809,6 +811,7 @@ class StaticRSSFilter:
             "static_obstacles": static_obstacles,
             "vehicles": vehicles,
             "lanes": lanes,
+            "route_corridors": route_corridors,
             "adapter_debug": {
                 "parse_ok": True,
                 "raw_object_count": len(objects),
@@ -1513,6 +1516,10 @@ class StaticRSSFilter:
         speed = self._resolve_attr(vehicle, "speed", default_speed)
         length = self._resolve_attr(vehicle, "LENGTH", self.config.vehicle_length)
         width = self._resolve_attr(vehicle, "WIDTH", self.config.vehicle_width)
+        def _bool_attr(name: str, default: bool = False) -> bool:
+            value = self._resolve_attr(vehicle, name, default)
+            return bool(default if value is None else value)
+
         return {
             "x": float(x),
             "y": float(y),
@@ -1521,6 +1528,14 @@ class StaticRSSFilter:
             "length": self._safe_float(length, self.config.vehicle_length),
             "width": self._safe_float(width, self.config.vehicle_width),
             "lane_id": self._metadrive_lane_id(vehicle),
+            "dist_to_left_side": self._safe_float(self._resolve_attr(vehicle, "dist_to_left_side", math.nan), math.nan),
+            "dist_to_right_side": self._safe_float(self._resolve_attr(vehicle, "dist_to_right_side", math.nan), math.nan),
+            "on_lane": _bool_attr("on_lane", True),
+            "out_of_route": _bool_attr("out_of_route", False),
+            "crash_sidewalk": _bool_attr("crash_sidewalk", False),
+            "on_yellow_continuous_line": _bool_attr("on_yellow_continuous_line", False),
+            "on_white_continuous_line": _bool_attr("on_white_continuous_line", False),
+            "on_broken_line": _bool_attr("on_broken_line", False),
         }
 
     def _metadrive_object_to_dict(self, obj: Any, default_speed: float = 0.0) -> Dict[str, Any]:
@@ -1629,6 +1644,44 @@ class StaticRSSFilter:
                     pass
         return self._resolve_attr(vehicle, "lane", None)
 
+    def _metadrive_lane_boundary_info(self, vehicle: Any) -> Dict[str, Any]:
+        lane = self._metadrive_current_lane(vehicle)
+
+        def _enum_name(value: Any) -> str:
+            if value is None:
+                return ""
+            name = getattr(value, "name", None)
+            if name is not None:
+                return str(name)
+            return str(value)
+
+        def _item(values: Any, index: int) -> Any:
+            if values is None:
+                return None
+            try:
+                return values[index]
+            except Exception:
+                return None
+
+        def _prohibited(line_type_name: str) -> bool:
+            upper = line_type_name.upper()
+            return "SOLID" in upper or "CONTINUOUS" in upper or "SIDE" in upper or "GUARDRAIL" in upper
+
+        line_types = self._resolve_attr(lane, "line_types", None) if lane is not None else None
+        line_colors = self._resolve_attr(lane, "line_colors", None) if lane is not None else None
+        left_type = _enum_name(_item(line_types, 0))
+        right_type = _enum_name(_item(line_types, 1))
+        left_color = _enum_name(_item(line_colors, 0))
+        right_color = _enum_name(_item(line_colors, 1))
+        return {
+            "left_lane_line_type": left_type,
+            "right_lane_line_type": right_type,
+            "left_lane_line_color": left_color,
+            "right_lane_line_color": right_color,
+            "left_lane_line_prohibited": _prohibited(left_type),
+            "right_lane_line_prohibited": _prohibited(right_type),
+        }
+
     def _metadrive_lanes(self, vehicle: Any) -> Dict[str, Dict[str, Any]]:
         current_lane = self._metadrive_current_lane(vehicle)
         current_width = self._metadrive_current_lane_width(vehicle)
@@ -1665,6 +1718,70 @@ class StaticRSSFilter:
                 "drivable": True,
             }
         return lanes
+
+    def _metadrive_route_corridors(self, vehicle: Any) -> List[Dict[str, Any]]:
+        navigation = self._resolve_attr(vehicle, "navigation", None)
+        if navigation is None:
+            return []
+
+        corridors: List[Dict[str, Any]] = []
+
+        def add_group(source: str, lanes: Any) -> None:
+            if not lanes:
+                return
+            try:
+                lanes_list = list(lanes)
+            except Exception:
+                return
+            if not lanes_list:
+                return
+
+            ref_lane = lanes_list[0]
+            lane_width = self._safe_float(self._resolve_attr(ref_lane, "width", self.config.default_lane_width), self.config.default_lane_width)
+            length = self._safe_float(self._resolve_attr(ref_lane, "length", 0.0), 0.0)
+            if length <= self.config.small_tolerance:
+                return
+
+            reference_vehicle_longitudinal = math.nan
+            reference_vehicle_lateral = math.nan
+            vehicle_position = self._resolve_attr(vehicle, "position", None)
+            if vehicle_position is not None:
+                try:
+                    lon, lat = ref_lane.local_coordinates(vehicle_position)
+                    reference_vehicle_longitudinal = float(lon)
+                    reference_vehicle_lateral = float(lat)
+                except Exception:
+                    pass
+
+            total_width = 0.0
+            for lane in lanes_list:
+                total_width += self._safe_float(self._resolve_attr(lane, "width", lane_width), lane_width)
+            total_width = max(lane_width, total_width)
+
+            sample_count = max(2, min(80, int(math.ceil(length / 2.0)) + 1))
+            points: List[List[float]] = []
+            for s in np.linspace(0.0, length, sample_count):
+                try:
+                    point = ref_lane.position(float(s), 0.0)
+                    points.append([float(point[0]), float(point[1])])
+                except Exception:
+                    return
+            corridors.append(
+                {
+                    "source": source,
+                    "points": points,
+                    "reference_lane_width": float(lane_width),
+                    "total_width": float(total_width),
+                    "length": float(length),
+                    "lane_count": len(lanes_list),
+                    "reference_vehicle_longitudinal": reference_vehicle_longitudinal,
+                    "reference_vehicle_lateral": reference_vehicle_lateral,
+                }
+            )
+
+        add_group("current_ref_lanes", self._resolve_attr(navigation, "current_ref_lanes", None))
+        add_group("next_ref_lanes", self._resolve_attr(navigation, "next_ref_lanes", None))
+        return corridors
 
     def _metadrive_side_lane(self, vehicle: Any, lane_offset: int) -> Optional[Any]:
         current_lane = self._metadrive_current_lane(vehicle)

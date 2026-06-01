@@ -3,7 +3,8 @@
 The public runtime path keeps PPL as the nominal policy and runs a cooperative
 RSS-MPC / RSS-CBF assurance layer:
 
-    u_nom -> CBF safety reference -> RSS-MPC planner -> CBF shield -> u_safe
+    normal unsafe: u_nom -> RSS-CBF -> u_safe
+    deadlock risk: u_nom -> predictive RSS-CBF-MPC -> emergency guard -> u_safe
 
 This first version uses sampling-based random shooting instead of a nonlinear
 optimizer. The rollout model is the same lightweight point-mass / heading-rate
@@ -137,6 +138,46 @@ class RSSMPCConfig(RSSCBFConfig):
     lateral_escape_min_acc: float = 0.05
     lateral_escape_min_lateral_margin_improvement: float = 0.05
     lateral_escape_min_overlap_reduction: float = 0.05
+    predictive_longitudinal_slack_weight: float = 1200.0
+    predictive_cbf_slack_weight: float = 800.0
+    predictive_immediate_collision_clearance: float = 0.1
+    predictive_catastrophic_lateral_margin: float = -2.0
+    road_boundary_prediction_horizon_steps: int = 12
+    road_boundary_trigger_margin: float = 0.35
+    road_boundary_trigger_speed_gain: float = 0.3
+    road_boundary_trigger_max_margin: float = 4.0
+    road_boundary_hard_margin: float = 0.15
+    road_boundary_recovery_target_margin: float = 0.8
+    road_boundary_low_speed_threshold: float = 1.0
+    road_boundary_low_speed_target_speed: float = 1.5
+    road_boundary_low_speed_target_progress: float = 0.5
+    road_boundary_away_recovery_speed: float = 4.0
+    road_boundary_mpc_max_candidates: int = 44
+    road_boundary_high_speed_threshold: float = 8.0
+    road_boundary_high_speed_steer_limit: float = 0.35
+    road_boundary_high_speed_steer_speed_product_limit: float = 5.0
+    road_boundary_high_speed_brake_threshold: float = 6.0
+    road_boundary_high_speed_max_acc: float = -0.5
+    road_boundary_high_speed_margin_gain: float = 0.4
+    road_boundary_high_speed_margin_max: float = 4.0
+    road_boundary_moderate_speed_threshold: float = 6.0
+    road_boundary_moderate_speed_trigger_margin: float = 2.4
+    road_boundary_toward_steer_tolerance: float = 0.0
+    road_boundary_away_steer_margin: float = 0.8
+    road_boundary_away_steer_min: float = 0.05
+    road_boundary_away_steer_side_distance: float = 0.0
+    road_boundary_use_route_endpoint_margin: bool = False
+    road_boundary_recovery_hold_steps: int = 3
+    road_boundary_recovery_release_speed: float = 5.5
+    road_boundary_recovery_release_margin: float = 0.4
+    brake_only_recovery_speed_threshold: float = 0.0
+    brake_only_recovery_max_speed: float = 4.0
+    brake_only_recovery_acc_threshold: float = 0.1
+    brake_only_recovery_nominal_acc_threshold: float = -0.2
+    w_road_boundary_projection: float = 2500.0
+    w_road_boundary_recovery: float = 120.0
+    w_road_boundary_deceleration: float = 1.5
+    w_road_boundary_stall: float = 80.0
 
 
 class RSSMPCFilter(RSSCBFFilter):
@@ -170,6 +211,7 @@ class RSSMPCFilter(RSSCBFFilter):
         self.recovery_corridor_ttl = 0
         self.recovery_side_switch_cooldown = 0
         self._consecutive_brake_counter = 0
+        self._road_boundary_recovery_ttl = 0
 
     def reset(self) -> None:
         """Clear rolling deadlock state at episode reset."""
@@ -185,6 +227,7 @@ class RSSMPCFilter(RSSCBFFilter):
         self.recovery_corridor_ttl = 0
         self.recovery_side_switch_cooldown = 0
         self._consecutive_brake_counter = 0
+        self._road_boundary_recovery_ttl = 0
 
     def update_after_step(self, env_info: Optional[Dict[str, Any]]) -> None:
         """Optionally attach post-step route progress to the newest history sample."""
@@ -211,6 +254,43 @@ class RSSMPCFilter(RSSCBFFilter):
         cbf_safe = self._clip_action(cbf_safe)
         front = self._select_front_rss_object(state)
         deadlock_info = self._update_deadlock_detector(state, u_original, cbf_safe, cbf_info, front)
+        self._apply_road_boundary_recovery_hold(state, deadlock_info)
+
+        if (
+            deadlock_info.get("road_boundary_projected_risk", False)
+            and not deadlock_info.get("deadlock_risk", False)
+            and front is None
+        ):
+            u_boundary, boundary_info = self._run_road_boundary_predictive_mpc(state, u_original, cbf_safe)
+            return u_boundary, self._make_mpc_info(
+                state=state,
+                obj=None,
+                object_kind="none",
+                mode="rss_mpc_recovery" if boundary_info.get("mpc_success", False) else "minimum_risk_stop",
+                reason="road_boundary_projected_risk_mpc",
+                u_original=u_original,
+                u_safe=u_boundary,
+                d_front=math.inf,
+                d_rss=0.0,
+                rss_margin_current=math.inf,
+                dynamic_vehicle_detected=False,
+                obstacle_detected=False,
+                mpc_success=bool(boundary_info.get("mpc_success", False)),
+                mpc_num_candidates=int(boundary_info.get("mpc_num_candidates", 0)),
+                mpc_num_feasible=int(boundary_info.get("mpc_num_feasible", 0)),
+                mpc_best_cost=float(boundary_info.get("mpc_best_cost", math.nan)),
+                rss_margin_min_pred=math.inf,
+                rss_margin_final_pred=math.inf,
+                rss_lateral_clearance_min_pred=math.inf,
+                rss_lateral_clearance_final_pred=math.inf,
+                predicted_progress=float(boundary_info.get("predicted_progress", math.nan)),
+                fallback_used=not bool(boundary_info.get("mpc_success", False)),
+                cbf_info=cbf_info,
+                cbf_reference_info=cbf_info,
+                cbf_guard_used=False,
+                cbf_guard_delta=0.0,
+                extra_info=self._merge_recovery_info(deadlock_info, boundary_info),
+            )
 
         if front is None:
             return u_original, self._make_mpc_info(
@@ -225,8 +305,8 @@ class RSSMPCFilter(RSSCBFFilter):
                 d_rss=0.0,
                 rss_margin_current=math.inf,
                 dynamic_vehicle_detected=False,
-                obstacle_detected=False,
-                mpc_success=False,
+        obstacle_detected=False,
+        mpc_success=False,
                 mpc_num_candidates=0,
                 mpc_num_feasible=0,
                 mpc_best_cost=math.nan,
@@ -241,7 +321,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 cbf_guard_used=False,
                 cbf_guard_delta=0.0,
                 extra_info=deadlock_info,
-            )
+        )
 
         object_kind, obj, d_front, d_rss, current_margin, dynamic_detected, static_detected = front
         rl_is_rss_safe = self._cbf_indicates_nominal_safe(cbf_info, u_original, cbf_safe)
@@ -279,6 +359,28 @@ class RSSMPCFilter(RSSCBFFilter):
                 cbf_guard_used=False,
                 cbf_guard_delta=0.0,
                 extra_info=deadlock_info,
+            )
+
+        brake_only_risk = self._brake_only_recovery_risk(
+            state=state,
+            obj=obj,
+            current_margin=current_margin,
+            cbf_info=cbf_info,
+            u_original=u_original,
+            u_cbf=cbf_safe,
+        )
+        if brake_only_risk:
+            conditions = str(deadlock_info.get("mpc_trigger_conditions", ""))
+            if "brake_only_risk" not in conditions:
+                conditions = ";".join([part for part in (conditions, "brake_only_risk") if part])
+            deadlock_info.update(
+                {
+                    "brake_only_risk": True,
+                    "deadlock_risk": True,
+                    "deadlock_reason": "brake_only_risk",
+                    "mpc_call_reason_override": "brake_only_risk",
+                    "mpc_trigger_conditions": conditions,
+                }
             )
 
         if not deadlock_info["deadlock_risk"]:
@@ -401,7 +503,6 @@ class RSSMPCFilter(RSSCBFFilter):
         no_terminal_recoverable_count = 0
         guard_rejected_count = 0
         terminal_feasible_candidates: List[Dict[str, Any]] = []
-        guard_rejected_candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
 
         def _family_stats_entry() -> Dict[str, Any]:
             return {
@@ -433,10 +534,12 @@ class RSSMPCFilter(RSSCBFFilter):
         }
 
         def _set_family_reject_reason(category: str, reason: str) -> None:
-            if category in family_stats and not family_stats[category]["reject_reason"]:
+            if (
+                category in family_stats
+                and not family_stats[category]["certified"]
+                and not family_stats[category]["reject_reason"]
+            ):
                 family_stats[category]["reject_reason"] = reason
-
-        conservative_gate_warning_printed = False
 
         for idx, sequence in enumerate(candidates):
             corridor = self._last_candidate_corridors[idx] if idx < len(self._last_candidate_corridors) else {}
@@ -477,16 +580,15 @@ class RSSMPCFilter(RSSCBFFilter):
                 evaluation.setdefault("lateral_escape_certified", False)
                 evaluation.setdefault("lateral_escape_used_relaxed_longitudinal_gate", False)
                 evaluation.setdefault("longitudinal_constraint_relaxed_by_lateral_escape", False)
+            evaluation.update(self._evaluate_predictive_recovery_candidate(state, obj, object_kind, evaluation))
 
             is_lateral_escape = bool(evaluation.get("is_lateral_escape", category in ("left", "right")))
-            lateral_certified_gate = bool(evaluation.get("lateral_certified_gate", evaluation.get("lateral_escape_certified", False)))
             lateral_escape_certified = bool(evaluation.get("lateral_escape_certified", False))
             conservative_safe = bool(evaluation.get("conservative_longitudinal_margin_safe", False))
-            critical_safe = bool(evaluation.get("critical_longitudinal_margin_safe", False))
-            if is_lateral_escape:
-                longitudinal_gate_passed = bool(critical_safe and (rss_feasible or lateral_certified_gate))
-            else:
-                longitudinal_gate_passed = bool(rss_feasible and conservative_safe)
+            rss_gate_passed = bool(rss_feasible and conservative_safe)
+            if not rss_gate_passed:
+                no_rss_feasible_count += 1
+            predictive_reject_reason = str(evaluation.get("predictive_reject_reason", ""))
             if evaluation["cost"] < family_stats[category]["best_cost"]:
                 family_stats[category]["best_cost"] = evaluation["cost"]
             if evaluation.get("road_boundary_safe", False):
@@ -513,14 +615,22 @@ class RSSMPCFilter(RSSCBFFilter):
                 family_stats[category]["rejected_by_conservative_gate"] = True
             if evaluation.get("lateral_escape_certified", False):
                 family_stats[category]["certified"] = True
+                family_stats[category]["reject_reason"] = ""
             if evaluation.get("terminal_recoverable", False):
                 family_stats[category]["terminal_recoverable"] = True
                 if not family_stats[category]["terminal_reason"]:
                     family_stats[category]["terminal_reason"] = str(evaluation.get("terminal_recovery_reason", ""))
             if is_lateral_escape:
-                if evaluation.get("road_boundary_safe", False) and terminal_lateral_safe:
+                if (
+                    evaluation.get("road_boundary_safe", False)
+                    and (
+                        terminal_lateral_safe
+                        or evaluation.get("lateral_escape_certified", False)
+                        or evaluation.get("certified_lateral_recovery", False)
+                    )
+                ):
                     family_stats[category]["escape_available"] = True
-                reject_reason = str(evaluation.get("lateral_escape_reject_reason", ""))
+                reject_reason = predictive_reject_reason or str(evaluation.get("lateral_escape_reject_reason", ""))
                 if lateral_escape_certified:
                     pass
                 elif reject_reason:
@@ -530,32 +640,41 @@ class RSSMPCFilter(RSSCBFFilter):
                 elif not evaluation["terminal_recoverable"]:
                     _set_family_reject_reason(category, "lateral_escape_terminal_not_recoverable")
 
-            if not longitudinal_gate_passed:
-                no_rss_feasible_count += 1
-            if (is_lateral_escape
-                    and not bool(evaluation.get("conservative_longitudinal_margin_safe", False))
-                    and bool(evaluation.get("critical_longitudinal_margin_safe", False))
-                    and bool(evaluation.get("road_boundary_safe", False))
-                    and bool(evaluation.get("lateral_certified_gate", False))):
-                evaluation["lateral_escape_used_relaxed_longitudinal_gate"] = True
-                family_stats[category]["relaxed_longitudinal_gate_used"] = True
-                if not longitudinal_gate_passed:
-                    evaluation["lateral_escape_rejected_by_conservative_gate"] = True
-                    family_stats[category]["rejected_by_conservative_gate"] = True
-                    _set_family_reject_reason(category, "lateral_escape_rejected_by_conservative_gate")
-                    if not conservative_gate_warning_printed:
-                        print("[RSS-MPC-DEADLOCK] lateral escape rejected only by conservative longitudinal gate")
-                        conservative_gate_warning_printed = True
-            if not longitudinal_gate_passed:
+            if not bool(evaluation.get("predictive_action_bounds_safe", True)):
+                first_step_rejected_count += 1
+                _set_family_reject_reason(category, predictive_reject_reason or "action_out_of_bounds")
+                continue
+            if not bool(evaluation.get("predictive_no_immediate_collision", False)):
+                first_step_rejected_count += 1
+                _set_family_reject_reason(category, predictive_reject_reason or "immediate_collision_risk")
                 continue
             if not evaluation.get("road_boundary_safe", False):
                 no_road_safe_count += 1
+                _set_family_reject_reason(category, predictive_reject_reason or "road_boundary_violation")
+                continue
+            if bool(evaluation.get("predictive_catastrophic_side_conflict", False)):
+                first_step_rejected_count += 1
+                _set_family_reject_reason(category, predictive_reject_reason or "catastrophic_lateral_rss_violation")
+                continue
+            if not bool(evaluation.get("hard_safe", False)):
+                first_step_rejected_count += 1
+                _set_family_reject_reason(category, predictive_reject_reason or "no_recovery_certified_candidate")
+                continue
+            if category in ("left", "right") and str(predictive_reject_reason) == "lateral_escape_acc_too_aggressive":
+                first_step_rejected_count += 1
+                _set_family_reject_reason(category, predictive_reject_reason)
                 continue
             if not evaluation.get("first_step_recovery_feasible", True):
                 first_step_rejected_count += 1
+                _set_family_reject_reason(category, predictive_reject_reason or "first_step_recovery_rejected")
                 continue
-            if not evaluation["terminal_recoverable"]:
+            if not bool(evaluation.get("predictive_terminal_recoverable", evaluation["terminal_recoverable"])):
                 no_terminal_recoverable_count += 1
+                _set_family_reject_reason(category, predictive_reject_reason or "terminal_not_recoverable")
+                continue
+            if not bool(evaluation.get("predictive_candidate_certified", False)):
+                first_step_rejected_count += 1
+                _set_family_reject_reason(category, predictive_reject_reason or "no_recovery_certified_candidate")
                 continue
             terminal_feasible_count += 1
             terminal_feasible_candidates.append(evaluation)
@@ -564,14 +683,13 @@ class RSSMPCFilter(RSSCBFFilter):
         guard_passed: List[Dict[str, Any]] = []
         for evaluation in terminal_feasible_candidates:
             category = self._family_category(evaluation["recovery_candidate_family"])
-            guard_eval = self._evaluate_guarded_first_action(state, evaluation)
+            guard_eval = self._evaluate_emergency_guarded_first_action(state, evaluation)
             if not guard_eval["guard_safe"]:
                 guard_rejected_count += 1
-                guard_rejected_candidates.append((evaluation, guard_eval))
                 if not family_stats[category]["guard_rejected"]:
                     family_stats[category]["guard_rejected"] = True
                     if category in ("left", "right"):
-                        family_stats[category]["reject_reason"] = "lateral_escape_guard_suppressed_throttle"
+                        family_stats[category]["reject_reason"] = guard_eval.get("guard_reject_reason", "emergency_guard_rejected")
                     else:
                         family_stats[category]["reject_reason"] = guard_eval.get("guard_reject_reason", "")
                 continue
@@ -627,29 +745,41 @@ class RSSMPCFilter(RSSCBFFilter):
                 if not stats["terminal_recoverable"]:
                     return "lateral_escape_terminal_not_recoverable"
                 if stats["guard_rejected"]:
-                    return "lateral_escape_guard_suppressed_throttle"
+                    return str(stats["reject_reason"] or "emergency_guard_rejected")
             return ""
 
         lateral_failure_reason = _lateral_escape_failure_reason()
 
+        def _canonical_deadlock_failure_reason(reason: str) -> str:
+            reason = str(reason or "")
+            if reason in {"immediate_collision_risk", "lateral_escape_immediate_collision_risk"}:
+                return "immediate_collision_risk"
+            if reason in {"road_boundary_violation", "lateral_escape_not_road_safe", "no_road_boundary_safe_candidate"}:
+                return "road_boundary_violation"
+            if reason in {"catastrophic_lateral_rss_violation"}:
+                return "catastrophic_lateral_rss_violation"
+            if reason in {"action_out_of_bounds", "lateral_escape_acc_too_aggressive"}:
+                return "action_out_of_bounds"
+            if reason in {"emergency_veto"}:
+                return "emergency_veto"
+            return "no_recovery_certified_candidate"
+
         if best is not None:
             failure_reason = ""
         elif not corridor_info.get("drivable_corridor_available", False):
-            failure_reason = "no_corridor_available"
+            failure_reason = "no_recovery_certified_candidate"
         elif lateral_failure_reason:
-            failure_reason = lateral_failure_reason
-        elif no_rss_feasible_count == total_candidates:
-            failure_reason = "no_rss_feasible_candidate"
-        elif no_road_safe_count > 0 and no_rss_feasible_count + no_road_safe_count == total_candidates:
-            failure_reason = "no_road_boundary_safe_candidate"
-        elif first_step_rejected_count > 0 and no_rss_feasible_count + no_road_safe_count + first_step_rejected_count == total_candidates:
-            failure_reason = "first_step_recovery_rejected"
+            failure_reason = _canonical_deadlock_failure_reason(lateral_failure_reason)
+        elif no_road_safe_count == total_candidates:
+            failure_reason = "road_boundary_violation"
+        elif first_step_rejected_count == total_candidates:
+            failure_reason = "no_recovery_certified_candidate"
         elif terminal_feasible_count == 0:
-            failure_reason = "no_terminal_recoverable_candidate"
+            failure_reason = "no_recovery_certified_candidate"
         elif feasible_count == 0:
-            failure_reason = "terminal_candidates_guard_rejected"
+            failure_reason = "emergency_veto"
         else:
-            failure_reason = "horizon_too_short_or_no_progress"
+            failure_reason = "no_recovery_certified_candidate"
 
         def _diagnostics_block() -> Dict[str, Any]:
             any_lateral_guard_rejected = family_stats["left"]["guard_rejected"] or family_stats["right"]["guard_rejected"]
@@ -681,6 +811,33 @@ class RSSMPCFilter(RSSCBFFilter):
                 "first_steer": selected_diag.get("first_steer", math.nan),
                 "rss_feasible": bool(selected_diag.get("rss_feasible", False)),
                 "lateral_certified_gate": bool(selected_diag.get("lateral_certified_gate", False)),
+                "predictive_filter_used": True,
+                "hard_safe": bool(selected_diag.get("hard_safe", False)),
+                "soft_longitudinal_slack": selected_diag.get("soft_longitudinal_slack", math.nan),
+                "recovery_certified": bool(selected_diag.get("recovery_certified", False)),
+                "emergency_veto": bool(selected_diag.get("emergency_veto", False)),
+                "total_cost": selected_diag.get("total_cost", selected_diag.get("cost", math.nan)),
+                "predictive_candidate_certified": bool(selected_diag.get("predictive_candidate_certified", False)),
+                "certified_lateral_recovery": bool(selected_diag.get("certified_lateral_recovery", False)),
+                "predictive_reject_reason": selected_diag.get("predictive_reject_reason", lateral_failure_reason),
+                "predictive_hard_safe": bool(selected_diag.get("predictive_hard_safe", selected_diag.get("hard_safe", False))),
+                "predictive_total_cost": selected_diag.get("predictive_total_cost", selected_diag.get("total_cost", selected_diag.get("cost", math.nan))),
+                "predictive_action_bounds_safe": bool(selected_diag.get("predictive_action_bounds_safe", False)),
+                "predictive_no_immediate_collision": bool(selected_diag.get("predictive_no_immediate_collision", False)),
+                "predictive_road_boundary_safe": bool(selected_diag.get("predictive_road_boundary_safe", False)),
+                "predictive_lateral_hard_safe": bool(selected_diag.get("predictive_lateral_hard_safe", False)),
+                "predictive_lateral_rss_safe_or_improving": bool(selected_diag.get("predictive_lateral_rss_safe_or_improving", False)),
+                "predictive_catastrophic_side_conflict": bool(selected_diag.get("predictive_catastrophic_side_conflict", False)),
+                "predictive_terminal_recoverable": bool(selected_diag.get("predictive_terminal_recoverable", False)),
+                "predictive_terminal_recovery_reason": selected_diag.get("predictive_terminal_recovery_reason", ""),
+                "predictive_longitudinal_soft_slack": selected_diag.get("predictive_longitudinal_soft_slack", math.nan),
+                "predictive_one_step_cbf_slack": selected_diag.get("predictive_one_step_cbf_slack", math.nan),
+                "predictive_soft_longitudinal_slack": selected_diag.get("predictive_soft_longitudinal_slack", selected_diag.get("soft_longitudinal_slack", math.nan)),
+                "predictive_longitudinal_slack_penalty": selected_diag.get("predictive_longitudinal_slack_penalty", math.nan),
+                "predictive_current_front_gap": selected_diag.get("predictive_current_front_gap", math.nan),
+                "predictive_first_step_front_gap": selected_diag.get("predictive_first_step_front_gap", math.nan),
+                "emergency_guard_used": bool(selected_diag.get("emergency_guard_used", False)),
+                "emergency_guard_reject_reason": selected_diag.get("emergency_guard_reject_reason", ""),
                 "num_candidates_brake": family_stats["brake"]["count"],
                 "num_candidates_creep": family_stats["creep"]["count"],
                 "num_candidates_left": family_stats["left"]["count"],
@@ -889,7 +1046,7 @@ class RSSMPCFilter(RSSCBFFilter):
                     deadlock_info,
                     {
                         "mpc_called": True,
-                        "mpc_call_reason": "deadlock_risk",
+                        "mpc_call_reason": deadlock_info.get("mpc_call_reason_override", "deadlock_risk"),
                         **_diagnostics_block(),
                         "terminal_recoverable": best["terminal_recoverable"],
                         "terminal_recovery_reason": best["terminal_recovery_reason"],
@@ -974,206 +1131,20 @@ class RSSMPCFilter(RSSCBFFilter):
                 ),
             )
 
-        held_recovery = self._take_held_recovery_action(current_margin)
-        if held_recovery is not None and cbf_info.get("mode") == "fallback_no_safe_candidate":
-            return held_recovery, self._make_mpc_info(
-                state=state,
-                obj=obj,
-                object_kind=object_kind,
-                mode="rss_mpc_recovery",
-                reason="mpc_recovery_hold_large_margin",
-                u_original=u_original,
-                u_safe=held_recovery,
-                d_front=d_front,
-                d_rss=d_rss,
-                rss_margin_current=current_margin,
-                dynamic_vehicle_detected=dynamic_detected,
-                obstacle_detected=static_detected,
-                mpc_success=True,
-                mpc_num_candidates=total_candidates,
-                mpc_num_feasible=0,
-                mpc_best_cost=math.nan,
-                rss_margin_min_pred=math.nan,
-                rss_margin_final_pred=math.nan,
-                rss_lateral_clearance_min_pred=math.nan,
-                rss_lateral_clearance_final_pred=math.nan,
-                predicted_progress=math.nan,
-                fallback_used=False,
-                cbf_info=cbf_info,
-                cbf_reference_info=cbf_info,
-                cbf_guard_used=False,
-                cbf_guard_delta=0.0,
-                extra_info=self._merge_recovery_info(
-                    deadlock_info,
-                    {
-                        "mpc_called": True,
-                        "mpc_call_reason": "deadlock_risk",
-                        "mpc_terminal_feasible": terminal_feasible_count,
-                        "mpc_guard_rejected": guard_rejected_count,
-                        "cbf_guard_override_used": True,
-                        "cbf_guard_override_reason": "held_certified_recovery_action_with_large_rss_margin",
-                        "certified_recovery_override_used": True,
-                        "certified_recovery_override_reason": "held_certified_recovery_action_with_large_rss_margin",
-                        "recovery_hold_used": True,
-                        **_diagnostics_block(),
-                    },
-                ),
-            )
-
-        if (guard_rejected_candidates
-                and math.isfinite(current_margin)
-                and current_margin >= self.mpc_config.guard_override_fallback_margin_buffer):
-            lateral_guard_rejected = [
-                (ev, ge) for ev, ge in guard_rejected_candidates
-                if self._family_category(ev.get("recovery_candidate_family", "")) in ("left", "right")
-            ]
-            override_pool = lateral_guard_rejected if lateral_guard_rejected else guard_rejected_candidates
-            override_pool.sort(key=lambda item: item[0].get("cost", 1e9))
-            for evaluation, guard_eval in override_pool:
-                guard_info = guard_eval.get("guard_info", {})
-                guard_mode = guard_info.get("mode", "")
-                override_used, override_reason = self._guard_override_for_certified_recovery(
-                    state=state,
-                    evaluation=evaluation,
-                    u_mpc=self._clip_action(evaluation["sequence"][0]),
-                    u_guarded=guard_eval.get("u_guarded_first", guard_eval.get("u_mpc_first")),
-                    guard_mode=guard_mode,
-                )
-                if override_used:
-                    u_safe = self._clip_action(evaluation["sequence"][0])
-                    self._remember_recovery_action(u_safe)
-                    corridor_memory_info = self._commit_recovery_corridor(evaluation.get("corridor", {}))
-                    ev_category = self._family_category(evaluation.get("recovery_candidate_family", ""))
-                    mpc_before = [float(u_safe[0]), float(u_safe[1])]
-                    selected_acc_before = float(u_safe[0])
-                    selected_acc_after = float(u_safe[0])
-                    selected_steer_before = float(u_safe[1])
-                    selected_steer_after = float(u_safe[1])
-                    selected_throttle = max(0.0, selected_acc_before / max(self.config.max_acc, 1e-6))
-                    selected_brake = max(0.0, -selected_acc_before / max(abs(self.config.min_acc), 1e-6))
-                    return u_safe, self._make_mpc_info(
-                        state=state,
-                        obj=obj,
-                        object_kind=object_kind,
-                        mode="rss_mpc_recovery",
-                        reason="mpc_recovery_guard_rejected_override" + ("_lateral" if ev_category in ("left", "right") else ""),
-                        u_original=u_original,
-                        u_safe=u_safe,
-                        d_front=d_front,
-                        d_rss=d_rss,
-                        rss_margin_current=current_margin,
-                        dynamic_vehicle_detected=dynamic_detected,
-                        obstacle_detected=static_detected,
-                        mpc_success=True,
-                        mpc_num_candidates=total_candidates,
-                        mpc_num_feasible=1,
-                        mpc_best_cost=evaluation.get("cost", math.nan),
-                        rss_margin_min_pred=evaluation["rss_margin_min_pred"],
-                        rss_margin_final_pred=evaluation["rss_margin_final_pred"],
-                        rss_lateral_clearance_min_pred=evaluation["rss_lateral_clearance_min_pred"],
-                        rss_lateral_clearance_final_pred=evaluation["rss_lateral_clearance_final_pred"],
-                        predicted_progress=evaluation["predicted_progress"],
-                        fallback_used=False,
-                        cbf_info=guard_info,
-                        cbf_reference_info=cbf_info,
-                        cbf_guard_used=False,
-                        cbf_guard_delta=0.0,
-                        extra_info=self._merge_recovery_info(
-                            deadlock_info,
-                            {
-                                "mpc_called": True,
-                                "mpc_call_reason": "deadlock_risk",
-                                **_diagnostics_block(),
-                                "candidate_family": evaluation.get("recovery_candidate_family", ""),
-                                "selected_candidate_family": evaluation.get("recovery_candidate_family", ""),
-                                "best_candidate_family": evaluation.get("recovery_candidate_family", ""),
-                                "terminal_recoverable": evaluation["terminal_recoverable"],
-                                "terminal_recovery_reason": evaluation["terminal_recovery_reason"],
-                                "recovery_progress": evaluation["recovery_progress"],
-                                "recovery_margin_improvement": evaluation["recovery_margin_improvement"],
-                                "blocking_object_final": evaluation["blocking_object_final"],
-                                "mpc_terminal_feasible": terminal_feasible_count,
-                                "mpc_guard_rejected": guard_rejected_count,
-                                "cbf_guard_override_used": True,
-                                "cbf_guard_override_reason": override_reason,
-                                "certified_recovery_override_used": True,
-                                "certified_recovery_override_reason": override_reason,
-                                "guard_reject_reason": guard_eval.get("guard_reject_reason", ""),
-                                "first_step_recovery_reason": evaluation.get("first_step_recovery_reason", ""),
-                                "recovery_candidate_family": evaluation.get("recovery_candidate_family", ""),
-                                "selected_recovery_corridor": evaluation.get("corridor_type", ""),
-                                "active_recovery_corridor": self.active_recovery_corridor,
-                                "previous_recovery_corridor": self.previous_recovery_corridor,
-                                "corridor_target_lateral_offset": evaluation.get("corridor_target_lateral_offset", math.nan),
-                                "corridor_target_speed": evaluation.get("corridor_target_speed", math.nan),
-                                "corridor_cost": evaluation.get("corridor_cost", math.nan),
-                                "corridor_terminal_recoverable": evaluation.get("terminal_recoverable", False),
-                                "first_step_recovery_feasible": evaluation.get("first_step_recovery_feasible", False),
-                                "predicted_lateral_distance": evaluation.get("predicted_lateral_distance", math.nan),
-                                "predicted_lateral_rss_margin": evaluation.get("predicted_lateral_rss_margin", math.nan),
-                                "predicted_path_overlap": evaluation.get("predicted_path_overlap", False),
-                                "predicted_path_overlap_reducing": evaluation.get("predicted_path_overlap_reducing", False),
-                                "terminal_lateral_separation_safe": evaluation.get("terminal_lateral_separation_safe", False),
-                                "terminal_lateral_deconflicted": evaluation.get("terminal_lateral_deconflicted", False),
-                                "road_boundary_safe": evaluation.get("road_boundary_safe", False),
-                                "immediate_longitudinal_margin_safe": evaluation.get("immediate_longitudinal_margin_safe", False),
-                                "conservative_longitudinal_margin_safe": evaluation.get("conservative_longitudinal_margin_safe", False),
-                                "critical_longitudinal_margin_safe": evaluation.get("critical_longitudinal_margin_safe", False),
-                                "is_lateral_escape": evaluation.get("is_lateral_escape", False),
-                                "rss_feasible": evaluation.get("rss_feasible", False),
-                                "lateral_certified_gate": evaluation.get("lateral_certified_gate", False),
-                                "lateral_escape_candidate": evaluation.get("lateral_escape_candidate", False),
-                                "lateral_escape_certified": evaluation.get("lateral_escape_certified", False),
-                                "lateral_escape_certification_reason": evaluation.get("lateral_escape_certification_reason", ""),
-                                "lateral_escape_reject_reason": evaluation.get("lateral_escape_reject_reason", ""),
-                                "lateral_escape_used_relaxed_longitudinal_gate": evaluation.get("lateral_escape_used_relaxed_longitudinal_gate", False),
-                                "lateral_escape_rejected_by_conservative_gate": evaluation.get("lateral_escape_rejected_by_conservative_gate", False),
-                                "lateral_escape_rejected_by_critical_margin": evaluation.get("lateral_escape_rejected_by_critical_margin", False),
-                                "lateral_escape_lateral_rss_safe": evaluation.get("lateral_escape_lateral_rss_safe", False),
-                                "lateral_escape_lateral_margin_improved": evaluation.get("lateral_escape_lateral_margin_improved", False),
-                                "lateral_escape_path_overlap_reduced": evaluation.get("lateral_escape_path_overlap_reduced", False),
-                                "lateral_escape_terminal_recoverable": evaluation.get("lateral_escape_terminal_recoverable", False),
-                                "lateral_escape_terminal_reason": evaluation.get("lateral_escape_terminal_reason", ""),
-                                "lateral_escape_low_speed_creep": evaluation.get("lateral_escape_low_speed_creep", False),
-                                "lateral_escape_no_immediate_collision_risk": evaluation.get("lateral_escape_no_immediate_collision_risk", False),
-                                "lateral_escape_steer_toward_escape": evaluation.get("lateral_escape_steer_toward_escape", False),
-                                "mpc_action_before_guard": mpc_before,
-                                "action_after_guard": [float(u_safe[0]), float(u_safe[1])],
-                                "selected_acc_before_guard": selected_acc_before,
-                                "selected_acc_after_guard": selected_acc_after,
-                                "selected_steer_before_guard": selected_steer_before,
-                                "selected_steer_after_guard": selected_steer_after,
-                                "selected_throttle_before_guard": selected_throttle,
-                                "selected_throttle_after_guard": selected_throttle,
-                                "selected_brake_before_guard": selected_brake,
-                                "selected_brake_after_guard": selected_brake,
-                                "initial_lateral_rss_margin": evaluation.get("initial_lateral_rss_margin", math.nan),
-                                "final_lateral_rss_margin": evaluation.get("final_lateral_rss_margin", math.nan),
-                                "lateral_rss_improvement": evaluation.get("lateral_rss_improvement", 0.0),
-                                "path_overlap_reduced": evaluation.get("path_overlap_reduced", False),
-                                "terminal_deconflicted": evaluation.get("terminal_deconflicted", False),
-                                "first_step_lateral_margin_improves": evaluation.get("first_step_lateral_margin_improves", False),
-                                "first_step_path_overlap_reduces": evaluation.get("first_step_path_overlap_reduces", False),
-                                "first_step_lateral_distance_increases": evaluation.get("first_step_lateral_distance_increases", False),
-                                **corridor_memory_info,
-                            },
-                        ),
-                    )
-
         if cbf_info.get("mode") != "fallback_no_safe_candidate":
             u_safe = cbf_safe
             mode = "rss_mpc_fallback_to_cbf"
             reason = "mpc_recovery_failed_fallback_to_cbf"
             minimum_risk_stop_used = False
             if feasible_count == 0 and terminal_feasible_count > 0:
-                failure_reason = failure_reason or "terminal_candidates_guard_rejected"
+                failure_reason = failure_reason or "emergency_veto"
         else:
             u_safe = self._minimum_risk_stop(u_original)
             mode = "minimum_risk_stop"
             reason = "mpc_recovery_failed_minimum_risk_stop"
             minimum_risk_stop_used = True
             if feasible_count == 0 and terminal_feasible_count > 0:
-                failure_reason = "fallback_to_minimum_risk_stop"
+                failure_reason = "emergency_veto"
 
         brake_selected_despite_lateral_escape_available = False
         if deadlock_info["deadlock_risk"] and minimum_risk_stop_used:
@@ -1222,7 +1193,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 deadlock_info,
                 {
                     "mpc_called": True,
-                    "mpc_call_reason": "deadlock_risk",
+                    "mpc_call_reason": deadlock_info.get("mpc_call_reason_override", "deadlock_risk"),
                     "minimum_risk_stop_used": minimum_risk_stop_used,
                     "mpc_terminal_feasible": terminal_feasible_count,
                     "mpc_guard_rejected": guard_rejected_count,
@@ -1240,6 +1211,28 @@ class RSSMPCFilter(RSSCBFFilter):
         cbf_delta = float(cbf_info.get("action_delta", self._action_norm(u_cbf, u_original)))
         return cbf_info.get("mode") == "normal" and cbf_delta <= self.mpc_config.action_change_tolerance
 
+    def _brake_only_recovery_risk(
+        self,
+        state: State,
+        obj: Dict[str, Any],
+        current_margin: float,
+        cbf_info: Dict[str, Any],
+        u_original: Action,
+        u_cbf: Action,
+    ) -> bool:
+        cfg = self.mpc_config
+        speed = self._ego_speed(state)
+        if speed < cfg.brake_only_recovery_speed_threshold or speed > cfg.brake_only_recovery_max_speed:
+            return False
+        if not self._front_object_path_overlap(state, obj):
+            return False
+        cbf_delta = float(cbf_info.get("action_delta", self._action_norm(u_cbf, u_original)))
+        cbf_active = cbf_info.get("mode") != "normal" or cbf_delta > cfg.deadlock_cbf_delta_threshold
+        brake_or_zero_throttle = float(u_cbf[0]) <= cfg.brake_only_recovery_acc_threshold
+        nominal_wants_progress = float(u_original[0]) >= cfg.brake_only_recovery_nominal_acc_threshold
+        rss_unsafe = math.isfinite(current_margin) and current_margin < 0.0
+        return bool(cbf_active and brake_or_zero_throttle and nominal_wants_progress and rss_unsafe)
+
     def _minimum_risk_stop(self, u_nom: Action) -> Action:
         return self._clip_action([self.mpc_config.strong_brake, u_nom[1]])
 
@@ -1256,6 +1249,471 @@ class RSSMPCFilter(RSSCBFFilter):
             return None
         self._held_recovery_ttl -= 1
         return self._clip_action(self._held_recovery_action)
+
+    def _projected_road_boundary_risk(self, state: State, action: Action) -> Dict[str, Any]:
+        cfg = self.mpc_config
+        horizon = max(1, int(cfg.road_boundary_prediction_horizon_steps))
+        trigger_margin = self._road_boundary_dynamic_trigger_margin(state)
+        rollout_state = copy.deepcopy(state)
+        margins: List[float] = []
+        for _ in range(horizon):
+            rollout_state = self._simulate_next_state(rollout_state, action)
+            margins.append(float(self._road_boundary_margin_for_state(state, rollout_state)))
+
+        current_margin = float(self._current_road_boundary_margin(state))
+        finite_margins = [m for m in margins if math.isfinite(m)]
+        min_margin = min(finite_margins) if finite_margins else math.nan
+        final_margin = finite_margins[-1] if finite_margins else math.nan
+        ego = self._ego(state)
+        current_violation = bool(
+            not bool(ego.get("on_lane", True))
+            or bool(ego.get("crash_sidewalk", False))
+            or bool(ego.get("out_of_route", False))
+            or bool(ego.get("on_yellow_continuous_line", False))
+            or bool(ego.get("on_white_continuous_line", False))
+        )
+        projected_violation = bool(
+            math.isfinite(min_margin)
+            and min_margin < float(trigger_margin)
+        )
+        risk = bool(current_violation or projected_violation)
+        return {
+            "road_boundary_projected_risk": risk,
+            "road_boundary_current_violation": current_violation,
+            "road_boundary_nominal_margin_current": current_margin,
+            "road_boundary_nominal_margin_min_pred": min_margin,
+            "road_boundary_nominal_margin_final_pred": final_margin,
+            "road_boundary_prediction_horizon_steps": horizon,
+            "road_boundary_trigger_margin_dynamic": float(trigger_margin),
+        }
+
+    def _apply_road_boundary_recovery_hold(self, state: State, deadlock_info: Dict[str, Any]) -> None:
+        cfg = self.mpc_config
+        if deadlock_info.get("road_boundary_projected_risk", False):
+            self._road_boundary_recovery_ttl = max(
+                self._road_boundary_recovery_ttl,
+                int(cfg.road_boundary_recovery_hold_steps),
+            )
+            deadlock_info["road_boundary_recovery_hold_active"] = False
+            deadlock_info["road_boundary_recovery_hold_ttl"] = int(self._road_boundary_recovery_ttl)
+            return
+
+        if self._road_boundary_recovery_ttl <= 0:
+            deadlock_info["road_boundary_recovery_hold_active"] = False
+            deadlock_info["road_boundary_recovery_hold_ttl"] = 0
+            return
+
+        trigger_margin = float(
+            deadlock_info.get(
+                "road_boundary_trigger_margin_dynamic",
+                self._road_boundary_dynamic_trigger_margin(state),
+            )
+        )
+        min_margin = float(deadlock_info.get("road_boundary_nominal_margin_min_pred", math.nan))
+        current_margin = float(deadlock_info.get("road_boundary_nominal_margin_current", math.nan))
+        release_threshold = trigger_margin + float(cfg.road_boundary_recovery_release_margin)
+        release_safe = bool(
+            not deadlock_info.get("road_boundary_current_violation", False)
+            and self._ego_speed(state) <= float(cfg.road_boundary_recovery_release_speed)
+            and math.isfinite(min_margin)
+            and math.isfinite(current_margin)
+            and min_margin >= release_threshold
+            and current_margin >= release_threshold
+        )
+        if release_safe:
+            self._road_boundary_recovery_ttl = 0
+            deadlock_info["road_boundary_recovery_hold_active"] = False
+            deadlock_info["road_boundary_recovery_hold_ttl"] = 0
+            return
+
+        self._road_boundary_recovery_ttl -= 1
+        conditions = str(deadlock_info.get("mpc_trigger_conditions", ""))
+        if "road_boundary_recovery_hold" not in conditions:
+            conditions = ";".join([part for part in (conditions, "road_boundary_recovery_hold") if part])
+        deadlock_info.update(
+            {
+                "road_boundary_projected_risk": True,
+                "road_boundary_recovery_hold_active": True,
+                "road_boundary_recovery_hold_ttl": int(self._road_boundary_recovery_ttl),
+                "mpc_trigger_boundary_risk": True,
+                "mpc_trigger_conditions": conditions,
+            }
+        )
+
+    def _generate_road_boundary_mpc_candidates(self, state: State, u_nom: Action, u_cbf: Action) -> Tuple[List[np.ndarray], List[str]]:
+        cfg = self.mpc_config
+        horizon = max(1, int(cfg.road_boundary_prediction_horizon_steps))
+        max_candidates = max(1, int(cfg.road_boundary_mpc_max_candidates))
+        acc_nom, steer_nom = self._clip_action(u_nom)
+        acc_cbf, steer_cbf = self._clip_action(u_cbf)
+        ego_speed = self._ego_speed(state)
+        low_speed_candidate_mode = ego_speed <= max(cfg.road_boundary_low_speed_threshold, cfg.stuck_speed_threshold)
+        sequences: List[np.ndarray] = []
+        families: List[str] = []
+
+        def add(acc_values: Sequence[float], steer_values: Sequence[float], family: str) -> None:
+            if len(sequences) >= max_candidates:
+                return
+            sequence = np.asarray(
+                [self._clip_action([acc, steer]) for acc, steer in zip(acc_values, steer_values)],
+                dtype=np.float64,
+            )
+            if sequence.shape == (horizon, 2):
+                sequences.append(sequence)
+                families.append(family)
+
+        add(np.full(horizon, acc_nom, dtype=np.float64), np.full(horizon, steer_nom, dtype=np.float64), "road_boundary_nominal")
+        add(np.full(horizon, acc_cbf, dtype=np.float64), np.full(horizon, steer_cbf, dtype=np.float64), "road_boundary_cbf_reference")
+        add(np.zeros(horizon, dtype=np.float64), np.full(horizon, steer_nom, dtype=np.float64), "road_boundary_coast_nominal_steer")
+        add(np.zeros(horizon, dtype=np.float64), np.zeros(horizon, dtype=np.float64), "road_boundary_coast_straight")
+        add(np.full(horizon, cfg.comfort_brake, dtype=np.float64), np.full(horizon, steer_nom, dtype=np.float64), "road_boundary_comfort_brake_nominal_steer")
+        add(np.full(horizon, cfg.comfort_brake, dtype=np.float64), np.zeros(horizon, dtype=np.float64), "road_boundary_comfort_brake_straight")
+        add(np.full(horizon, cfg.strong_brake, dtype=np.float64), np.zeros(horizon, dtype=np.float64), "road_boundary_strong_brake_straight")
+
+        mild_acc = min(max(acc_nom, cfg.lateral_escape_min_acc), cfg.lateral_escape_max_acc)
+        low_speed_acc_cap = max(cfg.lateral_escape_min_acc, 0.5 * cfg.lateral_escape_max_acc)
+        boundary_progress_acc = min(mild_acc, low_speed_acc_cap) if low_speed_candidate_mode else mild_acc
+        pulse_len = max(1, min(horizon, max(2, horizon // 3)))
+        mild_acc_pulse = np.zeros(horizon, dtype=np.float64)
+        mild_acc_pulse[:pulse_len] = boundary_progress_acc
+        if low_speed_candidate_mode:
+            add(mild_acc_pulse, np.full(horizon, steer_nom, dtype=np.float64), "road_boundary_mild_acc_pulse_nominal_steer")
+            add(mild_acc_pulse, np.zeros(horizon, dtype=np.float64), "road_boundary_mild_acc_pulse_straight")
+            add(np.full(horizon, boundary_progress_acc, dtype=np.float64), np.full(horizon, steer_nom, dtype=np.float64), "road_boundary_mild_acc_nominal_steer")
+            add(np.full(horizon, boundary_progress_acc, dtype=np.float64), np.zeros(horizon, dtype=np.float64), "road_boundary_mild_acc_straight")
+
+        steer_grid = [
+            -cfg.bypass_steer,
+            -cfg.nudge_steer,
+            -0.5 * cfg.nudge_steer,
+            0.0,
+            0.5 * cfg.nudge_steer,
+            cfg.nudge_steer,
+            cfg.bypass_steer,
+        ]
+        for steer in steer_grid:
+            add(np.zeros(horizon, dtype=np.float64), np.full(horizon, steer, dtype=np.float64), "road_boundary_coast_steer")
+            if ego_speed <= max(
+                cfg.road_boundary_away_recovery_speed,
+                3.0,
+                cfg.road_boundary_low_speed_threshold,
+                cfg.stuck_speed_threshold,
+            ):
+                add(mild_acc_pulse, np.full(horizon, steer, dtype=np.float64), "road_boundary_mild_acc_pulse_steer")
+                add(np.full(horizon, boundary_progress_acc, dtype=np.float64), np.full(horizon, steer, dtype=np.float64), "road_boundary_mild_acc_steer")
+
+        for steer in steer_grid:
+            add(np.full(horizon, cfg.comfort_brake, dtype=np.float64), np.full(horizon, steer, dtype=np.float64), "road_boundary_brake_steer")
+            if ego_speed <= max(2.0, cfg.stuck_speed_threshold):
+                add(np.full(horizon, boundary_progress_acc, dtype=np.float64), np.full(horizon, steer, dtype=np.float64), "road_boundary_creep_steer")
+            half = max(1, horizon // 2)
+            steer_then_straight = np.concatenate(
+                [np.full(half, steer, dtype=np.float64), np.linspace(steer, 0.0, horizon - half)]
+            )
+            add(np.full(horizon, cfg.comfort_brake, dtype=np.float64), steer_then_straight, "road_boundary_brake_steer_then_straight")
+
+        self._last_candidate_families = families
+        self._last_candidate_corridors = [
+            {
+                "corridor_type": family,
+                "target_lateral_offset": 0.0,
+                "target_speed": 0.0,
+                "road_boundary_margin": float(cfg.road_boundary_hard_margin),
+                "available": True,
+                "reason": "road_boundary_projected_risk",
+            }
+            for family in families
+        ]
+        return sequences, families
+
+    def _evaluate_road_boundary_mpc_sequence(
+        self,
+        state: State,
+        sequence: np.ndarray,
+        u_nom: Action,
+        family: str,
+    ) -> Dict[str, Any]:
+        cfg = self.mpc_config
+        rollout_state = copy.deepcopy(state)
+        margins: List[float] = []
+        speeds: List[float] = []
+        initial_ego = self._ego(state)
+        current_margin = float(self._current_road_boundary_margin(state))
+        for action in sequence:
+            rollout_state = self._simulate_next_state(rollout_state, action)
+            margins.append(float(self._road_boundary_margin_for_state(state, rollout_state)))
+            speeds.append(self._ego_speed(rollout_state))
+
+        finite_margins = [m for m in margins if math.isfinite(m)]
+        min_margin = min(finite_margins) if finite_margins else -math.inf
+        final_margin = finite_margins[-1] if finite_margins else -math.inf
+        progress = self._longitudinal_progress(initial_ego, self._ego(rollout_state))
+        final_speed = speeds[-1] if speeds else self._ego_speed(state)
+        dynamic_trigger_margin = self._road_boundary_dynamic_trigger_margin(state)
+        current_speed = self._ego_speed(state)
+        high_speed_margin = 0.0
+        if current_speed >= cfg.road_boundary_high_speed_brake_threshold:
+            high_speed_margin = min(
+                float(cfg.road_boundary_high_speed_margin_max),
+                float(cfg.road_boundary_high_speed_margin_gain) * max(0.0, current_speed),
+            )
+        hard_margin = max(float(cfg.road_boundary_hard_margin), 0.25 * dynamic_trigger_margin, high_speed_margin)
+        target_margin = max(float(cfg.road_boundary_recovery_target_margin), dynamic_trigger_margin)
+        road_safe = bool(min_margin >= hard_margin)
+        action_bounds_safe = bool(
+            np.all(sequence[:, 0] >= cfg.min_acc - self.config.small_tolerance)
+            and np.all(sequence[:, 0] <= cfg.max_acc + self.config.small_tolerance)
+            and np.all(np.abs(sequence[:, 1]) <= cfg.max_steer + self.config.small_tolerance)
+        )
+        margin_improvement = final_margin - current_margin if math.isfinite(final_margin) and math.isfinite(current_margin) else 0.0
+        intervention_cost = float(np.sum((sequence - np.asarray(self._clip_action(u_nom), dtype=np.float64)) ** 2))
+        violation_cost = max(0.0, hard_margin - min_margin) ** 2
+        trigger_violation_cost = max(0.0, dynamic_trigger_margin - min_margin) ** 2
+        recovery_cost = max(0.0, target_margin - final_margin) ** 2
+        brake_cost = float(np.sum([max(0.0, cfg.comfort_brake - float(action[0])) ** 2 for action in sequence]))
+        deceleration_cost = float(np.sum([max(0.0, -float(action[0])) ** 2 for action in sequence]))
+        low_speed = self._ego_speed(state) <= max(cfg.road_boundary_low_speed_threshold, cfg.stuck_speed_threshold)
+        low_speed_safe_buffer = bool(low_speed and math.isfinite(current_margin) and current_margin >= target_margin)
+        first_acc = float(sequence[0][0])
+        first_steer = float(sequence[0][1])
+        high_speed_aggressive_steer = bool(
+            current_speed >= cfg.road_boundary_high_speed_threshold
+            and abs(first_steer) > cfg.road_boundary_high_speed_steer_limit
+            and abs(first_steer) * current_speed > cfg.road_boundary_high_speed_steer_speed_product_limit
+        )
+        high_speed_steer_safe = not high_speed_aggressive_steer
+        high_speed_requires_brake = bool(current_speed >= cfg.road_boundary_high_speed_brake_threshold)
+        high_speed_acc_safe = not (
+            high_speed_requires_brake
+            and first_acc > cfg.road_boundary_high_speed_max_acc + self.config.small_tolerance
+        )
+        left_distance = self._safe_float(initial_ego.get("dist_to_left_side", math.nan), math.nan)
+        right_distance = self._safe_float(initial_ego.get("dist_to_right_side", math.nan), math.nan)
+        nearest_boundary_side = ""
+        if math.isfinite(left_distance) and math.isfinite(right_distance):
+            if right_distance + self.config.small_tolerance < left_distance:
+                nearest_boundary_side = "right"
+            elif left_distance + self.config.small_tolerance < right_distance:
+                nearest_boundary_side = "left"
+        elif math.isfinite(right_distance):
+            nearest_boundary_side = "right"
+        elif math.isfinite(left_distance):
+            nearest_boundary_side = "left"
+        steer_toward_boundary = bool(
+            (nearest_boundary_side == "right" and first_steer > cfg.road_boundary_toward_steer_tolerance)
+            or (nearest_boundary_side == "left" and first_steer < -cfg.road_boundary_toward_steer_tolerance)
+        )
+        near_boundary_recovery = bool(
+            nearest_boundary_side
+            and math.isfinite(current_margin)
+            and (
+                current_margin < dynamic_trigger_margin + cfg.road_boundary_away_steer_margin
+                or (
+                    nearest_boundary_side == "right"
+                    and math.isfinite(right_distance)
+                    and right_distance < cfg.road_boundary_away_steer_side_distance
+                )
+                or (
+                    nearest_boundary_side == "left"
+                    and math.isfinite(left_distance)
+                    and left_distance < cfg.road_boundary_away_steer_side_distance
+                )
+            )
+        )
+        if nearest_boundary_side == "right":
+            away_steer_safe = bool(first_steer <= -cfg.road_boundary_away_steer_min)
+        elif nearest_boundary_side == "left":
+            away_steer_safe = bool(first_steer >= cfg.road_boundary_away_steer_min)
+        else:
+            away_steer_safe = True
+        away_steer_required = bool(near_boundary_recovery and current_speed > cfg.road_boundary_low_speed_threshold)
+        low_speed_progress_recoverable = bool(
+            low_speed_safe_buffer
+            and action_bounds_safe
+            and road_safe
+            and first_acc > self.config.small_tolerance
+            and first_acc <= cfg.lateral_escape_max_acc + self.config.small_tolerance
+            and final_speed >= self._ego_speed(state) + 0.03
+        )
+        away_progress_recoverable = bool(
+            current_speed <= cfg.road_boundary_away_recovery_speed
+            and away_steer_required
+            and away_steer_safe
+            and action_bounds_safe
+            and road_safe
+            and first_acc > self.config.small_tolerance
+            and first_acc <= cfg.lateral_escape_max_acc + self.config.small_tolerance
+            and margin_improvement >= -cfg.lateral_escape_min_lateral_margin_improvement
+        )
+        recovery_certified = bool(
+            road_safe
+            and (
+                min_margin >= dynamic_trigger_margin
+                or low_speed_progress_recoverable
+                or away_progress_recoverable
+            )
+        )
+        stall_cost = 0.0
+        if low_speed_safe_buffer:
+            stall_cost += max(0.0, cfg.road_boundary_low_speed_target_speed - final_speed) ** 2
+            stall_cost += max(0.0, cfg.road_boundary_low_speed_target_progress - progress) ** 2
+            if float(sequence[0][0]) <= self.config.small_tolerance:
+                stall_cost += 1.0
+        cost = (
+            cfg.w_intervention * intervention_cost
+            + cfg.w_road_boundary_projection * violation_cost
+            + cfg.w_road_boundary_recovery * trigger_violation_cost
+            + cfg.w_road_boundary_recovery * recovery_cost
+            + cfg.w_brake * brake_cost
+            + cfg.w_road_boundary_deceleration * deceleration_cost
+            + cfg.w_road_boundary_stall * stall_cost
+            - 10.0 * max(0.0, margin_improvement)
+            - 3.0 * max(0.0, progress)
+        )
+        hard_safe = bool(
+            action_bounds_safe
+            and road_safe
+            and high_speed_steer_safe
+            and high_speed_acc_safe
+            and not steer_toward_boundary
+            and (not away_steer_required or away_steer_safe)
+        )
+        reject_reason = ""
+        if not high_speed_steer_safe:
+            reject_reason = "road_boundary_high_speed_aggressive_steer"
+        elif not high_speed_acc_safe:
+            reject_reason = "road_boundary_high_speed_requires_brake"
+        elif steer_toward_boundary:
+            reject_reason = "road_boundary_steer_toward_boundary"
+        elif away_steer_required and not away_steer_safe:
+            reject_reason = "road_boundary_steer_not_away_from_boundary"
+        elif not recovery_certified:
+            reject_reason = "road_boundary_dynamic_buffer_not_met" if hard_safe else "road_boundary_violation"
+        return {
+            "sequence": sequence,
+            "recovery_candidate_family": family,
+            "candidate_family": family,
+            "cost": float(cost),
+            "total_cost": float(cost),
+            "hard_safe": hard_safe,
+            "recovery_certified": recovery_certified,
+            "predictive_candidate_certified": recovery_certified,
+            "certified_lateral_recovery": False,
+            "predictive_filter_used": True,
+            "predictive_hard_safe": hard_safe,
+            "predictive_total_cost": float(cost),
+            "predictive_action_bounds_safe": bool(action_bounds_safe and high_speed_steer_safe and high_speed_acc_safe),
+            "predictive_no_immediate_collision": True,
+            "predictive_road_boundary_safe": road_safe,
+            "predictive_lateral_hard_safe": True,
+            "predictive_lateral_rss_safe_or_improving": True,
+            "predictive_catastrophic_side_conflict": False,
+            "predictive_terminal_recoverable": recovery_certified or margin_improvement > 0.0,
+            "predictive_terminal_recovery_reason": (
+                "road_boundary_low_speed_progress_safe"
+                if low_speed_progress_recoverable
+                else (
+                    "road_boundary_away_progress_safe"
+                    if away_progress_recoverable
+                    else ("road_boundary_dynamic_margin_safe" if recovery_certified else "road_boundary_margin_improved")
+                )
+            ),
+            "road_boundary_safe": road_safe,
+            "road_boundary_margin_min_pred": float(min_margin),
+            "road_boundary_margin_final_pred": float(final_margin),
+            "road_boundary_margin_improvement": float(margin_improvement),
+            "road_boundary_hard_margin": hard_margin,
+            "road_boundary_target_margin": target_margin,
+            "road_boundary_high_speed_margin": float(high_speed_margin),
+            "road_boundary_high_speed_requires_brake": bool(high_speed_requires_brake),
+            "road_boundary_nearest_side": nearest_boundary_side,
+            "road_boundary_steer_toward_boundary": bool(steer_toward_boundary),
+            "road_boundary_away_steer_required": bool(away_steer_required),
+            "road_boundary_away_steer_safe": bool(away_steer_safe),
+            "road_boundary_away_progress_recoverable": bool(away_progress_recoverable),
+            "road_boundary_trigger_margin_dynamic": float(dynamic_trigger_margin),
+            "road_boundary_low_speed_recovery": bool(low_speed_safe_buffer),
+            "predicted_progress": float(progress),
+            "final_speed": float(final_speed),
+            "first_acc": first_acc,
+            "first_steer": first_steer,
+            "predictive_reject_reason": reject_reason,
+        }
+
+    def _run_road_boundary_predictive_mpc(
+        self,
+        state: State,
+        u_nom: Action,
+        u_cbf: Action,
+    ) -> Tuple[Action, Dict[str, Any]]:
+        candidates, families = self._generate_road_boundary_mpc_candidates(state, u_nom, u_cbf)
+        evaluations = [
+            self._evaluate_road_boundary_mpc_sequence(state, sequence, u_nom, family)
+            for sequence, family in zip(candidates, families)
+        ]
+        safe_evaluations = [evaluation for evaluation in evaluations if evaluation["hard_safe"]]
+        certified_evaluations = [evaluation for evaluation in safe_evaluations if evaluation.get("recovery_certified", False)]
+        if certified_evaluations:
+            best_pool = certified_evaluations
+            if (
+                self._ego_speed(state) <= max(self.mpc_config.road_boundary_low_speed_threshold, self.mpc_config.stuck_speed_threshold)
+                and self._current_road_boundary_margin(state) >= self.mpc_config.road_boundary_recovery_target_margin
+            ):
+                progress_evaluations = [
+                    evaluation
+                    for evaluation in certified_evaluations
+                    if float(evaluation.get("first_acc", 0.0)) > self.config.small_tolerance
+                ]
+                if progress_evaluations:
+                    best_pool = progress_evaluations
+            best = min(best_pool, key=lambda item: item["cost"])
+        elif safe_evaluations:
+            best = max(safe_evaluations, key=lambda item: (item["road_boundary_margin_min_pred"], -item["cost"]))
+        else:
+            best = {
+                "sequence": np.asarray([self._clip_action([self.mpc_config.strong_brake, 0.0])], dtype=np.float64),
+                "cost": math.inf,
+                "hard_safe": False,
+                "recovery_certified": False,
+                "recovery_candidate_family": "road_boundary_minimum_risk_stop",
+                "road_boundary_margin_min_pred": -math.inf,
+                "predictive_reject_reason": "road_boundary_no_hard_safe_candidate",
+            }
+        selected = self._clip_action(best["sequence"][0])
+        acc, steer = selected
+        throttle = max(0.0, acc / max(self.config.max_acc, 1e-6))
+        brake = max(0.0, -acc / max(abs(self.config.min_acc), 1e-6))
+        info = {
+            **best,
+            "mpc_called": True,
+            "mpc_call_reason": "road_boundary_projected_risk",
+            "mpc_success": bool(best["hard_safe"]),
+            "mpc_num_candidates": len(evaluations),
+            "mpc_num_feasible": len(safe_evaluations),
+            "mpc_best_cost": float(best["cost"]),
+            "mpc_num_road_safe": len(safe_evaluations),
+            "mpc_num_terminal_recoverable": len(safe_evaluations),
+            "selected_candidate_family": best["recovery_candidate_family"],
+            "best_candidate_family": best["recovery_candidate_family"],
+            "road_boundary_mpc_used": True,
+            "road_boundary_mpc_no_safe_candidate": not bool(best["hard_safe"]),
+            "terminal_recoverable": bool(best.get("predictive_terminal_recoverable", False)),
+            "terminal_recovery_reason": best.get("predictive_terminal_recovery_reason", ""),
+            "guard_reject_reason": "" if best["hard_safe"] else "road_boundary_violation",
+            "selected_acc_before_guard": float(acc),
+            "selected_acc_after_guard": float(acc),
+            "selected_steer_before_guard": float(steer),
+            "selected_steer_after_guard": float(steer),
+            "selected_throttle_before_guard": float(throttle),
+            "selected_throttle_after_guard": float(throttle),
+            "selected_brake_before_guard": float(brake),
+            "selected_brake_after_guard": float(brake),
+            "rss_margin_min_pred": math.inf,
+            "rss_margin_final_pred": math.inf,
+            "rss_lateral_clearance_min_pred": math.inf,
+            "rss_lateral_clearance_final_pred": math.inf,
+        }
+        return selected, info
 
     def _update_deadlock_detector(
         self,
@@ -1292,7 +1750,113 @@ class RSSMPCFilter(RSSCBFFilter):
             self.deadlock_counter = max(0, self.deadlock_counter - 1)
         info["deadlock_counter"] = self.deadlock_counter
         info["deadlock_risk"] = bool(info["deadlock_candidate"] and self.deadlock_counter >= self.mpc_config.deadlock_counter_threshold)
+        info.update(self._mpc_trigger_diagnostics(state, front, cbf_info, u_original, u_cbf, info))
         return info
+
+    def _mpc_trigger_diagnostics(
+        self,
+        state: State,
+        front: Optional[Tuple[str, Dict[str, Any], float, float, float, bool, bool]],
+        cbf_info: Dict[str, Any],
+        u_original: Action,
+        u_cbf: Action,
+        deadlock_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        ego = self._ego(state)
+        cbf_delta = float(cbf_info.get("action_delta", self._action_norm(u_cbf, u_original)))
+        current_margin = self._current_road_boundary_margin(state)
+        margin_source = self._road_boundary_margin_source_for_state(state)
+        projected_boundary = self._projected_road_boundary_risk(state, u_original)
+        projected_boundary_risk = bool(projected_boundary.get("road_boundary_projected_risk", False))
+        yellow_line = bool(ego.get("on_yellow_continuous_line", False))
+        white_line = bool(ego.get("on_white_continuous_line", False))
+        on_lane = bool(ego.get("on_lane", True))
+        crash_sidewalk = bool(ego.get("crash_sidewalk", False))
+        out_of_route = bool(ego.get("out_of_route", False))
+        boundary_risk = bool(
+            (not on_lane)
+            or crash_sidewalk
+            or out_of_route
+            or yellow_line
+            or white_line
+            or (
+                math.isfinite(current_margin)
+                and current_margin < float(self.mpc_config.corridor_road_boundary_margin)
+            )
+            or projected_boundary_risk
+        )
+        front_exists = front is not None
+        object_kind = str(front[0]) if front_exists else "none"
+
+        conditions: List[str] = []
+        blockers: List[str] = []
+        if deadlock_info.get("deadlock_risk", False):
+            conditions.append("deadlock_risk")
+        if deadlock_info.get("deadlock_candidate", False):
+            conditions.append("deadlock_candidate")
+        if front_exists:
+            conditions.append("front_rss_object_detected")
+        else:
+            blockers.append("no_front_rss_object")
+        if cbf_info.get("mode") != "normal":
+            conditions.append("cbf_active")
+        if cbf_delta > self.mpc_config.deadlock_cbf_delta_threshold:
+            conditions.append("cbf_delta_large")
+        if boundary_risk:
+            conditions.append("road_boundary_risk_observed")
+        if projected_boundary_risk:
+            conditions.append("road_boundary_projected_risk")
+        elif boundary_risk:
+            blockers.append("road_boundary_risk_not_mpc_trigger")
+        if not deadlock_info.get("deadlock_risk", False):
+            blockers.append(str(deadlock_info.get("deadlock_reason", "deadlock_conditions_not_met")))
+
+        avg_speed = float(deadlock_info.get("deadlock_window_avg_speed", math.nan))
+        progress = float(deadlock_info.get("deadlock_window_progress", math.nan))
+        cbf_ratio = float(deadlock_info.get("deadlock_cbf_active_ratio", 0.0))
+        front_ratio = float(deadlock_info.get("deadlock_front_active_ratio", 0.0))
+        avg_cbf_delta = float(deadlock_info.get("deadlock_avg_cbf_delta", 0.0))
+        route_completion = float(deadlock_info.get("deadlock_route_completion", math.nan))
+        if math.isfinite(avg_speed) and avg_speed > self.mpc_config.deadlock_speed_threshold:
+            blockers.append("avg_speed_above_deadlock_threshold")
+        if math.isfinite(progress) and progress > self.mpc_config.deadlock_progress_threshold:
+            blockers.append("progress_above_deadlock_threshold")
+        if cbf_ratio < self.mpc_config.deadlock_cbf_active_ratio_threshold:
+            blockers.append("cbf_active_ratio_below_threshold")
+        if front_ratio < self.mpc_config.deadlock_front_active_ratio_threshold:
+            blockers.append("front_active_ratio_below_threshold")
+        if avg_cbf_delta < self.mpc_config.deadlock_cbf_delta_threshold:
+            blockers.append("avg_cbf_delta_below_threshold")
+        if math.isfinite(route_completion) and route_completion >= self.mpc_config.near_goal_route_completion:
+            blockers.append("near_goal")
+        if int(deadlock_info.get("deadlock_counter", self.deadlock_counter)) < self.mpc_config.deadlock_counter_threshold:
+            blockers.append("deadlock_counter_below_threshold")
+
+        return {
+            "mpc_trigger_policy": "deadlock_or_projected_road_boundary_risk",
+            "mpc_trigger_conditions": ";".join(dict.fromkeys([item for item in conditions if item])),
+            "mpc_trigger_blockers": ";".join(dict.fromkeys([item for item in blockers if item])),
+            "mpc_trigger_front_exists": bool(front_exists),
+            "mpc_trigger_front_object_kind": object_kind,
+            "mpc_trigger_cbf_mode": str(cbf_info.get("mode", "")),
+            "mpc_trigger_cbf_delta": float(cbf_delta),
+            "mpc_trigger_boundary_risk": bool(boundary_risk),
+            "mpc_trigger_boundary_margin": float(current_margin),
+            "mpc_trigger_boundary_margin_source": margin_source,
+            "mpc_trigger_boundary_min_pred": float(projected_boundary.get("road_boundary_nominal_margin_min_pred", math.nan)),
+            "mpc_trigger_boundary_final_pred": float(projected_boundary.get("road_boundary_nominal_margin_final_pred", math.nan)),
+            "road_boundary_projected_risk": projected_boundary_risk,
+            "road_boundary_nominal_margin_current": float(projected_boundary.get("road_boundary_nominal_margin_current", current_margin)),
+            "road_boundary_nominal_margin_min_pred": float(projected_boundary.get("road_boundary_nominal_margin_min_pred", math.nan)),
+            "road_boundary_nominal_margin_final_pred": float(projected_boundary.get("road_boundary_nominal_margin_final_pred", math.nan)),
+            "road_boundary_prediction_horizon_steps": int(projected_boundary.get("road_boundary_prediction_horizon_steps", 0)),
+            "road_boundary_trigger_margin_dynamic": float(projected_boundary.get("road_boundary_trigger_margin_dynamic", math.nan)),
+            "mpc_trigger_yellow_line": bool(yellow_line),
+            "mpc_trigger_white_line": bool(white_line),
+            "mpc_trigger_on_lane": bool(on_lane),
+            "mpc_trigger_crash_sidewalk": bool(crash_sidewalk),
+            "mpc_trigger_out_of_route": bool(out_of_route),
+        }
 
     def _deadlock_diagnostics(self) -> Dict[str, Any]:
         samples = list(self.deadlock_history)
@@ -1831,28 +2395,302 @@ class RSSMPCFilter(RSSCBFFilter):
     def _current_road_boundary_margin(self, state: State) -> float:
         return self._road_boundary_margin_for_state(state, state)
 
-    def _road_boundary_margin_for_state(self, reference_state: State, rollout_state: State) -> float:
-        initial_ego = self._ego(reference_state)
-        _, lateral = self._relative_position(initial_ego, self._ego(rollout_state))
-        current_width = self._current_lane_width(reference_state)
-        lanes = reference_state.get("lanes", {}) or {}
-        left_width = self._lane_available_width(reference_state, lanes.get("left")) if lanes.get("left") else 0.0
-        right_width = self._lane_available_width(reference_state, lanes.get("right")) if lanes.get("right") else 0.0
-        left_available = bool((lanes.get("left") or {}).get("available", False))
-        right_available = bool((lanes.get("right") or {}).get("available", False))
-        upper = current_width / 2.0 + (left_width if left_available else 0.0) - self.config.lane_margin
-        lower = -current_width / 2.0 - (right_width if right_available else 0.0) + self.config.lane_margin
-        return min(upper - lateral, lateral - lower)
+    def _road_boundary_dynamic_trigger_margin(self, state: State) -> float:
+        cfg = self.mpc_config
+        speed = max(0.0, self._ego_speed(state))
+        speed_margin = cfg.road_boundary_trigger_speed_gain * speed
+        trigger_margin = max(cfg.road_boundary_trigger_margin, min(cfg.road_boundary_trigger_max_margin, speed_margin))
+        if speed >= cfg.road_boundary_moderate_speed_threshold:
+            trigger_margin = max(trigger_margin, float(cfg.road_boundary_moderate_speed_trigger_margin))
+        if speed >= cfg.road_boundary_high_speed_brake_threshold:
+            high_speed_margin = min(
+                float(cfg.road_boundary_high_speed_margin_max),
+                float(cfg.road_boundary_high_speed_margin_gain) * speed,
+            )
+            trigger_margin = max(trigger_margin, high_speed_margin)
+        return float(trigger_margin)
 
-    def _corridor_boundary_feasible(self, state: State, target_lateral_offset: float) -> bool:
+    def _road_boundary_margin_source_for_state(self, state: State) -> str:
+        side_margin = self._side_distance_margin_for_state(state, state)
+        solid_line_margin = self._solid_lane_boundary_margin_for_state(state, state)
+        if math.isfinite(side_margin) and math.isfinite(solid_line_margin):
+            return "metadrive_side_distance_with_solid_lane_line"
+        if math.isfinite(side_margin):
+            return "metadrive_route_side_distance"
+        route_margin = self._route_corridor_margin_for_state(state, state)
+        if math.isfinite(route_margin) and math.isfinite(solid_line_margin):
+            return "metadrive_route_corridor_with_solid_lane_line"
+        if math.isfinite(route_margin):
+            return "metadrive_route_corridor"
+        _, _, source = self._road_boundary_limits_from_state(state)
+        return source
+
+    def _solid_lane_boundary_margin_for_state(self, reference_state: State, rollout_state: State) -> float:
+        reference_ego = self._ego(reference_state)
+        left_prohibited = bool(reference_ego.get("left_lane_line_prohibited", False))
+        right_prohibited = bool(reference_ego.get("right_lane_line_prohibited", False))
+        if not (left_prohibited or right_prohibited):
+            return math.nan
+
+        corridors = reference_state.get("route_corridors", []) or []
+        if not corridors:
+            return math.nan
+
+        ref_x = self._safe_float(reference_ego.get("x", math.nan), math.nan)
+        ref_y = self._safe_float(reference_ego.get("y", math.nan), math.nan)
+        rollout_ego = self._ego(rollout_state)
+        x = self._safe_float(rollout_ego.get("x", math.nan), math.nan)
+        y = self._safe_float(rollout_ego.get("y", math.nan), math.nan)
+        if not (math.isfinite(ref_x) and math.isfinite(ref_y) and math.isfinite(x) and math.isfinite(y)):
+            return math.nan
+
+        best_margin = -math.inf
+        use_longitudinal_endpoint = bool(
+            self.mpc_config.road_boundary_use_route_endpoint_margin
+            and self._ego_speed(reference_state) > max(
+                self.mpc_config.road_boundary_low_speed_threshold,
+                self.mpc_config.stuck_speed_threshold,
+            )
+        )
+        for corridor in corridors:
+            reference_projection = self._route_corridor_projection_for_point(corridor, ref_x, ref_y)
+            rollout_projection = self._route_corridor_projection_for_point(corridor, x, y)
+            if reference_projection is None or rollout_projection is None:
+                continue
+            lane_width = self._safe_float(
+                corridor.get("reference_lane_width", reference_ego.get("lane_width", self.config.default_lane_width)),
+                self.config.default_lane_width,
+            )
+            metadrive_reference_lateral = self._safe_float(
+                corridor.get("reference_vehicle_lateral", math.nan),
+                math.nan,
+            )
+            reference_lateral = (
+                metadrive_reference_lateral
+                if math.isfinite(metadrive_reference_lateral)
+                else reference_projection["lateral"]
+            )
+            reference_left_distance = lane_width / 2.0 + reference_lateral
+            reference_right_distance = lane_width - reference_left_distance
+            lateral_delta = self._route_corridor_lateral_delta(corridor, reference_projection, rollout_projection)
+
+            margins: List[float] = []
+            if left_prohibited:
+                margins.append(reference_left_distance + lateral_delta - self.config.lane_margin)
+            if right_prohibited:
+                margins.append(reference_right_distance - lateral_delta - self.config.lane_margin)
+            if use_longitudinal_endpoint and math.isfinite(rollout_projection["longitudinal_margin"]):
+                margins.append(rollout_projection["longitudinal_margin"] - self.config.lane_margin)
+            if margins:
+                best_margin = max(best_margin, float(min(margins)))
+        return best_margin
+
+    def _route_corridor_margin_for_state(self, reference_state: State, rollout_state: State) -> float:
+        corridors = reference_state.get("route_corridors", []) or []
+        if not corridors:
+            return math.nan
+        reference_ego = self._ego(reference_state)
+        rollout_ego = self._ego(rollout_state)
+        ref_x = self._safe_float(reference_ego.get("x", math.nan), math.nan)
+        ref_y = self._safe_float(reference_ego.get("y", math.nan), math.nan)
+        x = self._safe_float(rollout_ego.get("x", math.nan), math.nan)
+        y = self._safe_float(rollout_ego.get("y", math.nan), math.nan)
+        if not (math.isfinite(ref_x) and math.isfinite(ref_y) and math.isfinite(x) and math.isfinite(y)):
+            return math.nan
+
+        route_side_distances = self._metadrive_route_side_distances(reference_state)
+        use_longitudinal_endpoint = bool(
+            self.mpc_config.road_boundary_use_route_endpoint_margin
+            and self._ego_speed(reference_state) > max(
+                self.mpc_config.road_boundary_low_speed_threshold,
+                self.mpc_config.stuck_speed_threshold,
+            )
+        )
+        best_margin = -math.inf
+        for corridor in corridors:
+            if route_side_distances is not None:
+                reference_projection = self._route_corridor_projection_for_point(corridor, ref_x, ref_y)
+                rollout_projection = self._route_corridor_projection_for_point(corridor, x, y)
+                if reference_projection is None or rollout_projection is None:
+                    continue
+                left_distance, right_distance = route_side_distances
+                lateral_delta = self._route_corridor_lateral_delta(corridor, reference_projection, rollout_projection)
+                lateral_left_margin = left_distance + lateral_delta
+                lateral_right_margin = right_distance - lateral_delta
+                margins = [lateral_left_margin, lateral_right_margin]
+                if use_longitudinal_endpoint:
+                    margins.append(rollout_projection["longitudinal_margin"])
+                margin = min(margins) - self.config.lane_margin
+            else:
+                margin = self._route_corridor_margin_for_point(corridor, x, y)
+            if math.isfinite(margin):
+                best_margin = max(best_margin, margin)
+        return best_margin
+
+    def _route_corridor_lateral_delta(
+        self,
+        corridor: Dict[str, Any],
+        reference_projection: Dict[str, float],
+        rollout_projection: Dict[str, float],
+    ) -> float:
+        reference_lateral = reference_projection["lateral"]
+        metadrive_reference_lateral = self._safe_float(
+            corridor.get("reference_vehicle_lateral", math.nan),
+            math.nan,
+        )
+        if math.isfinite(metadrive_reference_lateral):
+            sign = 1.0
+            if abs(-reference_lateral - metadrive_reference_lateral) < abs(reference_lateral - metadrive_reference_lateral):
+                sign = -1.0
+            return sign * rollout_projection["lateral"] - metadrive_reference_lateral
+        return rollout_projection["lateral"] - reference_lateral
+
+    def _route_corridor_projection_for_point(self, corridor: Dict[str, Any], x: float, y: float) -> Optional[Dict[str, float]]:
+        points = corridor.get("points", []) or []
+        if len(points) < 2:
+            return None
+
+        best_projection: Optional[Dict[str, float]] = None
+        for idx in range(len(points) - 1):
+            x0, y0 = float(points[idx][0]), float(points[idx][1])
+            x1, y1 = float(points[idx + 1][0]), float(points[idx + 1][1])
+            sx = x1 - x0
+            sy = y1 - y0
+            seg_len = math.hypot(sx, sy)
+            if seg_len <= self.config.small_tolerance:
+                continue
+            dx = x - x0
+            dy = y - y0
+            raw_t = (dx * sx + dy * sy) / (seg_len * seg_len)
+            t = max(0.0, min(1.0, raw_t))
+            cx = x0 + t * sx
+            cy = y0 + t * sy
+            heading = math.atan2(sy, sx)
+            lateral = -(x - cx) * math.sin(heading) + (y - cy) * math.cos(heading)
+            if raw_t < 0.0:
+                longitudinal_margin = raw_t * seg_len
+            elif raw_t > 1.0:
+                longitudinal_margin = (1.0 - raw_t) * seg_len
+            else:
+                longitudinal_margin = math.inf
+            distance = math.hypot(x - cx, y - cy)
+            if best_projection is None or distance < best_projection["distance"]:
+                best_projection = {
+                    "lateral": float(lateral),
+                    "longitudinal_margin": float(longitudinal_margin),
+                    "distance": float(distance),
+                }
+        return best_projection
+
+    def _route_corridor_margin_for_point(self, corridor: Dict[str, Any], x: float, y: float) -> float:
+        points = corridor.get("points", []) or []
+        if len(points) < 2:
+            return math.nan
+        lane_width = self._safe_float(
+            corridor.get("reference_lane_width", self.config.default_lane_width),
+            self.config.default_lane_width,
+        )
+        total_width = max(
+            lane_width,
+            self._safe_float(corridor.get("total_width", lane_width), lane_width),
+        )
+
+        best_margin = -math.inf
+        travelled_before = 0.0
+        for idx in range(len(points) - 1):
+            x0, y0 = float(points[idx][0]), float(points[idx][1])
+            x1, y1 = float(points[idx + 1][0]), float(points[idx + 1][1])
+            sx = x1 - x0
+            sy = y1 - y0
+            seg_len = math.hypot(sx, sy)
+            if seg_len <= self.config.small_tolerance:
+                continue
+            dx = x - x0
+            dy = y - y0
+            raw_t = (dx * sx + dy * sy) / (seg_len * seg_len)
+            t = max(0.0, min(1.0, raw_t))
+            cx = x0 + t * sx
+            cy = y0 + t * sy
+            heading = math.atan2(sy, sx)
+            lateral = -(x - cx) * math.sin(heading) + (y - cy) * math.cos(heading)
+            lateral_to_left = lateral + lane_width / 2.0
+            lateral_to_right = total_width - lateral_to_left
+            if raw_t < 0.0:
+                longitudinal_margin = raw_t * seg_len
+            elif raw_t > 1.0:
+                longitudinal_margin = (1.0 - raw_t) * seg_len
+            else:
+                longitudinal_margin = math.inf
+            margins = [lateral_to_left, lateral_to_right]
+            if self.mpc_config.road_boundary_use_route_endpoint_margin:
+                margins.append(longitudinal_margin)
+            margin = min(margins) - self.config.lane_margin
+            best_margin = max(best_margin, float(margin))
+            travelled_before += seg_len
+        return best_margin
+
+    def _metadrive_route_side_distances(self, state: State) -> Optional[Tuple[float, float]]:
+        ego = self._ego(state)
+        left = self._safe_float(ego.get("dist_to_left_side", math.nan), math.nan)
+        right = self._safe_float(ego.get("dist_to_right_side", math.nan), math.nan)
+        if not (math.isfinite(left) and math.isfinite(right)):
+            return None
+        if left + right <= self.config.small_tolerance:
+            return None
+        return float(left), float(right)
+
+    def _road_boundary_limits_from_state(
+        self,
+        state: State,
+        margin: Optional[float] = None,
+    ) -> Tuple[float, float, str]:
+        margin = self.config.lane_margin if margin is None else float(margin)
+        route_side_distances = self._metadrive_route_side_distances(state)
+        if route_side_distances is not None:
+            left_distance, right_distance = route_side_distances
+            upper = left_distance - margin
+            lower = -right_distance + margin
+            return lower, upper, "metadrive_route_side_distance"
+
         current_width = self._current_lane_width(state)
         lanes = state.get("lanes", {}) or {}
         left_width = self._lane_available_width(state, lanes.get("left")) if lanes.get("left") else 0.0
         right_width = self._lane_available_width(state, lanes.get("right")) if lanes.get("right") else 0.0
         left_available = bool((lanes.get("left") or {}).get("available", False))
         right_available = bool((lanes.get("right") or {}).get("available", False))
-        upper = current_width / 2.0 + (left_width if left_available else 0.0) - self.mpc_config.corridor_road_boundary_margin
-        lower = -current_width / 2.0 - (right_width if right_available else 0.0) + self.mpc_config.corridor_road_boundary_margin
+        upper = current_width / 2.0 + (left_width if left_available else 0.0) - margin
+        lower = -current_width / 2.0 - (right_width if right_available else 0.0) + margin
+        return lower, upper, "lane_width_estimate"
+
+    def _road_boundary_margin_for_state(self, reference_state: State, rollout_state: State) -> float:
+        side_distance_margin = self._side_distance_margin_for_state(reference_state, rollout_state)
+        solid_line_margin = self._solid_lane_boundary_margin_for_state(reference_state, rollout_state)
+        finite_margins = [float(margin) for margin in (side_distance_margin, solid_line_margin) if math.isfinite(margin)]
+        if finite_margins:
+            return min(finite_margins)
+        route_margin = self._route_corridor_margin_for_state(reference_state, rollout_state)
+        if math.isfinite(route_margin):
+            return float(route_margin)
+        initial_ego = self._ego(reference_state)
+        _, lateral = self._relative_position(initial_ego, self._ego(rollout_state))
+        lower, upper, _ = self._road_boundary_limits_from_state(reference_state)
+        return min(upper - lateral, lateral - lower)
+
+    def _side_distance_margin_for_state(self, reference_state: State, rollout_state: State) -> float:
+        if self._metadrive_route_side_distances(reference_state) is None:
+            return math.nan
+        initial_ego = self._ego(reference_state)
+        _, lateral = self._relative_position(initial_ego, self._ego(rollout_state))
+        lower, upper, source = self._road_boundary_limits_from_state(reference_state)
+        if source != "metadrive_route_side_distance":
+            return math.nan
+        return min(upper - lateral, lateral - lower)
+
+    def _corridor_boundary_feasible(self, state: State, target_lateral_offset: float) -> bool:
+        lower, upper, _ = self._road_boundary_limits_from_state(
+            state,
+            margin=self.mpc_config.corridor_road_boundary_margin,
+        )
         return lower <= float(target_lateral_offset) <= upper
 
     def _sequences_for_corridor(
@@ -2621,6 +3459,342 @@ class RSSMPCFilter(RSSCBFFilter):
             "only_steering_no_creep": only_steering_no_creep,
             "lateral_escape_throttle_suppressed_guard": lateral_escape_throttle_suppressed_guard,
             "creep_suppression_reason_guard": creep_suppression_reason_guard,
+        }
+
+    def _evaluate_predictive_recovery_candidate(
+        self,
+        state: State,
+        obj: Dict[str, Any],
+        object_kind: str,
+        evaluation: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Certify deadlock recovery candidates before the final emergency guard."""
+        cfg = self.mpc_config
+        sequence = np.asarray(evaluation.get("sequence", []), dtype=np.float64)
+        sequence_shape_valid = sequence.ndim == 2 and sequence.shape[1] == 2 and len(sequence) > 0
+        if sequence_shape_valid:
+            first_action = np.asarray(sequence[0], dtype=np.float64)
+        else:
+            first_action = np.asarray([cfg.strong_brake, 0.0], dtype=np.float64)
+        first_acc = float(first_action[0])
+        first_steer = float(first_action[1])
+        category = self._family_category(str(evaluation.get("recovery_candidate_family", "")))
+        is_lateral_escape = bool(evaluation.get("is_lateral_escape", category in ("left", "right")))
+
+        action_bounds_safe = bool(sequence_shape_valid)
+        if sequence_shape_valid:
+            for action in sequence:
+                acc = float(action[0])
+                steer = float(action[1])
+                if (
+                    not math.isfinite(acc)
+                    or not math.isfinite(steer)
+                    or acc < cfg.min_acc - self.config.small_tolerance
+                    or acc > cfg.max_acc + self.config.small_tolerance
+                    or abs(steer) > cfg.max_steer + self.config.small_tolerance
+                ):
+                    action_bounds_safe = False
+                    break
+
+        collision_clearance = max(float(cfg.predictive_immediate_collision_clearance), self.config.small_tolerance)
+        try:
+            current_front_gap = float(self._distance_to_obstacle_front(state, obj))
+            next_state, next_obj = self._simulate_next_state_and_object(state, obj, object_kind, first_action)
+            next_front_gap = float(self._distance_to_obstacle_front(next_state, next_obj))
+            current_overlap = self._front_object_path_overlap(state, obj)
+            next_overlap = self._front_object_path_overlap(next_state, next_obj)
+            no_immediate_collision = bool(
+                (not current_overlap or current_front_gap > collision_clearance)
+                and (not next_overlap or next_front_gap > collision_clearance)
+            )
+        except Exception:
+            current_front_gap = math.nan
+            next_front_gap = math.nan
+            no_immediate_collision = False
+
+        road_safe = bool(evaluation.get("road_boundary_safe", False))
+        min_road_margin = float(evaluation.get("road_boundary_margin_min_pred", -math.inf))
+        road_boundary_safe = bool(road_safe and min_road_margin >= -self.config.small_tolerance)
+
+        final_lateral_rss_margin = float(evaluation.get("final_lateral_rss_margin", -math.inf))
+        min_lateral_rss_margin = float(evaluation.get("min_lateral_rss_margin", final_lateral_rss_margin))
+        lateral_rss_safe = bool(
+            math.isfinite(final_lateral_rss_margin)
+            and final_lateral_rss_margin >= cfg.lateral_rss_terminal_safe_threshold
+        )
+        terminal_lateral_safe = bool(evaluation.get("terminal_lateral_separation_safe", False))
+        lateral_hard_safe = bool(lateral_rss_safe or terminal_lateral_safe)
+        lateral_margin_improved = bool(
+            evaluation.get("lateral_escape_lateral_margin_improved", False)
+            or float(evaluation.get("lateral_rss_improvement", 0.0)) >= cfg.lateral_escape_min_lateral_margin_improvement
+        )
+        path_overlap_reduced = bool(
+            evaluation.get("lateral_escape_path_overlap_reduced", False)
+            or evaluation.get("path_overlap_reduced", False)
+            or evaluation.get("first_step_path_overlap_reduces", False)
+        )
+        lateral_safe_or_improving = bool(lateral_rss_safe or lateral_margin_improved)
+        catastrophic_side_conflict = bool(
+            math.isfinite(min_lateral_rss_margin)
+            and min_lateral_rss_margin < cfg.predictive_catastrophic_lateral_margin
+            and not (lateral_margin_improved or path_overlap_reduced)
+        )
+
+        terminal_reason = str(evaluation.get("terminal_recovery_reason", ""))
+        terminal_deconflicted = bool(evaluation.get("terminal_deconflicted", False))
+        front_object_deconflicted = bool(terminal_deconflicted or not evaluation.get("blocking_object_final", True))
+        handoff_reasons = {
+            "handoff_to_rl_safe",
+            "terminal_speed_recovered",
+            "rss_margin_maintained_large_buffer",
+            "progress_recovered",
+            "rss_margin_improved",
+            "mpc_feasible_rss_sequence",
+        }
+        minimum_risk_condition = bool(
+            str(evaluation.get("corridor_type", "")) == "minimum_risk_stop"
+            and float(evaluation.get("final_speed", math.inf)) <= max(cfg.stuck_speed_threshold, 0.5)
+        )
+        predictive_terminal_recoverable = bool(
+            evaluation.get("terminal_recoverable", False)
+            or path_overlap_reduced
+            or terminal_lateral_safe
+            or lateral_margin_improved
+            or front_object_deconflicted
+            or terminal_reason in handoff_reasons
+            or minimum_risk_condition
+        )
+        if predictive_terminal_recoverable and not bool(evaluation.get("terminal_recoverable", False)):
+            if path_overlap_reduced:
+                terminal_reason = "path_overlap_reduced"
+            elif terminal_lateral_safe:
+                terminal_reason = "terminal_lateral_separation_safe"
+            elif lateral_margin_improved:
+                terminal_reason = "lateral_rss_margin_improved"
+            elif front_object_deconflicted:
+                terminal_reason = "front_object_deconflicted"
+            elif minimum_risk_condition:
+                terminal_reason = "minimum_risk_condition"
+
+        min_acc = float(cfg.lateral_escape_min_acc)
+        max_acc = float(cfg.lateral_escape_max_acc)
+        small_positive_acc = bool(first_acc > 0.0 and min_acc <= first_acc <= max_acc + self.config.small_tolerance)
+        steer_threshold = cfg.nudge_steer * cfg.nudge_steer_ratio_threshold
+        escape_side_steer = bool(
+            abs(first_steer) >= steer_threshold
+            and (
+                (category == "right" and first_steer < -self.config.small_tolerance)
+                or (category == "left" and first_steer > self.config.small_tolerance)
+            )
+        )
+
+        hard_constraints_safe = bool(
+            action_bounds_safe
+            and no_immediate_collision
+            and road_boundary_safe
+            and lateral_hard_safe
+            and not catastrophic_side_conflict
+        )
+        acceleration_too_aggressive = bool(is_lateral_escape and first_acc > max_acc + self.config.small_tolerance)
+        recovery_certified = bool(
+            is_lateral_escape
+            and category in ("left", "right")
+            and hard_constraints_safe
+            and small_positive_acc
+            and escape_side_steer
+            and (lateral_margin_improved or terminal_lateral_safe)
+            and path_overlap_reduced
+            and predictive_terminal_recoverable
+        )
+        certified_lateral_recovery = recovery_certified
+        predictive_candidate_certified = recovery_certified
+
+        conservative_margin = float(evaluation.get("rss_margin_min_pred", math.inf))
+        one_step_margin = float(evaluation.get("first_step_rss_margin_pred", conservative_margin))
+        conservative_slack = 0.0
+        if math.isfinite(conservative_margin):
+            conservative_slack = max(0.0, float(cfg.safety_margin_tolerance) - conservative_margin)
+        one_step_cbf_slack = 0.0
+        if math.isfinite(one_step_margin):
+            one_step_cbf_slack = max(0.0, float(cfg.lateral_escape_critical_longitudinal_margin) - one_step_margin)
+        slack_penalty = (
+            cfg.predictive_longitudinal_slack_weight * conservative_slack * conservative_slack
+            + cfg.predictive_cbf_slack_weight * one_step_cbf_slack * one_step_cbf_slack
+        )
+        soft_longitudinal_slack = conservative_slack + one_step_cbf_slack
+        total_cost = float(evaluation.get("cost", 0.0)) + float(slack_penalty)
+
+        reject_reason = ""
+        if not action_bounds_safe:
+            reject_reason = "action_out_of_bounds"
+        elif not no_immediate_collision:
+            reject_reason = "immediate_collision_risk"
+        elif not road_boundary_safe:
+            reject_reason = "road_boundary_violation"
+        elif catastrophic_side_conflict:
+            reject_reason = "catastrophic_lateral_rss_violation"
+        elif not lateral_hard_safe:
+            reject_reason = "lateral_rss_unsafe"
+        elif is_lateral_escape and first_acc <= 0.0:
+            reject_reason = "invalid_lateral_escape_no_creep"
+        elif acceleration_too_aggressive:
+            reject_reason = "lateral_escape_acc_too_aggressive"
+        elif is_lateral_escape and not escape_side_steer:
+            reject_reason = "lateral_escape_wrong_steer_direction"
+        elif is_lateral_escape and not (lateral_margin_improved or terminal_lateral_safe):
+            reject_reason = "lateral_escape_lateral_rss_unsafe"
+        elif is_lateral_escape and not path_overlap_reduced:
+            reject_reason = "lateral_escape_path_overlap_not_reduced"
+        elif not predictive_terminal_recoverable:
+            reject_reason = "terminal_not_recoverable"
+        elif not predictive_candidate_certified:
+            reject_reason = "no_recovery_certified_candidate"
+
+        result = {
+            "cost": total_cost,
+            "total_cost": total_cost,
+            "predictive_filter_used": True,
+            "hard_safe": hard_constraints_safe,
+            "recovery_certified": recovery_certified,
+            "soft_longitudinal_slack": soft_longitudinal_slack,
+            "emergency_veto": False,
+            "predictive_candidate_certified": predictive_candidate_certified,
+            "certified_lateral_recovery": certified_lateral_recovery,
+            "predictive_reject_reason": reject_reason,
+            "predictive_hard_safe": hard_constraints_safe,
+            "predictive_total_cost": total_cost,
+            "predictive_action_bounds_safe": action_bounds_safe,
+            "predictive_no_immediate_collision": no_immediate_collision,
+            "predictive_road_boundary_safe": road_boundary_safe,
+            "predictive_lateral_hard_safe": lateral_hard_safe,
+            "predictive_lateral_rss_safe_or_improving": lateral_safe_or_improving,
+            "predictive_catastrophic_side_conflict": catastrophic_side_conflict,
+            "predictive_terminal_recoverable": predictive_terminal_recoverable,
+            "predictive_terminal_recovery_reason": terminal_reason,
+            "predictive_longitudinal_soft_slack": conservative_slack,
+            "predictive_one_step_cbf_slack": one_step_cbf_slack,
+            "predictive_soft_longitudinal_slack": soft_longitudinal_slack,
+            "predictive_longitudinal_slack_penalty": float(slack_penalty),
+            "predictive_current_front_gap": current_front_gap,
+            "predictive_first_step_front_gap": next_front_gap,
+            "terminal_recoverable": predictive_terminal_recoverable,
+            "terminal_recovery_reason": terminal_reason,
+            "lateral_escape_terminal_recoverable": (
+                predictive_terminal_recoverable if is_lateral_escape else evaluation.get("lateral_escape_terminal_recoverable", False)
+            ),
+            "lateral_escape_terminal_reason": (
+                terminal_reason if is_lateral_escape else evaluation.get("lateral_escape_terminal_reason", "")
+            ),
+            "lateral_escape_no_immediate_collision_risk": no_immediate_collision,
+            "lateral_escape_steer_toward_escape": escape_side_steer if is_lateral_escape else False,
+        }
+        if certified_lateral_recovery:
+            reason = "{}_predictive_lateral_recovery".format(category)
+            result.update({
+                "lateral_certified_gate": True,
+                "lateral_escape_certified": True,
+                "lateral_escape_certification_reason": reason,
+                "lateral_escape_reject_reason": "",
+                "first_step_recovery_feasible": True,
+                "first_step_recovery_reason": "predictive_lateral_recovery_certified",
+                "lateral_escape_rejected_by_conservative_gate": False,
+                "lateral_escape_rejected_by_critical_margin": False,
+                "lateral_escape_used_relaxed_longitudinal_gate": bool(
+                    not bool(evaluation.get("rss_feasible", False))
+                    or not bool(evaluation.get("conservative_longitudinal_margin_safe", False))
+                    or not bool(evaluation.get("critical_longitudinal_margin_safe", False))
+                ),
+                "longitudinal_constraint_relaxed_by_lateral_escape": bool(
+                    not bool(evaluation.get("rss_feasible", False))
+                    or not bool(evaluation.get("conservative_longitudinal_margin_safe", False))
+                    or not bool(evaluation.get("critical_longitudinal_margin_safe", False))
+                ),
+            })
+        elif is_lateral_escape and reject_reason:
+            result.update({
+                "lateral_escape_certified": False,
+                "lateral_certified_gate": False,
+                "lateral_escape_reject_reason": reject_reason,
+                "lateral_escape_rejected_by_critical_margin": False,
+            })
+        return result
+
+    def _evaluate_emergency_guarded_first_action(self, state: State, evaluation: Dict[str, Any]) -> Dict[str, Any]:
+        """Final deadlock guard: only emergency veto, no one-step RSS-CBF projection."""
+        u_mpc = self._clip_action(evaluation["sequence"][0])
+        action_bounds_safe = bool(evaluation.get("predictive_action_bounds_safe", True))
+        no_immediate_collision = bool(evaluation.get("predictive_no_immediate_collision", False))
+        road_boundary_safe = bool(evaluation.get("predictive_road_boundary_safe", evaluation.get("road_boundary_safe", False)))
+        catastrophic_side_conflict = bool(evaluation.get("predictive_catastrophic_side_conflict", False))
+        guard_reject_reason = ""
+        if not action_bounds_safe:
+            guard_reject_reason = "action_out_of_bounds"
+        elif not no_immediate_collision:
+            guard_reject_reason = "immediate_collision_risk"
+        elif not road_boundary_safe:
+            guard_reject_reason = "road_boundary_violation"
+        elif catastrophic_side_conflict:
+            guard_reject_reason = "catastrophic_lateral_rss_violation"
+
+        guard_safe = not guard_reject_reason
+        emergency_veto = bool(not guard_safe)
+        mpc_acc = float(u_mpc[0])
+        mpc_steer = float(u_mpc[1])
+        throttle = max(0.0, mpc_acc / max(self.config.max_acc, 1e-6))
+        brake = max(0.0, -mpc_acc / max(abs(self.config.min_acc), 1e-6))
+        candidate_category = self._family_category(str(evaluation.get("recovery_candidate_family", "")))
+        certified_lateral_escape_used = bool(
+            guard_safe
+            and candidate_category in ("left", "right")
+            and evaluation.get("certified_lateral_recovery", False)
+        )
+        guard_info = {
+            "mode": "predictive_emergency_guard",
+            "reason": "emergency_guard_pass" if guard_safe else guard_reject_reason,
+            "action_delta": 0.0,
+            "acc_safe": mpc_acc,
+            "steer_safe": mpc_steer,
+        }
+        return {
+            "guard_safe": bool(guard_safe),
+            "guard_cost": 0.0,
+            "hard_safe": bool(evaluation.get("hard_safe", False)),
+            "recovery_certified": bool(evaluation.get("recovery_certified", False)),
+            "emergency_veto": emergency_veto,
+            "total_cost": float(evaluation.get("total_cost", evaluation.get("cost", 0.0))),
+            "u_mpc_first": u_mpc,
+            "u_guarded_first": u_mpc,
+            "guard_info": guard_info,
+            "cbf_guard_used": False,
+            "cbf_guard_delta": 0.0,
+            "cbf_guard_override_used": False,
+            "cbf_guard_override_reason": "",
+            "certified_recovery_override_used": False,
+            "certified_recovery_override_reason": "",
+            "certified_lateral_escape_used": certified_lateral_escape_used,
+            "certified_lateral_escape_side": candidate_category if certified_lateral_escape_used else "",
+            "certified_lateral_escape_reason": (
+                evaluation.get("lateral_escape_certification_reason", "")
+                if certified_lateral_escape_used
+                else ""
+            ),
+            "lateral_escape_guard_pass_through": bool(certified_lateral_escape_used),
+            "lateral_escape_guard_reject_reason": guard_reject_reason,
+            "guard_rejected_lateral_escape": bool(
+                not guard_safe and candidate_category in ("left", "right")
+            ),
+            "guard_reject_reason": guard_reject_reason,
+            "mpc_action_before_guard": [mpc_acc, mpc_steer],
+            "action_after_guard": [mpc_acc, mpc_steer],
+            "selected_throttle_before_guard": float(throttle),
+            "selected_throttle_after_guard": float(throttle),
+            "selected_brake_before_guard": float(brake),
+            "selected_brake_after_guard": float(brake),
+            "only_steering_no_creep": bool(candidate_category in ("left", "right") and abs(mpc_steer) > 0.05 and mpc_acc <= 0.0),
+            "lateral_escape_throttle_suppressed_guard": False,
+            "creep_suppression_reason_guard": "",
+            "emergency_guard_used": True,
+            "emergency_guard_reject_reason": guard_reject_reason,
         }
 
     def _guard_override_for_certified_recovery(
@@ -3451,6 +4625,10 @@ class RSSMPCFilter(RSSCBFFilter):
         if mode not in self.FORMAL_MODES:
             mode = "rss_mpc_intervention"
 
+        ego = self._ego(state)
+        road_boundary_margin_current = self._current_road_boundary_margin(state)
+        road_boundary_margin_source = self._road_boundary_margin_source_for_state(state)
+
         info = {
             "mode": mode,
             "reason": reason,
@@ -3487,6 +4665,22 @@ class RSSMPCFilter(RSSCBFFilter):
             "obstacle_detected": bool(obstacle_detected),
             "left_feasible": False,
             "right_feasible": False,
+            "road_boundary_margin_current": float(road_boundary_margin_current),
+            "road_boundary_margin_source": road_boundary_margin_source,
+            "ego_dist_to_left_side": self._safe_float(ego.get("dist_to_left_side", math.nan), math.nan),
+            "ego_dist_to_right_side": self._safe_float(ego.get("dist_to_right_side", math.nan), math.nan),
+            "ego_on_lane": bool(ego.get("on_lane", True)),
+            "ego_out_of_route": bool(ego.get("out_of_route", False)),
+            "ego_crash_sidewalk": bool(ego.get("crash_sidewalk", False)),
+            "ego_on_yellow_continuous_line": bool(ego.get("on_yellow_continuous_line", False)),
+            "ego_on_white_continuous_line": bool(ego.get("on_white_continuous_line", False)),
+            "ego_on_broken_line": bool(ego.get("on_broken_line", False)),
+            "ego_left_lane_line_type": str(ego.get("left_lane_line_type", "")),
+            "ego_right_lane_line_type": str(ego.get("right_lane_line_type", "")),
+            "ego_left_lane_line_color": str(ego.get("left_lane_line_color", "")),
+            "ego_right_lane_line_color": str(ego.get("right_lane_line_color", "")),
+            "ego_left_lane_line_prohibited": bool(ego.get("left_lane_line_prohibited", False)),
+            "ego_right_lane_line_prohibited": bool(ego.get("right_lane_line_prohibited", False)),
             "state_debug": self._state_debug(state),
             "blocking_object": self._object_debug(obj, state) if obj is not None else {},
         }
@@ -3495,7 +4689,32 @@ class RSSMPCFilter(RSSCBFFilter):
                 "selective_mpc_enabled": True,
                 "mpc_called": False,
                 "mpc_call_reason": "",
+                "mpc_trigger_policy": "deadlock_or_projected_road_boundary_risk",
+                "mpc_trigger_conditions": "",
+                "mpc_trigger_blockers": "",
+                "mpc_trigger_front_exists": False,
+                "mpc_trigger_front_object_kind": "",
+                "mpc_trigger_cbf_mode": "",
+                "mpc_trigger_cbf_delta": math.nan,
+                "mpc_trigger_boundary_risk": False,
+                "mpc_trigger_boundary_margin": math.nan,
+                "mpc_trigger_boundary_margin_source": "",
+                "mpc_trigger_boundary_min_pred": math.nan,
+                "mpc_trigger_boundary_final_pred": math.nan,
+                "road_boundary_projected_risk": False,
+                "road_boundary_current_violation": False,
+                "road_boundary_nominal_margin_current": math.nan,
+                "road_boundary_nominal_margin_min_pred": math.nan,
+                "road_boundary_nominal_margin_final_pred": math.nan,
+                "road_boundary_prediction_horizon_steps": 0,
+                "road_boundary_trigger_margin_dynamic": math.nan,
+                "mpc_trigger_yellow_line": False,
+                "mpc_trigger_white_line": False,
+                "mpc_trigger_on_lane": True,
+                "mpc_trigger_crash_sidewalk": False,
+                "mpc_trigger_out_of_route": False,
                 "deadlock_risk": False,
+                "brake_only_risk": False,
                 "deadlock_score": 0.0,
                 "deadlock_counter": self.deadlock_counter,
                 "deadlock_window_progress": 0.0,
@@ -3513,6 +4732,14 @@ class RSSMPCFilter(RSSCBFFilter):
                 "mpc_guard_rejected": 0,
                 "cbf_guard_override_used": False,
                 "cbf_guard_override_reason": "",
+                "road_boundary_guard_used": False,
+                "road_boundary_guard_reason": "",
+                "road_boundary_guard_side": "",
+                "road_boundary_guard_acc": math.nan,
+                "road_boundary_guard_steer": math.nan,
+                "road_boundary_recovery_hold_active": False,
+                "road_boundary_recovery_hold_ttl": 0,
+                "road_boundary_route_endpoint_margin_enabled": bool(self.mpc_config.road_boundary_use_route_endpoint_margin),
                 "certified_recovery_override_used": False,
                 "certified_recovery_override_reason": "",
                 "guard_reject_reason": "",
@@ -3544,6 +4771,8 @@ class RSSMPCFilter(RSSCBFFilter):
                 "no_forward_corridor": True,
                 "no_recenter_corridor": True,
                 "road_boundary_active": False,
+                "road_boundary_mpc_used": False,
+                "road_boundary_mpc_no_safe_candidate": False,
                 "corridor_target_lateral_offset": math.nan,
                 "corridor_target_speed": math.nan,
                 "corridor_cost": math.nan,
@@ -3598,12 +4827,52 @@ class RSSMPCFilter(RSSCBFFilter):
                 "terminal_lateral_separation_safe": False,
                 "terminal_lateral_deconflicted": False,
                 "road_boundary_safe": False,
+                "road_boundary_margin_min_pred": math.nan,
+                "road_boundary_margin_final_pred": math.nan,
+                "road_boundary_margin_improvement": math.nan,
+                "road_boundary_hard_margin": math.nan,
+                "road_boundary_target_margin": math.nan,
+                "road_boundary_high_speed_margin": math.nan,
+                "road_boundary_high_speed_requires_brake": False,
+                "road_boundary_nearest_side": "",
+                "road_boundary_steer_toward_boundary": False,
+                "road_boundary_away_steer_required": False,
+                "road_boundary_away_steer_safe": False,
+                "road_boundary_away_progress_recoverable": False,
+                "road_boundary_low_speed_recovery": False,
                 "immediate_longitudinal_margin_safe": False,
                 "conservative_longitudinal_margin_safe": False,
                 "critical_longitudinal_margin_safe": False,
                 "is_lateral_escape": False,
                 "rss_feasible": False,
                 "lateral_certified_gate": False,
+                "predictive_filter_used": False,
+                "hard_safe": False,
+                "soft_longitudinal_slack": math.nan,
+                "recovery_certified": False,
+                "emergency_veto": False,
+                "total_cost": math.nan,
+                "predictive_candidate_certified": False,
+                "certified_lateral_recovery": False,
+                "predictive_reject_reason": "",
+                "predictive_hard_safe": False,
+                "predictive_total_cost": math.nan,
+                "predictive_action_bounds_safe": False,
+                "predictive_no_immediate_collision": False,
+                "predictive_road_boundary_safe": False,
+                "predictive_lateral_hard_safe": False,
+                "predictive_lateral_rss_safe_or_improving": False,
+                "predictive_catastrophic_side_conflict": False,
+                "predictive_terminal_recoverable": False,
+                "predictive_terminal_recovery_reason": "",
+                "predictive_longitudinal_soft_slack": math.nan,
+                "predictive_one_step_cbf_slack": math.nan,
+                "predictive_soft_longitudinal_slack": math.nan,
+                "predictive_longitudinal_slack_penalty": math.nan,
+                "predictive_current_front_gap": math.nan,
+                "predictive_first_step_front_gap": math.nan,
+                "emergency_guard_used": False,
+                "emergency_guard_reject_reason": "",
                 "lateral_rss_improvement": 0.0,
                 "initial_path_overlap": False,
                 "final_path_overlap": False,

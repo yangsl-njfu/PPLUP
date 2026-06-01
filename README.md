@@ -190,46 +190,67 @@ observation_lidar_distance
 
 这样才能判断 static object 是否真的是车辆、障碍物、lidar fallback，还是车道/路面相关对象。
 
-## 修复方向
+## 当前修复方向
 
-不要大改 MPC，也不要重写 RSS-CBF。
-
-优先做最小修复：
-
-1. 先补齐 blocking object 诊断字段，确认 static object 来源。
-2. 如果 static object 是误检，例如 lidar fallback 或车道/路面对象，应修 static object 过滤/分类。
-3. 如果 static object 是真实 blocker，但 lateral escape 已满足：
+现在不再继续修补旧的：
 
 ```text
-road_boundary_safe = True
-lateral_escape_terminal_recoverable = True
-lateral_escape_lateral_rss_safe = True
-lateral_escape_path_overlap_reduced = True
-first_acc > 0
-first_acc <= lateral_escape_max_acc
+RSS-CBF shield -> MPC recovery -> final RSS-CBF veto
 ```
 
-则应考虑让 certified low-speed lateral creep 使用更合理的 gate，而不是被 `critical_longitudinal_margin_safe=False` 一票否决。
+因为这个结构的根本问题是：MPC 给出 horizon-level lateral recovery，但 final RSS-CBF / lateral gate 仍会用 one-step longitudinal RSS/CBF 判据裁掉小正加速度，最后变成 `steer + brake`。
 
-修复目标是：
-
-当 lateral escape 被证明道路安全、横向安全、终端可恢复，并且第一步是受限的小正加速度时，系统不应继续输出：
+新的 deadlock recovery 分支改为：
 
 ```text
-escape-side steering + brake / zero throttle
+MPC 内部评估 RSS/CBF constraints
+-> 选择 certified recovery action
+-> final guard 只做 emergency veto
 ```
 
-而应输出：
+normal 路径仍保持不变：
+
+1. RL action safe：直接执行 RL action。
+2. RL action unsafe 但不是 deadlock-risk：走现有 RSS-CBF。
+3. deadlock-risk / brake-only-risk：进入 Predictive RSS-CBF-MPC。
+
+在 Predictive RSS-CBF-MPC 中：
+
+- immediate collision、road boundary、action bounds、catastrophic lateral conflict 是硬约束。
+- conservative longitudinal RSS margin 和 one-step longitudinal CBF margin 不再一票否决，而是作为 soft constraint 进入代价，并附加大惩罚。
+- lateral recovery 只要满足小正加速度、escape-side steering、道路安全、无立即碰撞、横向 RSS 安全或改善、path overlap 减少、终端可恢复，就可以被认证。
+- final guard 对 certified lateral recovery 不能再把 `positive acc + escape-side steer` 改成 `brake/zero acc + escape-side steer`。
+- final guard 只允许因 immediate collision、road boundary violation、catastrophic lateral RSS violation、action out of bound 做 emergency veto。
+
+deadlock-risk 分支中的 MPC candidate 统一输出：
+
+```text
+hard_safe
+soft_longitudinal_slack
+recovery_certified
+emergency_veto
+total_cost
+```
+
+其中 `hard_safe` 只包含立即碰撞、道路边界、横向 RSS/终端横向安全、灾难性侧向冲突、动作边界。纵向 RSS/CBF margin 不再进入 hard reject，只进入 `soft_longitudinal_slack` 和 cost penalty。
+
+修复后的目标输出是：
 
 ```text
 small positive acc/throttle + escape-side steering
 ```
 
+而不是：
+
+```text
+escape-side steering + brake / zero throttle
+```
+
 如果最终仍然 brake，CSV 必须能明确说明原因是：
 
-- critical margin unsafe
-- road unsafe
-- lateral_certified_gate failed
-- terminal not recoverable
-- first step rejected
-- final guard rejected
+- no_recovery_certified_candidate
+- emergency_veto
+- immediate_collision_risk
+- road_boundary_violation
+- catastrophic_lateral_rss_violation
+- action_out_of_bounds
