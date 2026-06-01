@@ -1027,6 +1027,9 @@ class StaticRSSFilter:
         rollout_state = state
         left_margins: List[float] = []
         right_margins: List[float] = []
+        lateral_positions: List[float] = []
+        lower_limit = -math.inf
+        upper_limit = math.inf
         min_margin = math.inf
         final_margin = math.inf
         source = ""
@@ -1041,6 +1044,9 @@ class StaticRSSFilter:
             source = str(metrics.get("source", source))
             left_margins.append(left_margin)
             right_margins.append(right_margin)
+            lateral_positions.append(float(metrics["lateral"]))
+            lower_limit = float(metrics["lower"])
+            upper_limit = float(metrics["upper"])
             min_margin = min(min_margin, boundary_margin)
             final_margin = boundary_margin
 
@@ -1053,6 +1059,11 @@ class StaticRSSFilter:
         left_min = min(left_margins) if left_margins else math.inf
         right_min = min(right_margins) if right_margins else math.inf
         current_margin = min(left_margins[0], right_margins[0]) if left_margins and right_margins else math.inf
+        current_lateral = lateral_positions[0] if lateral_positions else 0.0
+        final_lateral = lateral_positions[-1] if lateral_positions else current_lateral
+        center_lateral = 0.5 * (lower_limit + upper_limit)
+        current_center_error = abs(current_lateral - center_lateral)
+        final_center_error = abs(final_lateral - center_lateral)
         road_safe = (
             min_margin >= -self.config.small_tolerance
             and not hard_violation
@@ -1061,6 +1072,9 @@ class StaticRSSFilter:
             "road_boundary_safe": bool(road_safe),
             "left_boundary_safe": bool(left_min >= -self.config.small_tolerance),
             "right_boundary_safe": bool(right_min >= -self.config.small_tolerance),
+            "left_boundary_margin": float(left_min),
+            "right_boundary_margin": float(right_min),
+            "min_boundary_margin": float(min_margin),
             "road_boundary_margin_current": float(current_margin),
             "road_boundary_margin_min_pred": float(min_margin),
             "road_boundary_margin_final_pred": float(final_margin),
@@ -1070,6 +1084,15 @@ class StaticRSSFilter:
             "road_boundary_hard_violation": bool(hard_violation),
             "road_boundary_left_margin_min_pred": float(left_min),
             "road_boundary_right_margin_min_pred": float(right_min),
+            "road_boundary_left_margin_current": float(left_margins[0]) if left_margins else math.inf,
+            "road_boundary_right_margin_current": float(right_margins[0]) if right_margins else math.inf,
+            "road_boundary_left_margin_final_pred": float(left_margins[-1]) if left_margins else math.inf,
+            "road_boundary_right_margin_final_pred": float(right_margins[-1]) if right_margins else math.inf,
+            "predicted_lateral_position": float(final_lateral),
+            "predicted_lane_offset": float(final_lateral),
+            "road_boundary_current_lateral_position": float(current_lateral),
+            "road_boundary_center_lateral": float(center_lateral),
+            "road_boundary_centering_improvement": float(current_center_error - final_center_error),
             "ego_dist_to_left_side": self._safe_float(ego.get("dist_to_left_side", math.nan), math.nan),
             "ego_dist_to_right_side": self._safe_float(ego.get("dist_to_right_side", math.nan), math.nan),
             "ego_on_lane": bool(ego.get("on_lane", True)),

@@ -445,9 +445,75 @@ class StaticRSSFilterTest(unittest.TestCase):
         u_safe, info = rss_cbf_filter.filter_action(state, [1.0, 0.0])
 
         self.assertFalse(info["road_boundary_safe"])
-        self.assertEqual(info["safety_function_mode"], "rss_2d_cbf")
+        self.assertEqual(info["safety_function_mode"], "unified_safety_object_2d_cbf")
         self.assertNotEqual(info["mode"], "normal")
-        self.assertLessEqual(u_safe[0], 0.0)
+        self.assertLess(info["nominal_H"], 0.0)
+        self.assertEqual(info["worst_object_type"], "road_boundary")
+        self.assertLess(u_safe[1], 0.0)
+        self.assertGreaterEqual(u_safe[0], rss_cbf_filter.config.rss_2d_min_speed_preserve_acc)
+        self.assertGreater(info["selected_final_boundary_margin"], info["road_boundary_margin_current"])
+
+    def test_2d_rss_cbf_near_boundary_searches_steer_before_braking(self):
+        rss_cbf_filter = RSSCBFFilter(
+            RSSCBFConfig(enable_2d_rss_cbf=True, rss_2d_boundary_margin_threshold=0.5)
+        )
+        state = make_state(with_obstacle=False)
+        state["ego"]["dist_to_left_side"] = 0.6
+        state["ego"]["dist_to_right_side"] = 5.0
+
+        u_safe, info = rss_cbf_filter.filter_action(state, [1.0, 0.0])
+
+        self.assertLess(info["nominal_H"], 0.0)
+        self.assertEqual(info["reason"], "selected_least_unsafe")
+        self.assertEqual(info["worst_object_type"], "road_boundary")
+        self.assertLess(u_safe[1], 0.0)
+        self.assertGreaterEqual(u_safe[0], rss_cbf_filter.config.rss_2d_min_speed_preserve_acc)
+        self.assertGreater(info["selected_final_boundary_margin"], info["road_boundary_margin_current"])
+
+    def test_2d_rss_cbf_nominal_lazy_safe_skips_candidate_search(self):
+        rss_cbf_filter = RSSCBFFilter(RSSCBFConfig(enable_2d_rss_cbf=True))
+        state = make_state(with_obstacle=False)
+        state["ego"]["dist_to_left_side"] = 5.0
+        state["ego"]["dist_to_right_side"] = 5.0
+
+        u_safe, info = rss_cbf_filter.filter_action(state, [0.2, 0.05])
+
+        self.assertEqual(u_safe, [0.2, 0.05])
+        self.assertEqual(info["mode"], "normal")
+        self.assertEqual(info["reason"], "nominal_lazy_safe")
+        self.assertEqual(info["candidate_count"], 0)
+        self.assertEqual(info["safety_object_count_total"], 0)
+        self.assertEqual(info["safety_object_count_local"], 0)
+        self.assertEqual(info["horizon_steps"], rss_cbf_filter.config.prediction_horizon_steps)
+        self.assertIn("total_filter_time", info)
+
+    def test_2d_rss_cbf_spatial_filter_skips_far_objects(self):
+        rss_cbf_filter = RSSCBFFilter(
+            RSSCBFConfig(
+                enable_2d_rss_cbf=True,
+                max_check_distance=20.0,
+                broad_phase_radius=20.0,
+            )
+        )
+        state = make_state(with_obstacle=False)
+        state["ego"]["dist_to_left_side"] = 5.0
+        state["ego"]["dist_to_right_side"] = 5.0
+        state["static_obstacles"].append(
+            {
+                "x": 100.0,
+                "y": 0.0,
+                "length": 4.5,
+                "width": 2.0,
+                "heading": 0.0,
+                "object_id": "far_static",
+            }
+        )
+
+        _, info = rss_cbf_filter.filter_action(state, [0.2, 0.0])
+
+        self.assertEqual(info["safety_object_count_total"], 1)
+        self.assertEqual(info["safety_object_count_local"], 0)
+        self.assertEqual(info["candidate_count"], 0)
 
 
 if __name__ == "__main__":
