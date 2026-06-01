@@ -332,7 +332,7 @@ class StaticRSSFilterTest(unittest.TestCase):
         self.assertEqual(state["vehicles"][0]["object_id"], "moving")
 
     def test_rss_cbf_filter_uses_formal_modes_and_preserves_steer(self):
-        rss_cbf_filter = RSSCBFFilter(RSSCBFConfig())
+        rss_cbf_filter = RSSCBFFilter(RSSCBFConfig(enable_2d_rss_cbf=False))
         state = make_state(with_obstacle=False, left_available=True, right_available=False)
         state["vehicles"] = [
             {
@@ -363,6 +363,91 @@ class StaticRSSFilterTest(unittest.TestCase):
             "reason",
         ]:
             self.assertIn(key, info)
+
+    def test_2d_rss_cbf_same_lane_front_vehicle_is_longitudinally_unsafe(self):
+        rss_cbf_filter = RSSCBFFilter(RSSCBFConfig(enable_2d_rss_cbf=True))
+        state = make_state(with_obstacle=False)
+        front_vehicle = {
+            "x": 8.0,
+            "y": 0.0,
+            "heading": 0.0,
+            "speed": 1.0,
+            "length": 4.5,
+            "width": 2.0,
+            "lane_id": "center",
+            "object_type": "vehicle",
+            "object_id": "same_lane_front",
+        }
+
+        margin = rss_cbf_filter.compute_2d_rss_cbf_margin(state, front_vehicle, "dynamic")
+
+        self.assertEqual(margin["relation"], "front")
+        self.assertLess(margin["h_2d"], 0.0)
+        self.assertEqual(margin["lat_clearance"], 0.0)
+
+    def test_2d_rss_cbf_adjacent_parallel_vehicle_is_laterally_safe(self):
+        rss_cbf_filter = RSSCBFFilter(
+            RSSCBFConfig(enable_2d_rss_cbf=True, rss_2d_lateral_margin=0.5)
+        )
+        state = make_state(with_obstacle=False)
+        adjacent_vehicle = {
+            "x": 0.0,
+            "y": 3.7,
+            "heading": 0.0,
+            "speed": 8.0,
+            "length": 4.5,
+            "width": 2.0,
+            "lane_id": "left",
+            "object_type": "vehicle",
+            "object_id": "adjacent_parallel",
+        }
+
+        margin = rss_cbf_filter.compute_2d_rss_cbf_margin(state, adjacent_vehicle, "dynamic")
+
+        self.assertEqual(margin["relation"], "side")
+        self.assertGreater(margin["lat_clearance"], margin["d_l_safe"])
+        self.assertGreaterEqual(margin["h_2d"], 0.0)
+
+    def test_2d_rss_cbf_diagonal_vehicle_uses_both_axes(self):
+        rss_cbf_filter = RSSCBFFilter(
+            RSSCBFConfig(enable_2d_rss_cbf=True, rss_2d_lateral_margin=0.5, rss_2d_power=4.0)
+        )
+        state = make_state(with_obstacle=False)
+        diagonal_vehicle = {
+            "x": 14.0,
+            "y": 2.25,
+            "heading": 0.0,
+            "speed": 3.0,
+            "length": 4.5,
+            "width": 2.0,
+            "lane_id": "left",
+            "object_type": "vehicle",
+            "object_id": "diagonal",
+        }
+
+        margin = rss_cbf_filter.compute_2d_rss_cbf_margin(state, diagonal_vehicle, "dynamic")
+        expected = (
+            (margin["long_clearance"] / max(margin["d_s_safe"], rss_cbf_filter.config.rss_2d_eps)) ** 4
+            + (margin["lat_clearance"] / max(margin["d_l_safe"], rss_cbf_filter.config.rss_2d_eps)) ** 4
+            - 1.0
+        )
+
+        self.assertGreater(margin["long_clearance"], 0.0)
+        self.assertGreater(margin["lat_clearance"], 0.0)
+        self.assertAlmostEqual(margin["h_2d"], expected)
+
+    def test_2d_rss_cbf_road_boundary_rejects_otherwise_safe_nominal(self):
+        rss_cbf_filter = RSSCBFFilter(RSSCBFConfig(enable_2d_rss_cbf=True))
+        state = make_state(with_obstacle=False)
+        state["ego"]["dist_to_left_side"] = 0.2
+        state["ego"]["dist_to_right_side"] = 5.0
+
+        u_safe, info = rss_cbf_filter.filter_action(state, [1.0, 0.0])
+
+        self.assertFalse(info["road_boundary_safe"])
+        self.assertEqual(info["safety_function_mode"], "rss_2d_cbf")
+        self.assertNotEqual(info["mode"], "normal")
+        self.assertLessEqual(u_safe[0], 0.0)
 
 
 if __name__ == "__main__":

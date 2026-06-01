@@ -1015,6 +1015,121 @@ class StaticRSSFilter:
         }
         return safe, margins
 
+    def road_boundary_horizon_metrics(
+        self,
+        state: State,
+        action: Sequence[float],
+        steps: Optional[int] = None,
+        margin: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate lane/road boundary safety separately from object safety."""
+        horizon = self.config.horizon_steps if steps is None else int(steps)
+        rollout_state = state
+        left_margins: List[float] = []
+        right_margins: List[float] = []
+        min_margin = math.inf
+        final_margin = math.inf
+        source = ""
+
+        for step in range(max(0, horizon) + 1):
+            if step > 0:
+                rollout_state = self._simulate_next_state(rollout_state, action)
+            metrics = self._basic_road_boundary_margins_for_state(state, rollout_state, margin)
+            left_margin = float(metrics["left_margin"])
+            right_margin = float(metrics["right_margin"])
+            boundary_margin = float(metrics["margin"])
+            source = str(metrics.get("source", source))
+            left_margins.append(left_margin)
+            right_margins.append(right_margin)
+            min_margin = min(min_margin, boundary_margin)
+            final_margin = boundary_margin
+
+        ego = self._ego(state)
+        hard_violation = bool(
+            not bool(ego.get("on_lane", True))
+            or bool(ego.get("out_of_route", False))
+            or bool(ego.get("crash_sidewalk", False))
+        )
+        left_min = min(left_margins) if left_margins else math.inf
+        right_min = min(right_margins) if right_margins else math.inf
+        current_margin = min(left_margins[0], right_margins[0]) if left_margins and right_margins else math.inf
+        road_safe = (
+            min_margin >= -self.config.small_tolerance
+            and not hard_violation
+        )
+        return {
+            "road_boundary_safe": bool(road_safe),
+            "left_boundary_safe": bool(left_min >= -self.config.small_tolerance),
+            "right_boundary_safe": bool(right_min >= -self.config.small_tolerance),
+            "road_boundary_margin_current": float(current_margin),
+            "road_boundary_margin_min_pred": float(min_margin),
+            "road_boundary_margin_final_pred": float(final_margin),
+            "road_boundary_margin_improvement": float(final_margin - current_margin),
+            "road_boundary_margin_source": source,
+            "road_boundary_horizon_steps": int(max(0, horizon)),
+            "road_boundary_hard_violation": bool(hard_violation),
+            "road_boundary_left_margin_min_pred": float(left_min),
+            "road_boundary_right_margin_min_pred": float(right_min),
+            "ego_dist_to_left_side": self._safe_float(ego.get("dist_to_left_side", math.nan), math.nan),
+            "ego_dist_to_right_side": self._safe_float(ego.get("dist_to_right_side", math.nan), math.nan),
+            "ego_on_lane": bool(ego.get("on_lane", True)),
+            "ego_out_of_route": bool(ego.get("out_of_route", False)),
+            "ego_crash_sidewalk": bool(ego.get("crash_sidewalk", False)),
+        }
+
+    def _basic_road_boundary_margins_for_state(
+        self,
+        reference_state: State,
+        rollout_state: State,
+        margin: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        initial_ego = self._ego(reference_state)
+        _, lateral = self._relative_position(initial_ego, self._ego(rollout_state))
+        lower, upper, source = self._basic_road_boundary_limits_from_state(reference_state, margin)
+        left_margin = upper - lateral
+        right_margin = lateral - lower
+        return {
+            "left_margin": float(left_margin),
+            "right_margin": float(right_margin),
+            "margin": float(min(left_margin, right_margin)),
+            "lateral": float(lateral),
+            "lower": float(lower),
+            "upper": float(upper),
+            "source": source,
+        }
+
+    def _basic_road_boundary_limits_from_state(
+        self,
+        state: State,
+        margin: Optional[float] = None,
+    ) -> Tuple[float, float, str]:
+        margin_value = self.config.lane_margin if margin is None else float(margin)
+        ego = self._ego(state)
+        left_distance = self._safe_float(ego.get("dist_to_left_side", math.nan), math.nan)
+        right_distance = self._safe_float(ego.get("dist_to_right_side", math.nan), math.nan)
+        if math.isfinite(left_distance) and math.isfinite(right_distance) and left_distance + right_distance > 0.0:
+            return (
+                -right_distance + margin_value,
+                left_distance - margin_value,
+                "metadrive_side_distance",
+            )
+
+        current_width = self._current_lane_width(state)
+        lanes = state.get("lanes", {}) or {}
+        left_lane = lanes.get("left")
+        right_lane = lanes.get("right")
+        left_available = bool((left_lane or {}).get("available", False)) and not bool(
+            ego.get("left_lane_line_prohibited", False)
+        )
+        right_available = bool((right_lane or {}).get("available", False)) and not bool(
+            ego.get("right_lane_line_prohibited", False)
+        )
+        left_width = self._lane_available_width(state, left_lane) if left_available else 0.0
+        right_width = self._lane_available_width(state, right_lane) if right_available else 0.0
+        upper = current_width / 2.0 + left_width - margin_value
+        lower = -current_width / 2.0 - right_width + margin_value
+        return lower, upper, "lane_width_estimate"
+
     def _stop_margin(self, state: State, obstacle: Dict[str, Any]) -> float:
         d_obs = self._distance_to_obstacle_front(state, obstacle)
         return d_obs - self.compute_brake_distance(self._ego_speed(state))

@@ -114,6 +114,9 @@ def make_rss_cbf_step_record(
             np.linalg.norm(np.asarray(internal_action_safe) - np.asarray(internal_action_nominal)),
         )
     )
+    decision_mode = rss_info.get("mode", "unknown")
+    safety_function_mode = rss_info.get("safety_function_mode", rss_info.get("rss_cbf_variant", ""))
+    record_mode = safety_function_mode if method == "ppl_rss_cbf" and safety_function_mode else decision_mode
     return dict(
         ckpt_index=ckpt_index,
         method=method,
@@ -121,8 +124,33 @@ def make_rss_cbf_step_record(
         episode=episode,
         episode_in_env=episode_in_env,
         step=step_in_episode,
-        mode=rss_info.get("mode", "unknown"),
+        mode=record_mode,
+        decision_mode=decision_mode,
+        safety_function_mode=safety_function_mode,
+        rss_cbf_variant=rss_info.get("rss_cbf_variant", ""),
         reason=rss_info.get("reason", ""),
+        min_h_2d=rss_info.get("min_h_2d", np.nan),
+        current_h_2d=rss_info.get("current_h_2d", np.nan),
+        final_h_2d=rss_info.get("final_h_2d", np.nan),
+        nominal_min_h_2d=rss_info.get("nominal_min_h_2d", np.nan),
+        nominal_final_h_2d=rss_info.get("nominal_final_h_2d", np.nan),
+        worst_object_id=rss_info.get("worst_object_id", ""),
+        worst_object_type=rss_info.get("worst_object_type", ""),
+        worst_object_kind=rss_info.get("worst_object_kind", ""),
+        worst_object_relation=rss_info.get("worst_object_relation", ""),
+        worst_delta_s=rss_info.get("worst_delta_s", np.nan),
+        worst_delta_l=rss_info.get("worst_delta_l", np.nan),
+        worst_long_clearance=rss_info.get("worst_long_clearance", np.nan),
+        worst_lat_clearance=rss_info.get("worst_lat_clearance", np.nan),
+        worst_d_s_safe=rss_info.get("worst_d_s_safe", np.nan),
+        worst_d_l_safe=rss_info.get("worst_d_l_safe", np.nan),
+        selected_action=rss_info.get("selected_action", internal_action_safe),
+        nominal_action=rss_info.get("nominal_action", internal_action_nominal),
+        filter_intervened=rss_info.get("filter_intervened", action_delta > 1e-6),
+        candidate_reject_reasons=rss_info.get("candidate_reject_reasons", ""),
+        rss_2d_candidate_count=rss_info.get("candidate_count", np.nan),
+        rss_2d_safe_candidate_count=rss_info.get("safe_candidate_count", np.nan),
+        rss_2d_road_safe_candidate_count=rss_info.get("road_safe_candidate_count", np.nan),
         rss_margin=rss_info.get("rss_margin", np.nan),
         rss_margin_current=rss_info.get("rss_margin_current", rss_info.get("rss_margin", np.nan)),
         rss_margin_min_pred=rss_info.get("rss_margin_min_pred", np.nan),
@@ -499,6 +527,11 @@ def evaluate_ppl_once(
     rss_cbf=False,
     rss_mpc=False,
     rss_cbf_diagnostics=False,
+    enable_2d_rss_cbf=True,
+    rss_2d_power=None,
+    rss_2d_lateral_margin=None,
+    rss_2d_eps=None,
+    rss_2d_use_superellipse=True,
     eval_max_steps_per_episode=3000,
     eval_env_start=EVAL_ENV_START,
 ):
@@ -552,15 +585,34 @@ def evaluate_ppl_once(
     step_file_tag = ""
     save_runtime_step_csv = bool(rss_cbf or rss_mpc or rss_cbf_diagnostics)
     if rss_mpc:
-        rss_filter = RSSMPCFilter(RSSMPCConfig())
+        rss_config = RSSMPCConfig(enable_2d_rss_cbf=enable_2d_rss_cbf)
+        if rss_2d_power is not None:
+            rss_config.rss_2d_power = float(rss_2d_power)
+        if rss_2d_lateral_margin is not None:
+            rss_config.rss_2d_lateral_margin = float(rss_2d_lateral_margin)
+        if rss_2d_eps is not None:
+            rss_config.rss_2d_eps = float(rss_2d_eps)
+        rss_config.rss_2d_use_superellipse = bool(rss_2d_use_superellipse)
+        rss_filter = RSSMPCFilter(rss_config)
         runtime_label = "RSS-MPC"
         step_file_tag = "rss_mpc"
         print("[RSS-MPC] Runtime assurance enabled. Step diagnostics will be saved.")
     elif rss_cbf:
-        rss_filter = RSSCBFFilter(RSSCBFConfig())
+        rss_config = RSSCBFConfig(enable_2d_rss_cbf=enable_2d_rss_cbf)
+        if rss_2d_power is not None:
+            rss_config.rss_2d_power = float(rss_2d_power)
+        if rss_2d_lateral_margin is not None:
+            rss_config.rss_2d_lateral_margin = float(rss_2d_lateral_margin)
+        if rss_2d_eps is not None:
+            rss_config.rss_2d_eps = float(rss_2d_eps)
+        rss_config.rss_2d_use_superellipse = bool(rss_2d_use_superellipse)
+        rss_filter = RSSCBFFilter(rss_config)
         runtime_label = "RSS-CBF"
         step_file_tag = "rss_cbf"
-        print("[RSS-CBF] Runtime assurance enabled. Step diagnostics will be saved.")
+        print(
+            "[RSS-CBF] Runtime assurance enabled. Step diagnostics will be saved. "
+            "2D RSS-informed CBF={}".format(enable_2d_rss_cbf)
+        )
 
     saved_results = []
     runtime_step_records = []
@@ -879,6 +931,34 @@ if __name__ == "__main__":
         action="store_true",
         help="Save RSS-CBF step-level diagnostics. Enabled automatically by --rss_cbf.",
     )
+    parser.add_argument(
+        "--disable_2d_rss_cbf",
+        action="store_true",
+        help="Use the original longitudinal RSS-CBF plus lateral gate behavior.",
+    )
+    parser.add_argument(
+        "--rss_2d_power",
+        type=float,
+        default=None,
+        help="Power p for the RSS-informed 2D CBF superellipse. Defaults to RSSCBFConfig.",
+    )
+    parser.add_argument(
+        "--rss_2d_lateral_margin",
+        type=float,
+        default=None,
+        help="Lateral safety scale for the RSS-informed 2D CBF in meters.",
+    )
+    parser.add_argument(
+        "--rss_2d_eps",
+        type=float,
+        default=None,
+        help="Numerical epsilon for the RSS-informed 2D CBF denominators.",
+    )
+    parser.add_argument(
+        "--rss_2d_ellipse",
+        action="store_true",
+        help="Use the p=2 ellipse form instead of the configured superellipse power.",
+    )
 
     args = parser.parse_args()
 
@@ -902,6 +982,11 @@ if __name__ == "__main__":
             rss_cbf=args.rss_cbf,
             rss_mpc=args.rss_mpc,
             rss_cbf_diagnostics=args.rss_cbf_diagnostics,
+            enable_2d_rss_cbf=not args.disable_2d_rss_cbf,
+            rss_2d_power=args.rss_2d_power,
+            rss_2d_lateral_margin=args.rss_2d_lateral_margin,
+            rss_2d_eps=args.rss_2d_eps,
+            rss_2d_use_superellipse=not args.rss_2d_ellipse,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
         )
@@ -922,6 +1007,11 @@ if __name__ == "__main__":
             rss_cbf=args.rss_cbf,
             rss_mpc=args.rss_mpc,
             rss_cbf_diagnostics=args.rss_cbf_diagnostics,
+            enable_2d_rss_cbf=not args.disable_2d_rss_cbf,
+            rss_2d_power=args.rss_2d_power,
+            rss_2d_lateral_margin=args.rss_2d_lateral_margin,
+            rss_2d_eps=args.rss_2d_eps,
+            rss_2d_use_superellipse=not args.rss_2d_ellipse,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
         )
@@ -946,6 +1036,11 @@ if __name__ == "__main__":
                 rss_cbf=args.rss_cbf,
                 rss_mpc=args.rss_mpc,
                 rss_cbf_diagnostics=args.rss_cbf_diagnostics,
+                enable_2d_rss_cbf=not args.disable_2d_rss_cbf,
+                rss_2d_power=args.rss_2d_power,
+                rss_2d_lateral_margin=args.rss_2d_lateral_margin,
+                rss_2d_eps=args.rss_2d_eps,
+                rss_2d_use_superellipse=not args.rss_2d_ellipse,
                 eval_max_steps_per_episode=args.eval_max_steps_per_episode,
                 eval_env_start=args.eval_start_seed,
             )
