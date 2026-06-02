@@ -1254,7 +1254,7 @@ class RSSMPCFilter(RSSCBFFilter):
         cfg = self.mpc_config
         horizon = max(1, int(cfg.road_boundary_prediction_horizon_steps))
         trigger_margin = self._road_boundary_dynamic_trigger_margin(state)
-        rollout_state = copy.deepcopy(state)
+        rollout_state = self._copy_state_preserving_frenet_reference(state)
         margins: List[float] = []
         for _ in range(horizon):
             rollout_state = self._simulate_next_state(rollout_state, action)
@@ -1434,7 +1434,7 @@ class RSSMPCFilter(RSSCBFFilter):
         family: str,
     ) -> Dict[str, Any]:
         cfg = self.mpc_config
-        rollout_state = copy.deepcopy(state)
+        rollout_state = self._copy_state_preserving_frenet_reference(state)
         margins: List[float] = []
         speeds: List[float] = []
         initial_ego = self._ego(state)
@@ -2951,7 +2951,7 @@ class RSSMPCFilter(RSSCBFFilter):
         is_deadlock_recovery: bool = False,
     ) -> Dict[str, Any]:
         corridor = corridor or {}
-        rollout_state = copy.deepcopy(state)
+        rollout_state = self._copy_state_preserving_frenet_reference(state)
         rollout_obj = copy.deepcopy(obj)
         margins: List[float] = []
         lateral_clearance_margins: List[float] = []
@@ -4628,6 +4628,7 @@ class RSSMPCFilter(RSSCBFFilter):
         ego = self._ego(state)
         road_boundary_margin_current = self._current_road_boundary_margin(state)
         road_boundary_margin_source = self._road_boundary_margin_source_for_state(state)
+        cbf_log_info = cbf_info or {}
 
         info = {
             "mode": mode,
@@ -4649,6 +4650,22 @@ class RSSMPCFilter(RSSCBFFilter):
             "cbf_action_delta": (cbf_info or {}).get("action_delta", math.nan),
             "cbf_acc_safe": (cbf_info or {}).get("acc_safe", math.nan),
             "cbf_steer_safe": (cbf_info or {}).get("steer_safe", math.nan),
+            "coordinate_mode": cbf_log_info.get("coordinate_mode", ""),
+            "frenet_valid": bool(cbf_log_info.get("frenet_valid", False)),
+            "frenet_fallback_reason": cbf_log_info.get("frenet_fallback_reason", ""),
+            "s_ego": cbf_log_info.get("s_ego", math.nan),
+            "l_ego": cbf_log_info.get("l_ego", math.nan),
+            "heading_ref_ego": cbf_log_info.get("heading_ref_ego", math.nan),
+            "v_ego_s": cbf_log_info.get("v_ego_s", math.nan),
+            "worst_s_obj": cbf_log_info.get("worst_s_obj", math.nan),
+            "worst_l_obj": cbf_log_info.get("worst_l_obj", math.nan),
+            "worst_delta_s": cbf_log_info.get("worst_delta_s", math.nan),
+            "worst_delta_l": cbf_log_info.get("worst_delta_l", math.nan),
+            "worst_v_obj_s": cbf_log_info.get("worst_v_obj_s", math.nan),
+            "old_delta_s": cbf_log_info.get("old_delta_s", math.nan),
+            "old_delta_l": cbf_log_info.get("old_delta_l", math.nan),
+            "h_2d": cbf_log_info.get("h_2d", cbf_log_info.get("worst_h_2d", math.nan)),
+            "worst_object_type": cbf_log_info.get("worst_object_type", ""),
             "cbf_reference_mode": (cbf_reference_info or {}).get("mode", ""),
             "cbf_reference_action_delta": (cbf_reference_info or {}).get("action_delta", math.nan),
             "cbf_reference_acc_safe": (cbf_reference_info or {}).get("acc_safe", math.nan),

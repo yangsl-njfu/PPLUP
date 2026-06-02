@@ -104,6 +104,7 @@ class StaticRSSFilter:
 
     def __init__(self, config: Optional[StaticRSSConfig] = None):
         self.config = config or StaticRSSConfig()
+        self._last_frenet_reference_lane: Any = None
 
     def filter_action(self, state: State, u_nom: Sequence[float]) -> Tuple[Action, Dict[str, Any]]:
         """Filter a nominal policy action and return ``(u_safe, info)``.
@@ -764,7 +765,12 @@ class StaticRSSFilter:
         if vehicle is None:
             raise ValueError("Cannot parse MetaDrive state: env has no vehicle/agent attribute.")
 
+        reference_lane = self._metadrive_current_lane(vehicle)
+        if bool(getattr(self.config, "enable_frenet_coordinates", False)):
+            self._last_frenet_reference_lane = reference_lane
+
         ego = self._metadrive_vehicle_to_dict(vehicle, default_speed=0.0)
+        self._attach_frenet_to_entity(ego, vehicle, reference_lane, role="ego")
         ego["lane_width"] = self._metadrive_current_lane_width(vehicle)
         ego["lane_id"] = self._metadrive_lane_id(vehicle)
         ego.update(self._metadrive_lane_boundary_info(vehicle))
@@ -782,6 +788,7 @@ class StaticRSSFilter:
             if obj is vehicle:
                 continue
             parsed = self._metadrive_object_to_dict(obj, default_speed=0.0)
+            self._attach_frenet_to_entity(parsed, obj, reference_lane, role="object")
             if self._distance_xy(ego, parsed) > self.config.metadrive_object_scan_radius:
                 continue
 
@@ -812,6 +819,7 @@ class StaticRSSFilter:
             "vehicles": vehicles,
             "lanes": lanes,
             "route_corridors": route_corridors,
+            "_frenet_reference_lane": reference_lane if bool(getattr(self.config, "enable_frenet_coordinates", False)) else None,
             "adapter_debug": {
                 "parse_ok": True,
                 "raw_object_count": len(objects),
@@ -838,7 +846,7 @@ class StaticRSSFilter:
         if detection is None:
             return state
 
-        augmented = copy.deepcopy(state)
+        augmented = self._copy_state_preserving_frenet_reference(state)
         ego = self._ego(augmented)
         heading = float(ego.get("heading", 0.0))
         distance = detection["distance"]
@@ -854,6 +862,12 @@ class StaticRSSFilter:
             "class_name": "ObservationLidarFallback",
             "object_id": "front_lidar",
         }
+        self._attach_frenet_to_entity(
+            obstacle,
+            obstacle,
+            augmented.get("_frenet_reference_lane", self._last_frenet_reference_lane),
+            role="object",
+        )
         augmented.setdefault("static_obstacles", []).append(obstacle)
         adapter_debug = augmented.setdefault("adapter_debug", {})
         adapter_debug.update(
@@ -880,7 +894,7 @@ class StaticRSSFilter:
         in the RSS filter state, not in the physical simulator. It allows
         testing stop / bypass mode switching without a real MetaDrive obstacle.
         """
-        augmented = copy.deepcopy(state)
+        augmented = self._copy_state_preserving_frenet_reference(state)
         ego = self._ego(augmented)
         heading = float(ego.get("heading", 0.0))
         ego_x = float(ego.get("x", 0.0))
@@ -899,6 +913,12 @@ class StaticRSSFilter:
             "class_name": "ForcedDebugObstacle",
             "object_id": "forced_static_obstacle",
         }
+        self._attach_frenet_to_entity(
+            obstacle,
+            obstacle,
+            augmented.get("_frenet_reference_lane", self._last_frenet_reference_lane),
+            role="object",
+        )
         augmented.setdefault("static_obstacles", []).append(obstacle)
         adapter_debug = augmented.setdefault("adapter_debug", {})
         adapter_debug["forced_obstacle_injected"] = True
@@ -1278,6 +1298,13 @@ class StaticRSSFilter:
             "num_static_obstacles": len(state.get("static_obstacles", [])),
             "num_dynamic_vehicles": len(state.get("vehicles", [])),
             "nearest_object": self._object_debug(nearest, state) if nearest is not None else {},
+            "coordinate_mode": ego.get("coordinate_mode", "ego_local_fallback"),
+            "frenet_valid": bool(ego.get("frenet_valid", False)),
+            "frenet_fallback_reason": ego.get("frenet_fallback_reason", ""),
+            "s_ego": ego.get("frenet_s", math.nan),
+            "l_ego": ego.get("frenet_l", math.nan),
+            "heading_ref_ego": ego.get("frenet_heading_ref", math.nan),
+            "v_ego_s": ego.get("frenet_v_s", math.nan),
             "adapter_debug": state.get("adapter_debug", {}),
         }
 
@@ -1360,6 +1387,12 @@ class StaticRSSFilter:
             "relative_lane": obj.get("relative_lane", ""),
             "longitudinal": longitudinal,
             "lateral": lateral,
+            "coordinate_mode": obj.get("coordinate_mode", "ego_local_fallback"),
+            "frenet_valid": bool(obj.get("frenet_valid", False)),
+            "frenet_fallback_reason": obj.get("frenet_fallback_reason", ""),
+            "frenet_s": obj.get("frenet_s", float("nan")),
+            "frenet_l": obj.get("frenet_l", float("nan")),
+            "frenet_v_s": obj.get("frenet_v_s", float("nan")),
             "distance": self._distance_xy(self._ego(state), obj),
             "lane_id": obj.get("lane_id", ""),
         }
@@ -1385,7 +1418,8 @@ class StaticRSSFilter:
         """Lightweight rollout model; replace with real dynamics if available."""
         acc, steer = self._clip_action(action)
         cfg = self.config
-        next_state = copy.deepcopy(state)
+        reference_lane = state.get("_frenet_reference_lane", self._last_frenet_reference_lane)
+        next_state = self._copy_state_preserving_frenet_reference(state)
         ego = copy.deepcopy(self._ego(state))
 
         x = float(ego.get("x", 0.0))
@@ -1397,8 +1431,19 @@ class StaticRSSFilter:
         ego["y"] = y + speed * math.sin(heading) * cfg.dt
         ego["speed"] = max(0.0, min(cfg.v_max, speed + acc * cfg.dt))
         ego["heading"] = heading + steer * cfg.steer_gain * cfg.dt
+        self._attach_frenet_to_entity(ego, ego, reference_lane, role="ego")
         next_state["ego"] = ego
         return next_state
+
+    def _copy_state_preserving_frenet_reference(self, state: State) -> State:
+        reference_lane = state.get("_frenet_reference_lane", None)
+        if reference_lane is None:
+            return copy.deepcopy(state)
+        copy_state = dict(state)
+        copy_state["_frenet_reference_lane"] = None
+        copied = copy.deepcopy(copy_state)
+        copied["_frenet_reference_lane"] = reference_lane
+        return copied
 
     def _obstacle_clearance_margin(self, state: State, obstacle: Dict[str, Any]) -> float:
         ego = self._ego(state)
@@ -1518,13 +1563,239 @@ class StaticRSSFilter:
         obstacle_length = self._object_length(obstacle, self.config.vehicle_length)
         return longitudinal - obstacle_length / 2.0 - self.config.vehicle_length / 2.0
 
-    def _relative_position(self, ego: Dict[str, Any], obj: Dict[str, Any]) -> Tuple[float, float]:
-        dx = float(obj.get("x", 0.0)) - float(ego.get("x", 0.0))
-        dy = float(obj.get("y", 0.0)) - float(ego.get("y", 0.0))
+    def get_vehicle_frenet(self, vehicle: Any, reference_lane: Any) -> Dict[str, Any]:
+        if reference_lane is None:
+            return {
+                "s": math.nan,
+                "l": math.nan,
+                "heading_ref": math.nan,
+                "v_s": math.nan,
+                "v_l": math.nan,
+                "valid": False,
+                "fallback_reason": "missing_reference_lane",
+            }
+
+        position = self._frenet_position(vehicle)
+        if position is None:
+            return {
+                "s": math.nan,
+                "l": math.nan,
+                "heading_ref": math.nan,
+                "v_s": math.nan,
+                "v_l": math.nan,
+                "valid": False,
+                "fallback_reason": "missing_position",
+            }
+
+        try:
+            s_value, l_value = reference_lane.local_coordinates(position)
+            s_value = float(s_value)
+            l_value = float(l_value)
+        except Exception as exc:
+            return {
+                "s": math.nan,
+                "l": math.nan,
+                "heading_ref": math.nan,
+                "v_s": math.nan,
+                "v_l": math.nan,
+                "valid": False,
+                "fallback_reason": "local_coordinates_failed:{}".format(type(exc).__name__),
+            }
+
+        heading_ref = math.nan
+        try:
+            heading_ref = float(reference_lane.heading_at(s_value))
+        except Exception as exc:
+            return {
+                "s": float(s_value),
+                "l": float(l_value),
+                "heading_ref": math.nan,
+                "v_s": math.nan,
+                "v_l": math.nan,
+                "valid": False,
+                "fallback_reason": "heading_at_failed:{}".format(type(exc).__name__),
+            }
+
+        heading = self._entity_heading(vehicle, heading_ref)
+        speed = self._entity_speed(vehicle, 0.0)
+        heading_error = heading - heading_ref
+        return {
+            "s": float(s_value),
+            "l": float(l_value),
+            "heading_ref": float(heading_ref),
+            "v_s": float(speed * math.cos(heading_error)),
+            "v_l": float(speed * math.sin(heading_error)),
+            "valid": True,
+            "fallback_reason": "",
+        }
+
+    def _attach_frenet_to_entity(
+        self,
+        entity_dict: Dict[str, Any],
+        source: Any,
+        reference_lane: Any,
+        role: str = "object",
+    ) -> None:
+        if not bool(getattr(self.config, "enable_frenet_coordinates", False)):
+            entity_dict.update(
+                {
+                    "coordinate_mode": "ego_local_fallback",
+                    "frenet_valid": False,
+                    "frenet_fallback_reason": "disabled",
+                }
+            )
+            return
+
+        frenet = self.get_vehicle_frenet(source, reference_lane)
+        valid = bool(frenet.get("valid", False))
+        entity_dict.update(
+            {
+                "coordinate_mode": "frenet" if valid else "ego_local_fallback",
+                "frenet_valid": valid,
+                "frenet_fallback_reason": str(frenet.get("fallback_reason", "")),
+                "frenet_s": float(frenet.get("s", math.nan)),
+                "frenet_l": float(frenet.get("l", math.nan)),
+                "frenet_heading_ref": float(frenet.get("heading_ref", math.nan)),
+                "frenet_v_s": float(frenet.get("v_s", math.nan)),
+                "frenet_v_l": float(frenet.get("v_l", math.nan)),
+                "frenet_role": role,
+            }
+        )
+        if role == "ego" and valid:
+            entity_dict["lateral_speed"] = float(frenet.get("v_l", 0.0))
+
+    def _frenet_position(self, entity: Any) -> Optional[Any]:
+        if isinstance(entity, dict):
+            x = self._safe_float(entity.get("x", math.nan), math.nan)
+            y = self._safe_float(entity.get("y", math.nan), math.nan)
+            if math.isfinite(x) and math.isfinite(y):
+                return np.asarray([x, y], dtype=float)
+            position = entity.get("position", None)
+            if position is not None:
+                try:
+                    arr = np.asarray(position, dtype=float)
+                    if arr.size >= 2 and math.isfinite(float(arr[0])) and math.isfinite(float(arr[1])):
+                        return arr[:2]
+                except Exception:
+                    return None
+            return None
+        position = self._resolve_attr(entity, "position", None)
+        if position is None:
+            position = self._resolve_attr(entity, "get_position", None)
+        return position
+
+    def _entity_heading(self, entity: Any, default: float = 0.0) -> float:
+        if isinstance(entity, dict):
+            return self._safe_float(entity.get("heading", entity.get("heading_theta", default)), default)
+        heading = self._resolve_attr(
+            entity,
+            "heading_theta",
+            self._resolve_attr(entity, "heading", default),
+        )
+        return self._safe_float(heading, default)
+
+    def _entity_speed(self, entity: Any, default: float = 0.0) -> float:
+        if isinstance(entity, dict):
+            speed = self._safe_float(entity.get("speed", math.nan), math.nan)
+            if math.isfinite(speed):
+                return max(0.0, speed)
+            velocity = entity.get("velocity", None)
+            if velocity is not None:
+                try:
+                    return float(np.linalg.norm(np.asarray(velocity, dtype=float)))
+                except Exception:
+                    pass
+            return max(0.0, float(default))
+        speed = self._resolve_attr(entity, "speed", None)
+        if speed is not None:
+            return max(0.0, self._safe_float(speed, default))
+        velocity = self._resolve_attr(entity, "velocity", None)
+        if velocity is None:
+            return max(0.0, float(default))
+        try:
+            return float(np.linalg.norm(np.asarray(velocity, dtype=float)))
+        except Exception:
+            return max(0.0, float(default))
+
+    def _ego_local_relative_position(self, ego: Dict[str, Any], obj: Dict[str, Any]) -> Tuple[float, float]:
+        ego_position = self._frenet_position(ego)
+        obj_position = self._frenet_position(obj)
+        if ego_position is not None and obj_position is not None:
+            dx = float(obj_position[0]) - float(ego_position[0])
+            dy = float(obj_position[1]) - float(ego_position[1])
+        else:
+            dx = float(obj.get("x", 0.0)) - float(ego.get("x", 0.0))
+            dy = float(obj.get("y", 0.0)) - float(ego.get("y", 0.0))
         heading = float(ego.get("heading", 0.0))
         longitudinal = dx * math.cos(heading) + dy * math.sin(heading)
         lateral = -dx * math.sin(heading) + dy * math.cos(heading)
         return longitudinal, lateral
+
+    def _relative_position_metrics(self, ego: Dict[str, Any], obj: Dict[str, Any]) -> Dict[str, Any]:
+        old_delta_s, old_delta_l = self._ego_local_relative_position(ego, obj)
+        enabled = bool(getattr(self.config, "enable_frenet_coordinates", False))
+        fallback_allowed = bool(getattr(self.config, "frenet_fallback_to_ego_local", True))
+        ego_valid = bool(ego.get("frenet_valid", False))
+        obj_valid = bool(obj.get("frenet_valid", False))
+        if enabled and ego_valid and obj_valid:
+            s_ego = self._safe_float(ego.get("frenet_s", math.nan), math.nan)
+            l_ego = self._safe_float(ego.get("frenet_l", math.nan), math.nan)
+            s_obj = self._safe_float(obj.get("frenet_s", math.nan), math.nan)
+            l_obj = self._safe_float(obj.get("frenet_l", math.nan), math.nan)
+            if math.isfinite(s_ego) and math.isfinite(l_ego) and math.isfinite(s_obj) and math.isfinite(l_obj):
+                return {
+                    "delta_s": float(s_obj - s_ego),
+                    "delta_l": float(l_obj - l_ego),
+                    "coordinate_mode": "frenet",
+                    "frenet_valid": True,
+                    "frenet_fallback_reason": "",
+                    "s_ego": float(s_ego),
+                    "l_ego": float(l_ego),
+                    "heading_ref_ego": self._safe_float(ego.get("frenet_heading_ref", math.nan), math.nan),
+                    "v_ego_s": self._safe_float(ego.get("frenet_v_s", math.nan), math.nan),
+                    "v_ego_l": self._safe_float(ego.get("frenet_v_l", math.nan), math.nan),
+                    "s_obj": float(s_obj),
+                    "l_obj": float(l_obj),
+                    "heading_ref_obj": self._safe_float(obj.get("frenet_heading_ref", math.nan), math.nan),
+                    "v_obj_s": self._safe_float(obj.get("frenet_v_s", math.nan), math.nan),
+                    "v_obj_l": self._safe_float(obj.get("frenet_v_l", math.nan), math.nan),
+                    "old_delta_s": float(old_delta_s),
+                    "old_delta_l": float(old_delta_l),
+                }
+
+        if enabled and not fallback_allowed:
+            reason = "frenet_invalid"
+        elif not enabled:
+            reason = "disabled"
+        else:
+            reason = str(
+                ego.get("frenet_fallback_reason", "")
+                or obj.get("frenet_fallback_reason", "")
+                or "frenet_invalid"
+            )
+        return {
+            "delta_s": float(old_delta_s),
+            "delta_l": float(old_delta_l),
+            "coordinate_mode": "ego_local_fallback",
+            "frenet_valid": False,
+            "frenet_fallback_reason": reason,
+            "s_ego": self._safe_float(ego.get("frenet_s", math.nan), math.nan),
+            "l_ego": self._safe_float(ego.get("frenet_l", math.nan), math.nan),
+            "heading_ref_ego": self._safe_float(ego.get("frenet_heading_ref", math.nan), math.nan),
+            "v_ego_s": self._safe_float(ego.get("frenet_v_s", math.nan), math.nan),
+            "v_ego_l": self._safe_float(ego.get("frenet_v_l", math.nan), math.nan),
+            "s_obj": self._safe_float(obj.get("frenet_s", math.nan), math.nan),
+            "l_obj": self._safe_float(obj.get("frenet_l", math.nan), math.nan),
+            "heading_ref_obj": self._safe_float(obj.get("frenet_heading_ref", math.nan), math.nan),
+            "v_obj_s": self._safe_float(obj.get("frenet_v_s", math.nan), math.nan),
+            "v_obj_l": self._safe_float(obj.get("frenet_v_l", math.nan), math.nan),
+            "old_delta_s": float(old_delta_s),
+            "old_delta_l": float(old_delta_l),
+        }
+
+    def _relative_position(self, ego: Dict[str, Any], obj: Dict[str, Any]) -> Tuple[float, float]:
+        metrics = self._relative_position_metrics(ego, obj)
+        return float(metrics["delta_s"]), float(metrics["delta_l"])
 
     def _longitudinal_progress(self, initial_ego: Dict[str, Any], final_ego: Dict[str, Any]) -> float:
         dx = float(final_ego.get("x", 0.0)) - float(initial_ego.get("x", 0.0))
