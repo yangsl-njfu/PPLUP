@@ -116,6 +116,8 @@ class RSSCBFFilter(StaticRSSFilter):
         "rss_cbf_recovery",
         "fallback_no_safe_candidate",
     }
+    ROAD_SAFETY_OBJECT_KINDS = {"boundary", "no_drive_area", "road_edge"}
+    ROAD_BOUNDARY_OBJECT_KINDS = {"boundary", "road_edge"}
 
     def __init__(self, config: Optional[RSSCBFConfig] = None):
         super().__init__(config or RSSCBFConfig())
@@ -241,7 +243,7 @@ class RSSCBFFilter(StaticRSSFilter):
         profile["nominal_eval_time"] = time.perf_counter() - start
         profile["geometry_distance_time"] += float(nominal_eval.get("geometry_distance_time", 0.0))
         safety_margin = float(getattr(self.config, "rss_2d_safety_margin", 0.0))
-        nominal_eval["safe"] = bool(float(nominal_eval.get("H", -math.inf)) >= safety_margin)
+        nominal_eval["safe"] = bool(float(nominal_eval.get("H", -math.inf)) >= 0.0)
         lazy_margin = float(getattr(self.config, "lazy_safety_margin", safety_margin))
 
         if float(nominal_eval.get("H", -math.inf)) >= lazy_margin:
@@ -270,7 +272,7 @@ class RSSCBFFilter(StaticRSSFilter):
         )
         selected = projection_debug.get("selected", {}) if isinstance(projection_debug, dict) else {}
         selected_eval = selected.get("evaluation", nominal_eval) if isinstance(selected, dict) else nominal_eval
-        selected_safe = bool(float(selected.get("H", selected_eval.get("H", -math.inf))) >= -self.config.small_tolerance)
+        selected_safe = bool(float(selected.get("H", selected_eval.get("H", -math.inf))) >= 0.0)
 
         if selected_safe:
             mode = "rss_2d_cbf_intervention"
@@ -325,6 +327,7 @@ class RSSCBFFilter(StaticRSSFilter):
         objects.extend(static_objects)
         for index, vehicle in enumerate(state.get("vehicles", []) or []):
             objects.append(self._make_dynamic_safety_object(vehicle, index))
+        objects.extend(self._make_road_safety_objects(state))
         return objects
 
     def _rss_2d_static_obstacle_signature(self, obstacles: Sequence[Dict[str, Any]]) -> Tuple[Any, ...]:
@@ -367,6 +370,103 @@ class RSSCBFFilter(StaticRSSFilter):
             center=center,
             radius=radius,
         )
+
+    def _make_road_safety_objects(self, state: State) -> List[SafetyObject]:
+        return [
+            self._make_boundary_safety_object(state, "left"),
+            self._make_boundary_safety_object(state, "right"),
+            self._make_no_drive_area_safety_object(state),
+        ]
+
+    def _make_boundary_safety_object(self, state: State, side: str) -> SafetyObject:
+        ego = self._ego(state)
+        object_kind = self._road_boundary_object_kind_for_side(state, side)
+        line_type = str(ego.get("{}_lane_line_type".format(side), "") or "")
+        line_color = str(ego.get("{}_lane_line_color".format(side), "") or "")
+        object_type = self._road_boundary_object_type(object_kind, line_type, line_color)
+        payload = {
+            "object_id": "road_boundary_{}".format(side),
+            "object_type": object_type,
+            "object_kind": object_kind,
+            "geometry_type": "signed_boundary",
+            "side": side,
+            "boundary_side": side,
+            "line_type": line_type,
+            "line_color": line_color,
+            "line_prohibited": bool(ego.get("{}_lane_line_prohibited".format(side), False)),
+            "x": self._safe_float(ego.get("x", 0.0), 0.0),
+            "y": self._safe_float(ego.get("y", 0.0), 0.0),
+            "heading": self._safe_float(ego.get("heading", 0.0), 0.0),
+            "speed": 0.0,
+            "length": 0.0,
+            "width": 0.0,
+        }
+        return SafetyObject(
+            object_id=str(payload["object_id"]),
+            object_type=object_type,
+            geometry_type="signed_boundary",
+            object_kind=object_kind,
+            payload=payload,
+            is_dynamic=False,
+            center=(float(payload["x"]), float(payload["y"])),
+            radius=0.0,
+        )
+
+    def _make_no_drive_area_safety_object(self, state: State) -> SafetyObject:
+        ego = self._ego(state)
+        payload = {
+            "object_id": "no_drive_area_state",
+            "object_type": "no_drive_area",
+            "object_kind": "no_drive_area",
+            "geometry_type": "state_flag",
+            "x": self._safe_float(ego.get("x", 0.0), 0.0),
+            "y": self._safe_float(ego.get("y", 0.0), 0.0),
+            "heading": self._safe_float(ego.get("heading", 0.0), 0.0),
+            "speed": 0.0,
+            "length": 0.0,
+            "width": 0.0,
+        }
+        return SafetyObject(
+            object_id=str(payload["object_id"]),
+            object_type="no_drive_area",
+            geometry_type="state_flag",
+            object_kind="no_drive_area",
+            payload=payload,
+            is_dynamic=False,
+            center=(float(payload["x"]), float(payload["y"])),
+            radius=0.0,
+        )
+
+    def _road_boundary_object_kind_for_side(self, state: State, side: str) -> str:
+        ego = self._ego(state)
+        lanes = state.get("lanes", {}) or {}
+        adjacent_lane = lanes.get(side) or {}
+        line_type = str(ego.get("{}_lane_line_type".format(side), "") or "").upper()
+        line_color = str(ego.get("{}_lane_line_color".format(side), "") or "").upper()
+        adjacent_available = bool(adjacent_lane.get("available", False)) and bool(adjacent_lane.get("drivable", True))
+        edge_marker = "SIDE" in line_type or "GUARDRAIL" in line_type or "CURB" in line_type
+        if "YELLOW" in line_color:
+            return "boundary"
+        if edge_marker or not adjacent_available:
+            return "road_edge"
+        if bool(ego.get("{}_lane_line_prohibited".format(side), False)):
+            return "boundary"
+        return "road_edge"
+
+    def _road_boundary_object_type(self, object_kind: str, line_type: str, line_color: str) -> str:
+        if object_kind == "road_edge":
+            return "road_edge"
+        if "YELLOW" in str(line_color).upper():
+            return "yellow_line"
+        if line_type:
+            return "lane_boundary"
+        return "road_boundary"
+
+    def _is_rss_2d_road_safety_object(self, safety_object: SafetyObject) -> bool:
+        return str(safety_object.object_kind) in self.ROAD_SAFETY_OBJECT_KINDS
+
+    def _is_rss_2d_boundary_safety_object(self, safety_object: SafetyObject) -> bool:
+        return str(safety_object.object_kind) in self.ROAD_BOUNDARY_OBJECT_KINDS
 
     def _safety_object_center_radius(self, obj: Dict[str, Any]) -> Tuple[Tuple[float, float], float]:
         center = (
@@ -430,6 +530,8 @@ class RSSCBFFilter(StaticRSSFilter):
         if not bool(getattr(self.config, "enable_spatial_filtering", True)):
             return list(objects)
 
+        road_objects = [obj for obj in objects if self._is_rss_2d_road_safety_object(obj)]
+        spatial_objects = [obj for obj in objects if not self._is_rss_2d_road_safety_object(obj)]
         ego = self._ego(state)
         local_radius = max(0.0, float(getattr(self.config, "max_check_distance", 40.0)))
         broad_radius = max(local_radius, float(getattr(self.config, "broad_phase_radius", local_radius)))
@@ -438,10 +540,10 @@ class RSSCBFFilter(StaticRSSFilter):
         dynamic_rows: List[Tuple[float, float, SafetyObject]] = []
         if bool(getattr(self.config, "enable_static_safety_object_cache", True)):
             static_candidates = self._query_rss_2d_static_grid(state, broad_radius)
-            dynamic_candidates = [obj for obj in objects if obj.is_dynamic]
+            dynamic_candidates = [obj for obj in spatial_objects if obj.is_dynamic]
             candidate_objects = static_candidates + dynamic_candidates
         else:
-            candidate_objects = list(objects)
+            candidate_objects = list(spatial_objects)
 
         if bool(getattr(self.config, "enable_vectorized_broad_phase", True)):
             static_rows, dynamic_rows = self._rss_2d_broad_phase_rows_vectorized(
@@ -477,7 +579,10 @@ class RSSCBFFilter(StaticRSSFilter):
         selected_rows = static_rows[:max_static] + dynamic_rows[:max_dynamic]
         selected_rows.sort(key=lambda item: (item[0], item[1]))
         max_total = max(0, int(getattr(self.config, "max_local_safety_objects", 64)))
-        return [item[2] for item in selected_rows[:max_total]]
+        spatial_budget = max(0, max_total - len(road_objects)) if max_total > 0 else 0
+        selected_objects = [item[2] for item in selected_rows[:spatial_budget]]
+        selected_objects.extend(road_objects)
+        return selected_objects
 
     def _rss_2d_broad_phase_rows_vectorized(
         self,
@@ -617,8 +722,140 @@ class RSSCBFFilter(StaticRSSFilter):
             "eps": float(eps),
         }
 
+    def compute_signed_boundary_cbf_margin(
+        self,
+        reference_state: State,
+        rollout_state: State,
+        safety_object: SafetyObject,
+    ) -> Dict[str, Any]:
+        """Compute a signed road-boundary/no-drive CBF margin.
+
+        Positive values mean the ego is inside the drivable side of the
+        boundary, zero is the boundary itself, and negative values mean the
+        ego has crossed into a no-drive region.
+        """
+        payload = safety_object.payload or {}
+        object_kind = str(safety_object.object_kind)
+        if object_kind == "no_drive_area":
+            return self._compute_no_drive_area_cbf_margin(rollout_state, safety_object)
+
+        side = str(payload.get("side", payload.get("boundary_side", "left")) or "left")
+        if side not in {"left", "right"}:
+            side = "left"
+        boundary_metrics = self._basic_road_boundary_margins_for_state(
+            reference_state,
+            rollout_state,
+            margin=0.0,
+        )
+        raw_margin = (
+            float(boundary_metrics["left_margin"])
+            if side == "left"
+            else float(boundary_metrics["right_margin"])
+        )
+        scale = max(
+            float(getattr(self.config, "rss_2d_boundary_margin_threshold", 0.5)),
+            self.config.small_tolerance,
+        )
+        h_boundary = raw_margin / scale
+        lateral = float(boundary_metrics.get("lateral", 0.0))
+        signed_lateral = raw_margin if side == "left" else -raw_margin
+        return {
+            "h_2d": float(h_boundary),
+            "h_boundary": float(h_boundary),
+            "signed_boundary_margin": float(raw_margin),
+            "boundary_margin": float(raw_margin),
+            "left_boundary_margin": float(boundary_metrics["left_margin"]),
+            "right_boundary_margin": float(boundary_metrics["right_margin"]),
+            "delta_s": math.inf,
+            "delta_l": float(signed_lateral),
+            "long_clearance": math.inf,
+            "lat_clearance": float(raw_margin),
+            "d_s_safe": math.inf,
+            "d_l_safe": float(scale),
+            "object_id": safety_object.object_id,
+            "object_type": safety_object.object_type,
+            "object_kind": object_kind,
+            "relation": side,
+            "target_longitudinal_speed": 0.0,
+            "ego_length": float(self.config.vehicle_length),
+            "ego_width": float(self.config.vehicle_width),
+            "object_length": 0.0,
+            "object_width": 0.0,
+            "power": 1.0,
+            "eps": float(self.config.small_tolerance),
+            "road_boundary_margin_source": str(boundary_metrics.get("source", "")),
+            "road_boundary_lateral_position": float(lateral),
+            "road_boundary_lower": float(boundary_metrics.get("lower", math.nan)),
+            "road_boundary_upper": float(boundary_metrics.get("upper", math.nan)),
+            "line_type": str(payload.get("line_type", "")),
+            "line_color": str(payload.get("line_color", "")),
+            "line_prohibited": bool(payload.get("line_prohibited", False)),
+        }
+
+    def _compute_no_drive_area_cbf_margin(
+        self,
+        rollout_state: State,
+        safety_object: SafetyObject,
+    ) -> Dict[str, Any]:
+        ego = self._ego(rollout_state)
+        hard_violation = bool(
+            not bool(ego.get("on_lane", True))
+            or bool(ego.get("out_of_route", False))
+            or bool(ego.get("crash_sidewalk", False))
+            or bool(ego.get("on_yellow_continuous_line", False))
+            or bool(ego.get("on_white_continuous_line", False))
+        )
+        h_value = -1.0 if hard_violation else math.inf
+        return {
+            "h_2d": float(h_value),
+            "h_boundary": math.nan,
+            "delta_s": math.nan,
+            "delta_l": math.nan,
+            "long_clearance": math.nan,
+            "lat_clearance": math.nan,
+            "d_s_safe": math.nan,
+            "d_l_safe": math.nan,
+            "object_id": safety_object.object_id,
+            "object_type": safety_object.object_type,
+            "object_kind": safety_object.object_kind,
+            "relation": "no_drive_area",
+            "target_longitudinal_speed": 0.0,
+            "ego_length": float(self.config.vehicle_length),
+            "ego_width": float(self.config.vehicle_width),
+            "object_length": 0.0,
+            "object_width": 0.0,
+            "power": 1.0,
+            "eps": float(self.config.small_tolerance),
+            "ego_on_lane": bool(ego.get("on_lane", True)),
+            "ego_out_of_route": bool(ego.get("out_of_route", False)),
+            "ego_crash_sidewalk": bool(ego.get("crash_sidewalk", False)),
+            "ego_on_yellow_continuous_line": bool(ego.get("on_yellow_continuous_line", False)),
+            "ego_on_white_continuous_line": bool(ego.get("on_white_continuous_line", False)),
+            "hard_violation": bool(hard_violation),
+        }
+
+    def _compute_2d_rss_cbf_safety_object_margin(
+        self,
+        reference_state: State,
+        rollout_state: State,
+        safety_object: SafetyObject,
+    ) -> Dict[str, Any]:
+        if self._is_rss_2d_road_safety_object(safety_object):
+            return self.compute_signed_boundary_cbf_margin(reference_state, rollout_state, safety_object)
+        return self.compute_2d_rss_cbf_margin(
+            rollout_state,
+            safety_object.payload or {},
+            safety_object.object_kind,
+        )
+
     def _rss_2d_object_kind(self, obj: Dict[str, Any]) -> str:
         object_type = str(obj.get("object_type", "")).lower()
+        if object_type in {"road_boundary", "lane_boundary", "yellow_line", "boundary"}:
+            return "boundary"
+        if object_type in {"road_edge", "sidewalk"}:
+            return "road_edge"
+        if object_type in {"no_drive_area", "road_departure"}:
+            return "no_drive_area"
         if object_type == "vehicle":
             return "dynamic"
         return "static"
@@ -688,6 +925,9 @@ class RSSCBFFilter(StaticRSSFilter):
         left_margins: List[float] = []
         right_margins: List[float] = []
         lateral_positions: List[float] = []
+        boundary_h_values: List[float] = []
+        boundary_h_current = math.inf
+        boundary_h_final = math.inf
         boundary_source = ""
         geometry_distance_time = 0.0
 
@@ -697,10 +937,10 @@ class RSSCBFFilter(StaticRSSFilter):
                 if safety_object.payload is None:
                     continue
                 geometry_start = time.perf_counter()
-                margin = self.compute_2d_rss_cbf_margin(
+                margin = self._compute_2d_rss_cbf_safety_object_margin(
+                    state,
                     rollout_state,
-                    safety_object.payload,
-                    safety_object.object_kind,
+                    safety_object,
                 )
                 geometry_distance_time += time.perf_counter() - geometry_start
                 constraint = self._rss_2d_object_constraint(
@@ -712,22 +952,37 @@ class RSSCBFFilter(StaticRSSFilter):
                 )
                 step_constraints.append(constraint)
 
-            geometry_start = time.perf_counter()
-            boundary_metrics = self._basic_road_boundary_margins_for_state(state, rollout_state)
-            geometry_distance_time += time.perf_counter() - geometry_start
-            boundary_source = str(boundary_metrics.get("source", boundary_source))
-            left_margin = float(boundary_metrics["left_margin"])
-            right_margin = float(boundary_metrics["right_margin"])
-            left_margins.append(left_margin)
-            right_margins.append(right_margin)
-            lateral_positions.append(float(boundary_metrics.get("lateral", 0.0)))
-            step_constraints.extend(
-                self._rss_2d_boundary_constraints(boundary_metrics, step)
-            )
+            step_boundary_h_values: List[float] = []
+            step_left_margin = math.nan
+            step_right_margin = math.nan
+            step_lateral = math.nan
+            for constraint in step_constraints:
+                constraint_kind = str(constraint.get("object_kind", ""))
+                if constraint_kind not in self.ROAD_BOUNDARY_OBJECT_KINDS:
+                    continue
+                h_value = float(constraint.get("h", constraint.get("h_2d", math.inf)))
+                step_boundary_h_values.append(h_value)
+                side = str(constraint.get("relation", ""))
+                if side == "left":
+                    step_left_margin = float(constraint.get("boundary_margin", math.nan))
+                elif side == "right":
+                    step_right_margin = float(constraint.get("boundary_margin", math.nan))
+                if math.isnan(step_lateral):
+                    step_lateral = float(constraint.get("road_boundary_lateral_position", math.nan))
+                boundary_source = str(constraint.get("road_boundary_margin_source", boundary_source))
 
-            hard_constraint = self._rss_2d_state_flag_constraint(state, step)
-            if hard_constraint is not None:
-                step_constraints.append(hard_constraint)
+            if step_boundary_h_values:
+                step_boundary_h = min(step_boundary_h_values)
+                boundary_h_values.append(step_boundary_h)
+                if step == 0:
+                    boundary_h_current = step_boundary_h
+                boundary_h_final = step_boundary_h
+            if math.isfinite(step_left_margin):
+                left_margins.append(step_left_margin)
+            if math.isfinite(step_right_margin):
+                right_margins.append(step_right_margin)
+            if math.isfinite(step_lateral):
+                lateral_positions.append(step_lateral)
 
             if collect_debug:
                 constraints.extend(step_constraints)
@@ -758,13 +1013,15 @@ class RSSCBFFilter(StaticRSSFilter):
         final_boundary_margin = min(left_margins[-1], right_margins[-1]) if left_margins and right_margins else math.inf
         current_lateral = lateral_positions[0] if lateral_positions else 0.0
         final_lateral = lateral_positions[-1] if lateral_positions else 0.0
-        lower_limit, upper_limit, _ = self._basic_road_boundary_limits_from_state(state)
+        lower_limit, upper_limit, _ = self._basic_road_boundary_limits_from_state(state, margin=0.0)
         center_lateral = 0.5 * (lower_limit + upper_limit)
         centering_improvement = abs(current_lateral - center_lateral) - abs(final_lateral - center_lateral)
-        boundary_safe = min(left_min, right_min) >= float(getattr(self.config, "rss_2d_boundary_margin_threshold", 0.5))
+        boundary_h_min = min(boundary_h_values) if boundary_h_values else math.inf
+        boundary_safe = boundary_h_min >= 0.0
+        ego = self._ego(state)
         return {
-            "safe": bool(H >= -self.config.small_tolerance),
-            "objects_safe": bool(H >= -self.config.small_tolerance),
+            "safe": bool(H >= 0.0),
+            "objects_safe": bool(H >= 0.0),
             "H": float(H),
             "current_H": float(current_H),
             "final_H": float(final_H),
@@ -780,11 +1037,14 @@ class RSSCBFFilter(StaticRSSFilter):
             "horizon_steps": int(horizon),
             "geometry_distance_time": float(geometry_distance_time),
             "road_boundary_safe": bool(boundary_safe),
-            "left_boundary_safe": bool(left_min >= float(getattr(self.config, "rss_2d_boundary_margin_threshold", 0.5))),
-            "right_boundary_safe": bool(right_min >= float(getattr(self.config, "rss_2d_boundary_margin_threshold", 0.5))),
+            "left_boundary_safe": bool(left_min >= 0.0),
+            "right_boundary_safe": bool(right_min >= 0.0),
             "left_boundary_margin": float(left_min),
             "right_boundary_margin": float(right_min),
             "min_boundary_margin": float(min(left_min, right_min)),
+            "boundary_h_current": float(boundary_h_current),
+            "boundary_h_min_pred": float(boundary_h_min),
+            "boundary_h_final_pred": float(boundary_h_final),
             "road_boundary_margin_current": float(current_boundary_margin),
             "road_boundary_margin_min_pred": float(min(left_min, right_min)),
             "road_boundary_margin_final_pred": float(final_boundary_margin),
@@ -801,6 +1061,13 @@ class RSSCBFFilter(StaticRSSFilter):
             "road_boundary_current_lateral_position": float(current_lateral),
             "road_boundary_center_lateral": float(center_lateral),
             "road_boundary_centering_improvement": float(centering_improvement),
+            "ego_dist_to_left_side": self._safe_float(ego.get("dist_to_left_side", math.nan), math.nan),
+            "ego_dist_to_right_side": self._safe_float(ego.get("dist_to_right_side", math.nan), math.nan),
+            "ego_on_lane": bool(ego.get("on_lane", True)),
+            "ego_out_of_route": bool(ego.get("out_of_route", False)),
+            "ego_crash_sidewalk": bool(ego.get("crash_sidewalk", False)),
+            "ego_on_yellow_continuous_line": bool(ego.get("on_yellow_continuous_line", False)),
+            "ego_on_white_continuous_line": bool(ego.get("on_white_continuous_line", False)),
         }
 
     def _copy_safety_object(self, safety_object: SafetyObject) -> SafetyObject:
@@ -820,6 +1087,8 @@ class RSSCBFFilter(StaticRSSFilter):
         state: State,
         safety_object: SafetyObject,
     ) -> SafetyObject:
+        if self._is_rss_2d_road_safety_object(safety_object):
+            return safety_object
         if safety_object.payload is None:
             return safety_object
         next_payload = self._advance_object_for_rss_cbf(
@@ -879,17 +1148,18 @@ class RSSCBFFilter(StaticRSSFilter):
             ("left", float(boundary_metrics["left_margin"])),
             ("right", float(boundary_metrics["right_margin"])),
         ):
-            h_value = (raw_margin - scale) / scale
+            h_value = raw_margin / scale
             signed_lateral = raw_margin if side == "left" else -raw_margin
             constraints.append(
                 {
                     "h": float(h_value),
                     "h_2d": float(h_value),
+                    "h_boundary": float(h_value),
                     "constraint_type": "safety_object",
                     "object_id": "road_boundary_{}".format(side),
                     "object_type": "road_boundary",
-                    "object_kind": "static",
-                    "geometry_type": "boundary_segment",
+                    "object_kind": "boundary",
+                    "geometry_type": "signed_boundary",
                     "is_dynamic": False,
                     "relation": side,
                     "step": int(step),
@@ -900,6 +1170,7 @@ class RSSCBFFilter(StaticRSSFilter):
                     "d_s_safe": math.inf,
                     "d_l_safe": float(scale),
                     "boundary_margin": float(raw_margin),
+                    "signed_boundary_margin": float(raw_margin),
                     "object_debug": {},
                 }
             )
@@ -919,8 +1190,8 @@ class RSSCBFFilter(StaticRSSFilter):
             "h_2d": -1.0,
             "constraint_type": "safety_object",
             "object_id": "road_departure_state",
-            "object_type": "road_departure",
-            "object_kind": "static",
+            "object_type": "no_drive_area",
+            "object_kind": "no_drive_area",
             "geometry_type": "state_flag",
             "is_dynamic": False,
             "relation": "road_departure",
@@ -1000,7 +1271,7 @@ class RSSCBFFilter(StaticRSSFilter):
             if (
                 search_mode == "lazy_coarse_to_fine"
                 and stage == "coarse"
-                and any(float(candidate.get("H", -math.inf)) >= -self.config.small_tolerance for candidate in stage_candidates)
+                and any(float(candidate.get("H", -math.inf)) >= 0.0 for candidate in stage_candidates)
             ):
                 stopped_after_stage = stage
                 break
@@ -1022,7 +1293,7 @@ class RSSCBFFilter(StaticRSSFilter):
         safe_candidates = [
             candidate
             for candidate in candidates
-            if float(candidate.get("H", -math.inf)) >= -self.config.small_tolerance
+            if float(candidate.get("H", -math.inf)) >= 0.0
         ]
         road_safe_candidates = [
             candidate
@@ -1035,7 +1306,7 @@ class RSSCBFFilter(StaticRSSFilter):
         acc_candidates = self._unique_float_list(acc_candidates)
         steer_candidates = self._unique_float_list(steer_candidates)
         return selected["action"], {
-            "projection_failed": not bool(float(selected.get("H", -math.inf)) >= -self.config.small_tolerance),
+            "projection_failed": not bool(float(selected.get("H", -math.inf)) >= 0.0),
             "candidate_count": len(candidates),
             "candidate_reject_reasons": reject_reasons,
             "safe_candidate_count": len(safe_candidates),
@@ -1050,7 +1321,7 @@ class RSSCBFFilter(StaticRSSFilter):
             "candidates": compact_candidates,
             "reason": (
                 "selected_safe_candidate"
-                if float(selected.get("H", -math.inf)) >= -self.config.small_tolerance
+                if float(selected.get("H", -math.inf)) >= 0.0
                 else "selected_least_unsafe"
             ),
         }
@@ -1086,9 +1357,7 @@ class RSSCBFFilter(StaticRSSFilter):
         return self._unique_clipped_values(values, index=0)
 
     def _rss_2d_coarse_steer_candidates(self, u_original: Action) -> List[float]:
-        if not bool(getattr(self.config, "rss_2d_sample_steer", True)):
-            return [float(u_original[1])]
-        values: List[float] = [float(u_original[1]), 0.0]
+        values: List[float] = [float(u_original[1]), 0.0, -0.25, 0.25, -0.5, 0.5]
         values.extend(float(value) for value in getattr(self.config, "coarse_steer_samples", ()))
         return self._unique_clipped_values(values, index=1)
 
@@ -1102,10 +1371,7 @@ class RSSCBFFilter(StaticRSSFilter):
         return self._unique_clipped_values(values, index=0)
 
     def _rss_2d_steer_candidates(self, u_original: Action) -> List[float]:
-        if not bool(getattr(self.config, "rss_2d_sample_steer", True)):
-            return [float(u_original[1])]
-
-        values: List[float] = [float(u_original[1]), 0.0]
+        values: List[float] = [float(u_original[1]), 0.0, -0.25, 0.25, -0.5, 0.5]
         values.extend(float(value) for value in getattr(self.config, "rss_2d_steer_samples", ()))
         fine_count = int(getattr(self.config, "fine_steer_samples", 0))
         if fine_count > 0:
@@ -1152,7 +1418,7 @@ class RSSCBFFilter(StaticRSSFilter):
         final_H = float(evaluation.get("final_H", H))
         current_H = float(evaluation.get("current_H", H))
         H_improvement = final_H - current_H
-        safe = H >= -self.config.small_tolerance
+        safe = H >= 0.0
         speed_preserve_score = min(0.0, float(action[0]) - float(getattr(self.config, "rss_2d_min_speed_preserve_acc", -0.2)))
         intervention_cost = self._action_distance_sq(action, u_original)
         acc_penalty = max(0.0, -float(action[0]))
@@ -1180,6 +1446,9 @@ class RSSCBFFilter(StaticRSSFilter):
             "min_h_2d": H,
             "final_h_2d": final_H,
             "min_boundary_margin": float(evaluation.get("min_boundary_margin", math.nan)),
+            "boundary_h_current": float(evaluation.get("boundary_h_current", math.nan)),
+            "boundary_h_min_pred": float(evaluation.get("boundary_h_min_pred", math.nan)),
+            "boundary_h_final_pred": float(evaluation.get("boundary_h_final_pred", math.nan)),
             "left_boundary_margin": float(evaluation.get("left_boundary_margin", math.nan)),
             "right_boundary_margin": float(evaluation.get("right_boundary_margin", math.nan)),
             "final_boundary_margin": float(evaluation.get("road_boundary_margin_final_pred", math.nan)),
@@ -1196,6 +1465,9 @@ class RSSCBFFilter(StaticRSSFilter):
                 "min_h_2d": H,
                 "current_h_2d": current_H,
                 "final_h_2d": final_H,
+                "boundary_h_current": float(evaluation.get("boundary_h_current", math.nan)),
+                "boundary_h_min_pred": float(evaluation.get("boundary_h_min_pred", math.nan)),
+                "boundary_h_final_pred": float(evaluation.get("boundary_h_final_pred", math.nan)),
             },
             "intervention_cost": intervention_cost,
             "progress_score": self._score_progress_after_rollout(state, action),
@@ -1214,6 +1486,9 @@ class RSSCBFFilter(StaticRSSFilter):
             "H": float(candidate.get("H", math.nan)),
             "final_H": float(candidate.get("final_H", math.nan)),
             "H_improvement": float(candidate.get("H_improvement", math.nan)),
+            "boundary_h_current": float(candidate.get("boundary_h_current", math.nan)),
+            "boundary_h_min_pred": float(candidate.get("boundary_h_min_pred", math.nan)),
+            "boundary_h_final_pred": float(candidate.get("boundary_h_final_pred", math.nan)),
             "min_boundary_margin": float(candidate.get("min_boundary_margin", math.nan)),
             "final_boundary_margin": float(candidate.get("final_boundary_margin", math.nan)),
             "boundary_margin_improvement": float(candidate.get("boundary_margin_improvement", math.nan)),
@@ -1232,7 +1507,7 @@ class RSSCBFFilter(StaticRSSFilter):
         safe_candidates = [
             candidate
             for candidate in candidates
-            if float(candidate.get("H", -math.inf)) >= -self.config.small_tolerance
+            if float(candidate.get("H", -math.inf)) >= 0.0
         ]
         if safe_candidates:
             return max(
@@ -1263,7 +1538,7 @@ class RSSCBFFilter(StaticRSSFilter):
         )
 
     def _rss_2d_candidate_reject_reason(self, evaluation: Dict[str, Any]) -> str:
-        if float(evaluation.get("H", math.inf)) < -self.config.small_tolerance:
+        if float(evaluation.get("H", math.inf)) < 0.0:
             worst = evaluation.get("worst", {}) if isinstance(evaluation, dict) else {}
             object_type = str(worst.get("object_type", "unknown"))
             return "unified_H_violation:{}".format(object_type)
@@ -1307,6 +1582,8 @@ class RSSCBFFilter(StaticRSSFilter):
             "min_h_2d": float(selected_eval.get("min_h_2d", math.inf)),
             "current_h_2d": float(selected_eval.get("current_h_2d", math.inf)),
             "final_h_2d": float(selected_eval.get("final_h_2d", math.inf)),
+            "H_nominal": float(nominal_eval.get("H", nominal_eval.get("min_h_2d", math.inf))),
+            "H_selected": float(selected_eval.get("H", selected_eval.get("min_h_2d", math.inf))),
             "nominal_H": float(nominal_eval.get("H", nominal_eval.get("min_h_2d", math.inf))),
             "selected_H": float(selected_eval.get("H", selected_eval.get("min_h_2d", math.inf))),
             "worst_h": float(worst.get("h", selected_eval.get("H", math.inf))) if worst else math.inf,
@@ -1319,7 +1596,7 @@ class RSSCBFFilter(StaticRSSFilter):
             ),
             "nominal_min_h_2d": float(nominal_eval.get("min_h_2d", math.inf)),
             "nominal_final_h_2d": float(nominal_eval.get("final_h_2d", math.inf)),
-            "nominal_hard_safe": bool(float(nominal_eval.get("H", -math.inf)) >= -self.config.small_tolerance),
+            "nominal_hard_safe": bool(float(nominal_eval.get("H", -math.inf)) >= 0.0),
             "nominal_boundary_margin_above_threshold": bool(nominal_eval.get("road_boundary_safe", False)),
             "rss_2d_safety_margin": float(getattr(self.config, "rss_2d_safety_margin", 0.0)),
             "rss_2d_boundary_margin_threshold": float(
@@ -1342,6 +1619,15 @@ class RSSCBFFilter(StaticRSSFilter):
             "left_boundary_margin": float(selected_eval.get("left_boundary_margin", math.nan)),
             "right_boundary_margin": float(selected_eval.get("right_boundary_margin", math.nan)),
             "min_boundary_margin": float(selected_eval.get("min_boundary_margin", math.nan)),
+            "boundary_h_current": float(selected_eval.get("boundary_h_current", math.nan)),
+            "boundary_h_selected": float(
+                selected_eval.get("boundary_h_min_pred", selected_eval.get("boundary_h_current", math.nan))
+            ),
+            "boundary_h_nominal": float(
+                nominal_eval.get("boundary_h_min_pred", nominal_eval.get("boundary_h_current", math.nan))
+            ),
+            "boundary_h_min_pred": float(selected_eval.get("boundary_h_min_pred", math.nan)),
+            "boundary_h_final_pred": float(selected_eval.get("boundary_h_final_pred", math.nan)),
             "road_boundary_margin_current": float(selected_eval.get("road_boundary_margin_current", math.nan)),
             "road_boundary_margin_min_pred": float(selected_eval.get("road_boundary_margin_min_pred", math.nan)),
             "road_boundary_margin_final_pred": float(selected_eval.get("road_boundary_margin_final_pred", math.nan)),
@@ -1351,6 +1637,8 @@ class RSSCBFFilter(StaticRSSFilter):
             "predicted_lane_offset": float(selected_eval.get("predicted_lane_offset", math.nan)),
             "road_boundary_centering_improvement": float(selected_eval.get("road_boundary_centering_improvement", math.nan)),
             "selected_action": list(u_safe),
+            "selected_acc": float(u_safe[0]),
+            "selected_steer": float(u_safe[1]),
             "nominal_action": list(u_original),
             "filter_intervened": bool(self._action_distance_sq(u_safe, u_original) > self.config.small_tolerance),
             "candidate_reject_reasons": projection_debug.get("candidate_reject_reasons", ""),
@@ -1374,6 +1662,7 @@ class RSSCBFFilter(StaticRSSFilter):
             "safety_object_count_local": int(profile.get("safety_object_count_local", len(objects))),
             "horizon_steps": int(profile.get("horizon_steps", selected_eval.get("horizon_steps", 0))),
             "selected_min_boundary_margin": float(selected.get("min_boundary_margin", math.nan)) if isinstance(selected, dict) else math.nan,
+            "selected_boundary_h": float(selected.get("boundary_h_min_pred", math.nan)) if isinstance(selected, dict) else math.nan,
             "selected_final_boundary_margin": float(selected.get("final_boundary_margin", math.nan)) if isinstance(selected, dict) else math.nan,
             "selected_boundary_margin_improvement": float(selected.get("boundary_margin_improvement", math.nan)) if isinstance(selected, dict) else math.nan,
             "selected_centering_score": float(selected.get("centering_score", math.nan)) if isinstance(selected, dict) else math.nan,
@@ -1398,6 +1687,8 @@ class RSSCBFFilter(StaticRSSFilter):
                 "H": float(nominal_eval.get("H", math.inf)),
                 "min_h_2d": float(nominal_eval.get("min_h_2d", math.inf)),
                 "final_h_2d": float(nominal_eval.get("final_h_2d", math.inf)),
+                "boundary_h_current": float(nominal_eval.get("boundary_h_current", math.nan)),
+                "boundary_h_min_pred": float(nominal_eval.get("boundary_h_min_pred", math.nan)),
                 "road_boundary_margin_min_pred": float(nominal_eval.get("road_boundary_margin_min_pred", math.nan)),
             },
             "projection_debug": projection_debug,
@@ -1426,11 +1717,16 @@ class RSSCBFFilter(StaticRSSFilter):
         for key in [
             "road_boundary_left_margin_min_pred",
             "road_boundary_right_margin_min_pred",
+            "boundary_h_current",
+            "boundary_h_min_pred",
+            "boundary_h_final_pred",
             "ego_dist_to_left_side",
             "ego_dist_to_right_side",
             "ego_on_lane",
             "ego_out_of_route",
             "ego_crash_sidewalk",
+            "ego_on_yellow_continuous_line",
+            "ego_on_white_continuous_line",
         ]:
             if key in selected_eval:
                 info[key] = selected_eval[key]
