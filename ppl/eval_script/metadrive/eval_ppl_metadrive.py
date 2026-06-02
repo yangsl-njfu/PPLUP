@@ -22,11 +22,57 @@ import argparse
 import copy
 import os
 import os.path as osp
+import sys
 import time
 import traceback
+import warnings
 
 import numpy as np
 import pandas as pd
+
+
+_NODEPATH_ID_WARNING_TEXT = "NodePath.id() is deprecated"
+
+
+class _NodePathIdWarningFilter:
+    """Suppress only Panda3D's noisy NodePath.id deprecation line."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._drop_next_blank_write = False
+
+    def write(self, text):
+        if _NODEPATH_ID_WARNING_TEXT in str(text):
+            self._drop_next_blank_write = True
+            return len(text)
+        if self._drop_next_blank_write and not str(text).strip():
+            self._drop_next_blank_write = False
+            return len(text)
+        self._drop_next_blank_write = False
+        return self._stream.write(text)
+
+    def flush(self):
+        return self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _suppress_nodepath_id_warning():
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*NodePath\.id\(\) is deprecated.*",
+        category=Warning,
+    )
+    if not isinstance(sys.stderr, _NodePathIdWarningFilter):
+        sys.stderr = _NodePathIdWarningFilter(sys.stderr)
+    if not isinstance(sys.stdout, _NodePathIdWarningFilter):
+        sys.stdout = _NodePathIdWarningFilter(sys.stdout)
+
+
+if os.environ.get("PPL_SUPPRESS_NODEPATH_ID_WARNING", "1") != "0":
+    _suppress_nodepath_id_warning()
+
 
 from ppl.experiments.metadrive.driving_env import DrivingEnv
 from ppl.ppl import PPL

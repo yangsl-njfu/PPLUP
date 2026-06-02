@@ -1422,7 +1422,7 @@ class StaticRSSFilter:
         cfg = self.config
         reference_lane = state.get("_frenet_reference_lane", self._last_frenet_reference_lane)
         next_state = self._copy_state_preserving_frenet_reference(state)
-        ego = copy.deepcopy(self._ego(state))
+        ego = self._copy_entity_without_runtime_refs(self._ego(state))
 
         x = float(ego.get("x", 0.0))
         y = float(ego.get("y", 0.0))
@@ -1461,11 +1461,15 @@ class StaticRSSFilter:
         return value
 
     def _copy_entity_without_runtime_refs(self, entity: Any) -> Any:
-        return copy.deepcopy(self._strip_runtime_object_refs(entity))
+        stripped = self._strip_runtime_object_refs(entity)
+        try:
+            return copy.deepcopy(stripped)
+        except TypeError:
+            return stripped
 
     def _copy_entity_preserving_runtime_refs(self, entity: Any) -> Any:
         if not isinstance(entity, dict):
-            return copy.deepcopy(entity)
+            return entity
         source = entity.get("_metadrive_source", None)
         copied = self._copy_entity_without_runtime_refs(entity)
         if source is not None and isinstance(copied, dict):
