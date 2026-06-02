@@ -4457,7 +4457,7 @@ class RSSMPCFilter(RSSCBFFilter):
                 return True, "left_escape_deconflicted"
             return True, "front_object_deconflicted"
 
-        if is_lateral_escape and road_boundary_safe and terminal_lateral_separation_safe and critical_longitudinal_margin_safe:
+        if is_lateral_escape and road_boundary_safe and terminal_lateral_separation_safe:
             if lateral_margin_improved and path_overlap_reduced:
                 if escape_side == "right":
                     return True, "right_escape_deconflicted"
@@ -4504,7 +4504,7 @@ class RSSMPCFilter(RSSCBFFilter):
         if terminal_deconflicted and not final_path_overlap:
             return True, "front_object_deconflicted"
 
-        if is_lateral_escape and terminal_deconflicted and road_boundary_safe and critical_longitudinal_margin_safe:
+        if is_lateral_escape and terminal_deconflicted and road_boundary_safe:
             if final_lateral_rss_margin >= self.mpc_config.lateral_rss_terminal_safe_threshold:
                 if escape_side == "right":
                     return True, "right_escape_deconflicted"

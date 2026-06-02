@@ -60,6 +60,7 @@ class RSSCBFConfig(StaticRSSConfig):
     certified_lateral_escape_margin_buffer: float = 1.0
     certified_lateral_creep_critical_margin: float = -1.5
     certified_lateral_creep_max_acc: float = 1.0
+    strong_brake: float = -5.0
 
     enable_2d_rss_cbf: bool = True
     enable_frenet_coordinates: bool = True
@@ -318,14 +319,37 @@ class RSSCBFFilter(StaticRSSFilter):
         )
         selected = projection_debug.get("selected", {}) if isinstance(projection_debug, dict) else {}
         selected_eval = selected.get("evaluation", nominal_eval) if isinstance(selected, dict) else nominal_eval
-        selected_safe = bool(float(selected.get("H", selected_eval.get("H", -math.inf))) >= 0.0)
+        selected_safe = bool(selected.get("_certified_safe", False))
 
-        if selected_safe:
+        if selected and selected_safe:
             mode = "rss_2d_cbf_intervention"
-            reason = "selected_safe_candidate"
+            reason = "selected_certified_safe"
         else:
-            mode = "rss_2d_cbf_recovery"
-            reason = "selected_least_unsafe"
+            u_safe = self._minimum_risk_stop(u_original)
+            profile["total_filter_time"] = time.perf_counter() - total_start
+            projection_debug["profile"] = profile
+            self._rss_2d_last_profile = dict(profile)
+            self._maybe_log_rss_2d_profile(profile, mode="fallback_no_certified_candidate")
+            info = self._make_rss_2d_cbf_info(
+                state=state,
+                objects=objects,
+                mode="fallback_no_certified_candidate",
+                reason="no_certified_cbf_feasible_candidate",
+                u_original=u_original,
+                u_safe=u_safe,
+                nominal_eval=nominal_eval,
+                selected_eval=nominal_eval,
+                projection_debug=projection_debug,
+            )
+            info["certified_safe"] = False
+            info["cbf_feasible"] = False
+            info["hard_safe"] = False
+            info["emergency_veto"] = False
+            info["fallback_reason"] = "no_certified_cbf_feasible_candidate"
+            info["min_h"] = float(nominal_eval.get("H", -math.inf))
+            info["min_cbf_residual"] = float(nominal_eval.get("H", -math.inf))
+            self._rss_2d_prev_selected_action = self._clip_action(u_safe)
+            return u_safe, info
 
         profile["total_filter_time"] = time.perf_counter() - total_start
         projection_debug["profile"] = profile
@@ -354,9 +378,7 @@ class RSSCBFFilter(StaticRSSFilter):
         static_obstacles = list(state.get("static_obstacles", []) or [])
         static_objects: List[SafetyObject]
         signature = self._rss_2d_static_obstacle_signature(static_obstacles)
-        cache_enabled = bool(getattr(self.config, "enable_static_safety_object_cache", True)) and not bool(
-            getattr(self.config, "enable_frenet_coordinates", False)
-        )
+        cache_enabled = bool(getattr(self.config, "enable_static_safety_object_cache", True))
         if (
             cache_enabled
             and self._rss_2d_static_cache_signature == signature
@@ -588,9 +610,7 @@ class RSSCBFFilter(StaticRSSFilter):
         dynamic_radius = max(broad_radius, float(getattr(self.config, "dynamic_check_distance", broad_radius)))
         static_rows: List[Tuple[float, float, SafetyObject]] = []
         dynamic_rows: List[Tuple[float, float, SafetyObject]] = []
-        static_cache_enabled = bool(getattr(self.config, "enable_static_safety_object_cache", True)) and not bool(
-            getattr(self.config, "enable_frenet_coordinates", False)
-        )
+        static_cache_enabled = bool(getattr(self.config, "enable_static_safety_object_cache", True))
         if static_cache_enabled:
             static_candidates = self._query_rss_2d_static_grid(state, broad_radius)
             dynamic_candidates = [obj for obj in spatial_objects if obj.is_dynamic]
@@ -1820,17 +1840,25 @@ class RSSCBFFilter(StaticRSSFilter):
 
         if selected is None:
             selected = self._select_2d_rss_cbf_candidate(candidates, u_original)
-        if selected is None and candidates:
-            selected = candidates[0]
         if selected is None:
-            selected = self._make_2d_rss_cbf_candidate(
-                state,
-                objects,
-                u_original,
-                u_original,
-                evaluation=nominal_eval,
-                search_stage="empty",
-            )
+            unsafe_candidates = [
+                candidate
+                for candidate in candidates
+                if float(candidate.get("current_H", candidate.get("H_current", math.inf))) < 0.0
+            ]
+            return None, {
+                "projection_failed": True,
+                "candidate_count": len(candidates),
+                "candidate_reject_reasons": "",
+                "safe_candidate_count": sum(1 for c in candidates if float(c.get("H", -math.inf)) >= 0.0),
+                "road_safe_candidate_count": sum(1 for c in candidates if c.get("road_boundary_safe", False)),
+                "valid_recovery_candidate_count": 0,
+                "least_unsafe_candidate_count": len(unsafe_candidates),
+                "selected": None,
+                "margins": {},
+                "candidates": [],
+                "reason": "no_certified_cbf_feasible_candidate",
+            }
 
         safe_candidates = [
             candidate
@@ -2249,26 +2277,15 @@ class RSSCBFFilter(StaticRSSFilter):
     ) -> Optional[Dict[str, Any]]:
         if not candidates:
             return None
-        currently_unsafe = any(float(candidate.get("current_H", candidate.get("H_current", math.inf))) < 0.0 for candidate in candidates)
-        if currently_unsafe:
-            valid_recovery_candidates = [
-                candidate for candidate in candidates if self._rss_2d_valid_recovery_candidate(candidate)
-            ]
-            if valid_recovery_candidates:
-                selected = max(valid_recovery_candidates, key=self._rss_2d_recovery_candidate_sort_key)
-                selected["_selected_reason"] = "selected_adaptive_recovery"
-                return selected
-            selected = max(candidates, key=self._rss_2d_least_unsafe_recovery_candidate_sort_key)
-            selected["_selected_reason"] = "least_unsafe_adaptive_recovery"
-            return selected
-        safe_candidates = [
+        certified_candidates = [
             candidate
             for candidate in candidates
             if float(candidate.get("H", -math.inf)) >= 0.0
+            and bool(candidate.get("road_boundary_safe", False))
         ]
-        if safe_candidates:
-            return max(
-                safe_candidates,
+        if certified_candidates:
+            selected = max(
+                certified_candidates,
                 key=lambda item: (
                     -float(item.get("intervention_cost", math.inf)),
                     float(item.get("H", -math.inf)),
@@ -2278,7 +2295,10 @@ class RSSCBFFilter(StaticRSSFilter):
                     -float(item.get("steer_penalty", math.inf)),
                 ),
             )
-        return max(candidates, key=self._rss_2d_candidate_sort_key)
+            selected["_selected_reason"] = "selected_certified_safe"
+            selected["_certified_safe"] = True
+            return selected
+        return None
 
     def _rss_2d_valid_recovery_candidate(self, item: Dict[str, Any]) -> bool:
         current_H = self._safe_float(item.get("current_H", item.get("H_current", math.inf)), math.inf)
@@ -2420,6 +2440,13 @@ class RSSCBFFilter(StaticRSSFilter):
             "worst_h": float(worst.get("h", selected_eval.get("H", math.inf))) if worst else math.inf,
             "safety_object_count": int(selected_eval.get("safety_object_count", 0)),
             "fallback_used": False,
+            "certified_safe": bool(selected.get("_certified_safe", False)),
+            "cbf_feasible": bool(selected.get("_certified_safe", False)),
+            "hard_safe": bool(selected.get("_certified_safe", False)),
+            "emergency_veto": False,
+            "fallback_reason": "",
+            "min_h": float(selected_eval.get("H", math.inf)),
+            "min_cbf_residual": float(selected_eval.get("H", math.inf)),
             "selected_steering_changed": bool(abs(float(u_safe[1]) - float(u_original[1])) > self.config.small_tolerance),
             "excessive_braking": bool(
                 float(u_safe[0]) < float(getattr(self.config, "rss_2d_min_speed_preserve_acc", -0.2))
@@ -3379,3 +3406,7 @@ class RSSCBFFilter(StaticRSSFilter):
                 "longitudinal_constraint_relaxed_by_lateral_escape": False,
             })
         return self._with_action_debug(info, u_original, u_safe)
+
+    def _minimum_risk_stop(self, u_nom: Action) -> Action:
+        strong_brake = float(getattr(self.config, "strong_brake", -5.0))
+        return self._clip_action([strong_brake, u_nom[1]])
