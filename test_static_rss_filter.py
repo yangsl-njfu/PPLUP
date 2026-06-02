@@ -103,6 +103,30 @@ class StaticRSSFilterTest(unittest.TestCase):
         self.assertEqual(info["mode"], "normal")
         self.assertFalse(info["obstacle_detected"])
 
+    def test_metadrive_action_adapter_uses_steer_throttle_brake_order(self):
+        control = {"acc": -5.0, "steer": 0.25}
+        env_action = self.filter.to_env_action(control, "metadrive")
+        components = self.filter.env_action_components(env_action, "metadrive")
+        brake_state = self.filter.action_brake_state(control, "metadrive")
+
+        self.assertEqual(env_action, [0.25, -1.0])
+        self.assertEqual(components["steer"], 0.25)
+        self.assertEqual(components["throttle_brake"], -1.0)
+        self.assertEqual(self.filter.from_policy_action(env_action, "metadrive"), control)
+        self.assertTrue(brake_state["selected_acc_maps_to_brake"])
+        self.assertEqual(
+            brake_state["action_order_detected"],
+            "env:[steer, throttle_brake]; internal/control:[acc, steer]",
+        )
+
+    def test_prediction_model_negative_acc_reduces_speed(self):
+        state = make_state(with_obstacle=False)
+        state["ego"]["speed"] = 6.0
+
+        next_state = self.filter._simulate_next_state(state, {"acc": -1.0, "steer": 0.0})
+        self.assertLess(next_state["ego"]["speed"], state["ego"]["speed"])
+        self.assertEqual(next_state["ego"]["_prediction_action_order"], "internal/control:[acc, steer]")
+
     def test_obstacle_ahead_no_bypass_stops(self):
         u_safe, info = self.filter.filter_action(
             make_state(with_obstacle=True, left_available=False, right_available=False),

@@ -734,6 +734,24 @@ class StaticRSSFilter:
             return self._clip_action([acc, steer])
         raise ValueError("Unsupported action_format: {}".format(action_format))
 
+    def env_action_components(
+        self,
+        action: Sequence[float],
+        action_format: str = "metadrive",
+    ) -> Dict[str, float]:
+        """Return named components for an action in the target environment order."""
+        if len(action) != 2:
+            raise ValueError("Action must have length 2, got {}".format(action))
+        if action_format == "acc_steer":
+            acc, steer = self._clip_action(action)
+            return {"acc": float(acc), "steer": float(steer)}
+        if action_format in {"steer_throttle", "metadrive"}:
+            return {
+                "steer": float(action[0]),
+                "throttle_brake": max(-1.0, min(1.0, float(action[1]))),
+            }
+        raise ValueError("Unsupported action_format: {}".format(action_format))
+
     def from_internal_action(self, action: Sequence[float], action_format: str = "acc_steer") -> Action:
         """Convert internal ``[acc, steer]`` action to an environment format."""
         acc, steer = self._clip_action(action)
@@ -749,6 +767,64 @@ class StaticRSSFilter:
                 max(-1.0, min(1.0, throttle_brake)),
             ]
         raise ValueError("Unsupported action_format: {}".format(action_format))
+
+    def control_action_from_internal(self, action: Sequence[float]) -> Dict[str, float]:
+        """Return an explicit control action dict from internal ``[acc, steer]``."""
+        acc, steer = self._clip_action(action)
+        return {"acc": float(acc), "steer": float(steer)}
+
+    def internal_action_from_control(self, control_action: Any) -> Action:
+        """Return internal ``[acc, steer]`` from a control dict or sequence."""
+        if isinstance(control_action, dict):
+            return self._clip_action([
+                control_action.get("acc", 0.0),
+                control_action.get("steer", 0.0),
+            ])
+        return self._clip_action(control_action)
+
+    def from_policy_action(
+        self,
+        policy_action: Sequence[float],
+        action_format: str = "metadrive",
+    ) -> Dict[str, float]:
+        """Convert a raw policy/env action into explicit ``{"acc", "steer"}`` control fields."""
+        return self.control_action_from_internal(self.to_internal_action(policy_action, action_format))
+
+    def to_env_action(
+        self,
+        control_action: Any,
+        action_format: str = "metadrive",
+    ) -> Action:
+        """Convert explicit control fields to the target environment action order."""
+        return self.from_internal_action(self.internal_action_from_control(control_action), action_format)
+
+    def action_order_descriptor(self, action_format: str = "metadrive") -> str:
+        if action_format in {"steer_throttle", "metadrive"}:
+            return "env:[steer, throttle_brake]; internal/control:[acc, steer]"
+        if action_format == "acc_steer":
+            return "env/internal/control:[acc, steer]"
+        return "unknown:{}".format(action_format)
+
+    def action_brake_state(self, control_action: Any, action_format: str = "metadrive") -> Dict[str, Any]:
+        """Summarize whether a control action maps to braking in the environment."""
+        control = self.internal_action_from_control(control_action)
+        env_action = self.to_env_action(self.control_action_from_internal(control), action_format)
+        components = self.env_action_components(env_action, action_format)
+        acc = float(control[0])
+        if "throttle_brake" in components:
+            throttle_brake = float(components["throttle_brake"])
+            is_brake = throttle_brake < -self.config.small_tolerance
+        else:
+            throttle_brake = math.nan
+            is_brake = acc < -self.config.small_tolerance
+        return {
+            "control_action": self.control_action_from_internal(control),
+            "env_action": list(env_action),
+            "env_action_components": components,
+            "selected_acc_maps_to_brake": bool(is_brake),
+            "env_throttle_brake": float(throttle_brake),
+            "action_order_detected": self.action_order_descriptor(action_format),
+        }
 
     def parse_state_from_metadrive(self, env: Any) -> State:
         """Best-effort adapter from a MetaDrive env/wrapper to generic state.
@@ -955,13 +1031,21 @@ class StaticRSSFilter:
     def _with_action_debug(
         self, info: Dict[str, Any], u_original: Sequence[float], u_safe: Sequence[float]
     ) -> Dict[str, Any]:
-        info["acc_nominal"] = float(u_original[0])
-        info["acc_safe"] = float(u_safe[0])
-        info["acc_delta"] = float(u_safe[0] - u_original[0])
-        info["steer_nominal"] = float(u_original[1])
-        info["steer_safe"] = float(u_safe[1])
-        info["steer_delta"] = float(u_safe[1] - u_original[1])
+        original_control = self.control_action_from_internal(u_original)
+        safe_control = self.control_action_from_internal(u_safe)
+        info["acc_nominal"] = float(original_control["acc"])
+        info["acc_safe"] = float(safe_control["acc"])
+        info["acc_delta"] = float(safe_control["acc"] - original_control["acc"])
+        info["steer_nominal"] = float(original_control["steer"])
+        info["steer_safe"] = float(safe_control["steer"])
+        info["steer_delta"] = float(safe_control["steer"] - original_control["steer"])
         info["action_delta"] = float(math.sqrt(info["acc_delta"] ** 2 + info["steer_delta"] ** 2))
+        info.setdefault("control_action_order", "internal/control:[acc, steer]")
+        info.setdefault("prediction_action_order", "internal/control:[acc, steer]")
+        info.setdefault("rss_filter_input_control_action", original_control)
+        info.setdefault("rss_filter_selected_control_action", safe_control)
+        info.setdefault("rss_filter_selected_acc", float(safe_control["acc"]))
+        info.setdefault("rss_filter_selected_steer", float(safe_control["steer"]))
         info.setdefault("reason", "")
         return info
 
@@ -1417,8 +1501,10 @@ class StaticRSSFilter:
         return rollout
 
     def _simulate_next_state(self, state: State, action: Sequence[float]) -> State:
-        """Lightweight rollout model; replace with real dynamics if available."""
-        acc, steer = self._clip_action(action)
+        """Lightweight rollout using explicit internal ``[acc, steer]`` semantics."""
+        control_action = self.control_action_from_internal(self.internal_action_from_control(action))
+        acc = float(control_action["acc"])
+        steer = float(control_action["steer"])
         cfg = self.config
         reference_lane = state.get("_frenet_reference_lane", self._last_frenet_reference_lane)
         next_state = self._copy_state_preserving_frenet_reference(state)
@@ -1429,10 +1515,14 @@ class StaticRSSFilter:
         heading = float(ego.get("heading", 0.0))
         speed = max(0.0, float(ego.get("speed", 0.0)))
 
-        ego["x"] = x + speed * math.cos(heading) * cfg.dt
-        ego["y"] = y + speed * math.sin(heading) * cfg.dt
-        ego["speed"] = max(0.0, min(cfg.v_max, speed + acc * cfg.dt))
-        ego["heading"] = heading + steer * cfg.steer_gain * cfg.dt
+        next_speed = max(0.0, min(cfg.v_max, speed + acc * cfg.dt))
+        next_heading = heading + steer * cfg.steer_gain * cfg.dt
+        ego["x"] = x + next_speed * math.cos(next_heading) * cfg.dt
+        ego["y"] = y + next_speed * math.sin(next_heading) * cfg.dt
+        ego["speed"] = next_speed
+        ego["heading"] = next_heading
+        ego["_prediction_action_order"] = "internal/control:[acc, steer]"
+        ego["_prediction_control_action"] = control_action
         self._attach_frenet_to_entity(ego, ego, reference_lane, role="ego")
         next_state["ego"] = ego
         return next_state
@@ -1633,10 +1723,8 @@ class StaticRSSFilter:
                 "fallback_reason": "local_coordinates_failed:{}".format(type(exc).__name__),
             }
 
-        heading_ref = math.nan
-        try:
-            heading_ref = float(reference_lane.heading_at(s_value))
-        except Exception as exc:
+        heading_ref, heading_reason = self._lane_heading_ref(reference_lane, s_value)
+        if not math.isfinite(heading_ref):
             return {
                 "s": float(s_value),
                 "l": float(l_value),
@@ -1644,7 +1732,7 @@ class StaticRSSFilter:
                 "v_s": math.nan,
                 "v_l": math.nan,
                 "valid": False,
-                "fallback_reason": "heading_at_failed:{}".format(type(exc).__name__),
+                "fallback_reason": heading_reason,
             }
 
         heading = self._entity_heading(vehicle, heading_ref)
@@ -1659,6 +1747,28 @@ class StaticRSSFilter:
             "valid": True,
             "fallback_reason": "",
         }
+
+    def _lane_heading_ref(self, lane: Any, s_value: float) -> Tuple[float, str]:
+        try:
+            heading_value = lane.heading_at(s_value)
+            try:
+                return float(heading_value), ""
+            except (TypeError, ValueError):
+                arr = np.asarray(heading_value, dtype=float).reshape(-1)
+                if arr.size >= 2 and math.isfinite(float(arr[0])) and math.isfinite(float(arr[1])):
+                    return float(math.atan2(float(arr[1]), float(arr[0]))), ""
+                raise
+        except Exception as heading_exc:
+            try:
+                return float(lane.heading_theta_at(s_value)), ""
+            except Exception as theta_exc:
+                return (
+                    math.nan,
+                    "heading_at_failed:{};heading_theta_at_failed:{}".format(
+                        type(heading_exc).__name__,
+                        type(theta_exc).__name__,
+                    ),
+                )
 
     def _attach_frenet_to_entity(
         self,
@@ -1689,6 +1799,7 @@ class StaticRSSFilter:
                 "frenet_heading_ref": float(frenet.get("heading_ref", math.nan)),
                 "frenet_v_s": float(frenet.get("v_s", math.nan)),
                 "frenet_v_l": float(frenet.get("v_l", math.nan)),
+                "frenet_source_mode": "computed_frenet" if valid else "ego_local_fallback",
                 "frenet_role": role,
             }
         )
@@ -1971,6 +2082,7 @@ class StaticRSSFilter:
             "dist_to_left_side": self._safe_float(self._resolve_attr(vehicle, "dist_to_left_side", math.nan), math.nan),
             "dist_to_right_side": self._safe_float(self._resolve_attr(vehicle, "dist_to_right_side", math.nan), math.nan),
             "on_lane": _bool_attr("on_lane", True),
+            "out_of_road": _bool_attr("out_of_road", False),
             "out_of_route": _bool_attr("out_of_route", False),
             "crash_sidewalk": _bool_attr("crash_sidewalk", False),
             "on_yellow_continuous_line": _bool_attr("on_yellow_continuous_line", False),

@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import copy
+import math
 import os
 import os.path as osp
 import sys
@@ -137,6 +138,181 @@ def reset_eval_env(env, seed):
             raise force_seed_error
 
 
+def extract_action_probe_state(env, rss_filter=None):
+    """Return speed/heading/lateral state for action pipeline debugging."""
+    state = {}
+    if rss_filter is not None:
+        try:
+            parsed = rss_filter.parse_state_from_metadrive(env)
+            ego = parsed.get("ego", {}) or {}
+            state.update(
+                speed=float(ego.get("speed", np.nan)),
+                heading=float(ego.get("heading", np.nan)),
+                ego_l=float(ego.get("frenet_l", ego.get("l", np.nan))),
+            )
+            lane = parsed.get("_frenet_reference_lane", None)
+            if lane is not None and math.isfinite(float(ego.get("x", np.nan))) and math.isfinite(float(ego.get("y", np.nan))):
+                try:
+                    _, ego_l = lane.local_coordinates(np.asarray([float(ego["x"]), float(ego["y"])], dtype=float))
+                    state["ego_l"] = float(ego_l)
+                except Exception:
+                    pass
+            return state
+        except Exception:
+            pass
+    vehicle = getattr(env, "vehicle", getattr(env, "agent", None))
+    if vehicle is not None:
+        speed = getattr(vehicle, "speed", np.nan)
+        heading = getattr(vehicle, "heading_theta", getattr(vehicle, "heading", np.nan))
+        state.update(speed=float(speed), heading=float(heading), ego_l=np.nan)
+    return state
+
+
+def run_metadrive_action_probe(env, rss_filter, seed, probe_steps=5):
+    """Force basic MetaDrive env actions to identify action order and signs."""
+    probe_actions = [
+        ("A_brake_or_steer_neg", np.asarray([-1.0, 0.0], dtype=np.float32)),
+        ("B_throttle_or_steer_pos", np.asarray([1.0, 0.0], dtype=np.float32)),
+        ("C_steer_or_brake_neg", np.asarray([0.0, -1.0], dtype=np.float32)),
+        ("D_steer_or_throttle_pos", np.asarray([0.0, 1.0], dtype=np.float32)),
+    ]
+    print("[RSS-ACTION-PROBE] action_order_assumption={}".format(rss_filter.action_order_descriptor("metadrive")))
+    summaries = {}
+    records = []
+    for name, forced_action in probe_actions:
+        reset_eval_env(env, seed)
+        print("[RSS-ACTION-PROBE] begin {} env_action={}".format(name, forced_action.tolist()))
+        initial = extract_action_probe_state(env, rss_filter)
+        final = dict(initial)
+        for step in range(int(probe_steps)):
+            before = extract_action_probe_state(env, rss_filter)
+            _, _, done, info = env.step(forced_action)
+            after = extract_action_probe_state(env, rss_filter)
+            final = dict(after)
+            env_components = rss_filter.env_action_components(forced_action, "metadrive")
+            record = {
+                "probe_name": name,
+                "step": step,
+                "action_sent_to_env": forced_action.tolist(),
+                "env_action_steer": env_components.get("steer", np.nan),
+                "env_action_throttle_brake": env_components.get("throttle_brake", np.nan),
+                "speed_before": float(before.get("speed", np.nan)),
+                "speed_after": float(after.get("speed", np.nan)),
+                "heading_before": float(before.get("heading", np.nan)),
+                "heading_after": float(after.get("heading", np.nan)),
+                "ego_l_before": float(before.get("ego_l", np.nan)),
+                "ego_l_after": float(after.get("ego_l", np.nan)),
+                "env_velocity": info.get("velocity", np.nan) if isinstance(info, dict) else np.nan,
+                "done": bool(done),
+            }
+            records.append(record)
+            print(
+                "[RSS-ACTION-PROBE] {} step={} action_sent_to_env={} "
+                "speed_before={:.6f} speed_after={:.6f} heading_before={:.6f} heading_after={:.6f} "
+                "ego_l_before={:.6f} ego_l_after={:.6f} env_velocity={}".format(
+                    name,
+                    step,
+                    forced_action.tolist(),
+                    float(before.get("speed", np.nan)),
+                    float(after.get("speed", np.nan)),
+                    float(before.get("heading", np.nan)),
+                    float(after.get("heading", np.nan)),
+                    float(before.get("ego_l", np.nan)),
+                    float(after.get("ego_l", np.nan)),
+                    info.get("velocity", np.nan) if isinstance(info, dict) else np.nan,
+                )
+            )
+            if done:
+                break
+        summaries[name] = {
+            "speed_delta": float(final.get("speed", np.nan)) - float(initial.get("speed", np.nan)),
+            "heading_delta": float(final.get("heading", np.nan)) - float(initial.get("heading", np.nan)),
+            "ego_l_delta": float(final.get("ego_l", np.nan)) - float(initial.get("ego_l", np.nan)),
+        }
+    first_dim_speed_effect = abs(summaries["B_throttle_or_steer_pos"]["speed_delta"] - summaries["A_brake_or_steer_neg"]["speed_delta"])
+    second_dim_speed_effect = abs(summaries["D_steer_or_throttle_pos"]["speed_delta"] - summaries["C_steer_or_brake_neg"]["speed_delta"])
+    first_dim_turn_effect = (
+        abs(summaries["B_throttle_or_steer_pos"]["heading_delta"])
+        + abs(summaries["A_brake_or_steer_neg"]["heading_delta"])
+        + abs(summaries["B_throttle_or_steer_pos"]["ego_l_delta"])
+        + abs(summaries["A_brake_or_steer_neg"]["ego_l_delta"])
+    )
+    second_dim_turn_effect = (
+        abs(summaries["D_steer_or_throttle_pos"]["heading_delta"])
+        + abs(summaries["C_steer_or_brake_neg"]["heading_delta"])
+        + abs(summaries["D_steer_or_throttle_pos"]["ego_l_delta"])
+        + abs(summaries["C_steer_or_brake_neg"]["ego_l_delta"])
+    )
+    throttle_dim = 0 if first_dim_speed_effect > second_dim_speed_effect else 1
+    steer_dim = 0 if first_dim_turn_effect > second_dim_turn_effect else 1
+    inferred_order = (
+        "env:[steer, throttle_brake]"
+        if steer_dim == 0 and throttle_dim == 1
+        else "env:[throttle_brake, steer]"
+        if throttle_dim == 0 and steer_dim == 1
+        else "ambiguous"
+    )
+    for record in records:
+        record.update(
+            {
+                "inferred_throttle_brake_dim": throttle_dim,
+                "inferred_steer_dim": steer_dim,
+                "action_order_detected": inferred_order,
+                "first_dim_speed_effect": first_dim_speed_effect,
+                "second_dim_speed_effect": second_dim_speed_effect,
+                "first_dim_turn_effect": first_dim_turn_effect,
+                "second_dim_turn_effect": second_dim_turn_effect,
+            }
+        )
+    print(
+        "[RSS-ACTION-PROBE] inferred throttle_brake_dim={} steer_dim={} action_order_detected={} "
+        "first_dim_speed_effect={:.6f} second_dim_speed_effect={:.6f} "
+        "first_dim_turn_effect={:.6f} second_dim_turn_effect={:.6f}".format(
+            throttle_dim,
+            steer_dim,
+            inferred_order,
+            first_dim_speed_effect,
+            second_dim_speed_effect,
+            first_dim_turn_effect,
+            second_dim_turn_effect,
+        )
+    )
+    return records
+
+
+def attach_action_pipeline_debug(
+    rss_filter,
+    rss_info,
+    env_action_nominal,
+    internal_action_nominal,
+    internal_action_safe,
+    env_action_safe,
+    action_format="metadrive",
+):
+    """Attach explicit action pipeline fields to RSS diagnostics."""
+    safe_control_action = rss_filter.control_action_from_internal(internal_action_safe)
+    brake_state = rss_filter.action_brake_state(safe_control_action, action_format)
+    env_components = rss_filter.env_action_components(env_action_safe, action_format)
+    rss_info.update(
+        policy_action_raw=list(np.asarray(env_action_nominal, dtype=float)),
+        mpc_action_raw=list(np.asarray(internal_action_safe, dtype=float)),
+        rss_filter_input_action=list(np.asarray(internal_action_nominal, dtype=float)),
+        rss_filter_selected_control_action=dict(safe_control_action),
+        rss_filter_selected_control_action_acc=float(safe_control_action["acc"]),
+        rss_filter_selected_control_action_steer=float(safe_control_action["steer"]),
+        rss_filter_selected_acc=float(safe_control_action["acc"]),
+        rss_filter_selected_steer=float(safe_control_action["steer"]),
+        rss_filter_output_env_action=list(np.asarray(env_action_safe, dtype=float)),
+        rss_filter_output_action=list(np.asarray(env_action_safe, dtype=float)),
+        action_order_detected=rss_filter.action_order_descriptor(action_format),
+        env_action_components=dict(env_components),
+        final_action_steer=float(env_components.get("steer", np.nan)),
+        final_action_throttle_brake=float(env_components.get("throttle_brake", np.nan)),
+        selected_acc_maps_to_brake=bool(brake_state.get("selected_acc_maps_to_brake", False)),
+    )
+    return safe_control_action
+
+
 def make_rss_cbf_step_record(
     ckpt_index,
     env_id,
@@ -234,6 +410,38 @@ def make_rss_cbf_step_record(
         selected_centering_score=rss_info.get("selected_centering_score", np.nan),
         selected_speed_preserve_score=rss_info.get("selected_speed_preserve_score", np.nan),
         selected_selection_score=rss_info.get("selected_selection_score", np.nan),
+        H_current=rss_info.get("H_current", np.nan),
+        H_next=rss_info.get("H_next", np.nan),
+        delta_H=rss_info.get("delta_H", np.nan),
+        final_H=rss_info.get("final_H", np.nan),
+        current_speed=rss_info.get("current_speed", np.nan),
+        predicted_speed=rss_info.get("predicted_speed", np.nan),
+        adaptive_recovery_mode=rss_info.get("adaptive_recovery_mode", False),
+        risk=rss_info.get("risk", np.nan),
+        w_delta_H=rss_info.get("w_delta_H", np.nan),
+        w_center=rss_info.get("w_center", np.nan),
+        w_speed_reduction=rss_info.get("w_speed_reduction", np.nan),
+        selected_score=rss_info.get("selected_score", np.nan),
+        selected_delta_H=rss_info.get("selected_delta_H", np.nan),
+        selected_center_recovery=rss_info.get("selected_center_recovery", np.nan),
+        selected_speed_reduction=rss_info.get("selected_speed_reduction", np.nan),
+        selected_action_distance=rss_info.get("selected_action_distance", np.nan),
+        selected_smoothness_cost=rss_info.get("selected_smoothness_cost", np.nan),
+        current_ego_l=rss_info.get("current_ego_l", np.nan),
+        predicted_ego_l=rss_info.get("predicted_ego_l", np.nan),
+        lane_center_l=rss_info.get("lane_center_l", np.nan),
+        current_l_error=rss_info.get("current_l_error", np.nan),
+        predicted_l_error=rss_info.get("predicted_l_error", np.nan),
+        boundary_recovery_score=rss_info.get("boundary_recovery_score", np.nan),
+        valid_recovery_candidate_count=rss_info.get("valid_recovery_candidate_count", np.nan),
+        least_unsafe_candidate_count=rss_info.get("least_unsafe_candidate_count", np.nan),
+        selected_candidate_delta_H=rss_info.get("selected_candidate_delta_H", np.nan),
+        selected_candidate_boundary_recovery_score=rss_info.get(
+            "selected_candidate_boundary_recovery_score", np.nan
+        ),
+        rejected_because_negative_delta_H_count=rss_info.get(
+            "rejected_because_negative_delta_H_count", np.nan
+        ),
         safety_object_count=rss_info.get("safety_object_count", np.nan),
         fallback_used_unified=rss_info.get("fallback_used", False),
         excessive_braking=rss_info.get("excessive_braking", False),
@@ -242,6 +450,54 @@ def make_rss_cbf_step_record(
         rss_2d_steer_candidate_count=rss_info.get("rss_2d_steer_candidate_count", np.nan),
         selected_action=rss_info.get("selected_action", internal_action_safe),
         nominal_action=rss_info.get("nominal_action", internal_action_nominal),
+        selected_reason=rss_info.get("selected_reason", ""),
+        policy_action_raw=rss_info.get("policy_action_raw", list(np.asarray(env_action_nominal, dtype=float))),
+        mpc_action_raw=rss_info.get("mpc_action_raw", list(np.asarray(internal_action_safe, dtype=float))),
+        rss_filter_input_action=rss_info.get("rss_filter_input_action", list(np.asarray(internal_action_nominal, dtype=float))),
+        rss_filter_selected_control_action_acc=rss_info.get(
+            "rss_filter_selected_control_action_acc", np.nan
+        ),
+        rss_filter_selected_control_action_steer=rss_info.get(
+            "rss_filter_selected_control_action_steer", np.nan
+        ),
+        rss_filter_selected_control_action=rss_info.get(
+            "rss_filter_selected_control_action",
+            {
+                "acc": rss_info.get("rss_filter_selected_control_action_acc", np.nan),
+                "steer": rss_info.get("rss_filter_selected_control_action_steer", np.nan),
+            },
+        ),
+        rss_filter_selected_acc=rss_info.get(
+            "rss_filter_selected_acc",
+            rss_info.get("rss_filter_selected_control_action_acc", np.nan),
+        ),
+        rss_filter_selected_steer=rss_info.get(
+            "rss_filter_selected_steer",
+            rss_info.get("rss_filter_selected_control_action_steer", np.nan),
+        ),
+        rss_filter_output_env_action=rss_info.get("rss_filter_output_env_action", list(np.asarray(env_action_safe, dtype=float))),
+        rss_filter_output_action=rss_info.get(
+            "rss_filter_output_action",
+            rss_info.get("rss_filter_output_env_action", list(np.asarray(env_action_safe, dtype=float))),
+        ),
+        final_action_sent_to_env=rss_info.get("final_action_sent_to_env", list(np.asarray(env_action_safe, dtype=float))),
+        action_order_detected=rss_info.get("action_order_detected", "env:[steer, throttle_brake]; internal/control:[acc, steer]"),
+        prediction_action_order=rss_info.get("prediction_action_order", "internal/control:[acc, steer]"),
+        control_action_order=rss_info.get("control_action_order", "internal/control:[acc, steer]"),
+        env_action_components=rss_info.get("env_action_components", {}),
+        final_action_steer=rss_info.get("final_action_steer", np.nan),
+        final_action_throttle_brake=rss_info.get("final_action_throttle_brake", np.nan),
+        selected_acc_maps_to_brake=rss_info.get("selected_acc_maps_to_brake", False),
+        speed_before_env_step=rss_info.get("speed_before_env_step", rss_info.get("speed_before", np.nan)),
+        speed_after_env_step=rss_info.get("speed_after_env_step", rss_info.get("speed_after", np.nan)),
+        ego_l_before_env_step=rss_info.get("ego_l_before_env_step", rss_info.get("ego_l_before", np.nan)),
+        ego_l_after_env_step=rss_info.get("ego_l_after_env_step", rss_info.get("ego_l_after", np.nan)),
+        speed_before=rss_info.get("speed_before", np.nan),
+        speed_after=rss_info.get("speed_after", np.nan),
+        heading_before=rss_info.get("heading_before", np.nan),
+        heading_after=rss_info.get("heading_after", np.nan),
+        ego_l_before=rss_info.get("ego_l_before", np.nan),
+        ego_l_after=rss_info.get("ego_l_after", np.nan),
         filter_intervened=rss_info.get("filter_intervened", action_delta > 1e-6),
         candidate_reject_reasons=rss_info.get("candidate_reject_reasons", ""),
         rss_2d_candidate_count=rss_info.get("candidate_count", np.nan),
@@ -644,6 +900,8 @@ def evaluate_ppl_once(
     rss_2d_use_superellipse=True,
     eval_max_steps_per_episode=3000,
     eval_env_start=EVAL_ENV_START,
+    rss_action_probe=False,
+    rss_action_probe_steps=5,
 ):
     """
     Evaluate one PPL checkpoint on `total_env_num` environments,
@@ -723,6 +981,36 @@ def evaluate_ppl_once(
             "[RSS-CBF] Runtime assurance enabled. Step diagnostics will be saved. "
             "2D RSS-informed CBF={}".format(enable_2d_rss_cbf)
         )
+    elif rss_action_probe:
+        rss_filter = RSSCBFFilter(RSSCBFConfig(enable_2d_rss_cbf=enable_2d_rss_cbf))
+        runtime_label = "RSS-ACTION-PROBE"
+        step_file_tag = "rss_action_probe"
+
+    if rss_action_probe:
+        probe_records = run_metadrive_action_probe(
+            env,
+            rss_filter,
+            seed=eval_env_start,
+            probe_steps=rss_action_probe_steps,
+        )
+        probe_path = osp.join(folder_name, "{}_{}_steps.csv".format(ckpt_name, step_file_tag))
+        pd.DataFrame(probe_records).to_csv(probe_path, index=False)
+        print("[RSS-ACTION-PROBE] step-level probe results saved to: {}".format(probe_path))
+        env.close()
+        return pd.DataFrame(
+            [
+                {
+                    "ckpt_index": ckpt_index,
+                    "model_name": "rss_action_probe",
+                    "success_rate": np.nan,
+                    "mean_reward": np.nan,
+                    "mean_velocity": np.nan,
+                    "total_cost": np.nan,
+                    "action_probe": True,
+                    "action_probe_step_csv": probe_path,
+                }
+            ]
+        )
 
     saved_results = []
     runtime_step_records = []
@@ -758,17 +1046,27 @@ def evaluate_ppl_once(
                 try:
                     rss_state = rss_filter.parse_state_from_metadrive(env)
                     rss_state = rss_filter.augment_state_from_observation(rss_state, o)
-                    internal_action_nominal = rss_filter.to_internal_action(env_action_nominal, "metadrive")
+                    nominal_control_action = rss_filter.from_policy_action(env_action_nominal, "metadrive")
+                    internal_action_nominal = rss_filter.internal_action_from_control(nominal_control_action)
                     internal_action_safe, rss_info = rss_filter.filter_action(rss_state, internal_action_nominal)
-                    env_action_safe = np.asarray(
-                        rss_filter.from_internal_action(internal_action_safe, "metadrive"),
-                        dtype=np.float32,
+                    safe_control_action = rss_filter.control_action_from_internal(internal_action_safe)
+                    env_action_safe = np.asarray(rss_filter.to_env_action(safe_control_action, "metadrive"), dtype=np.float32)
+                    safe_control_action = attach_action_pipeline_debug(
+                        rss_filter,
+                        rss_info,
+                        env_action_nominal,
+                        internal_action_nominal,
+                        internal_action_safe,
+                        env_action_safe,
                     )
                     action = env_action_safe
                 except Exception as error:
                     traceback.print_exc()
-                    internal_action_nominal = rss_filter.to_internal_action(env_action_nominal, "metadrive")
+                    nominal_control_action = rss_filter.from_policy_action(env_action_nominal, "metadrive")
+                    internal_action_nominal = rss_filter.internal_action_from_control(nominal_control_action)
                     internal_action_safe = internal_action_nominal
+                    safe_control_action = rss_filter.control_action_from_internal(internal_action_safe)
+                    env_action_safe = np.asarray(rss_filter.to_env_action(safe_control_action, "metadrive"), dtype=np.float32)
                     rss_info = {
                         "mode": "fallback_no_safe_candidate",
                         "reason": "adapter_error: {}".format(error),
@@ -783,6 +1081,14 @@ def evaluate_ppl_once(
                         "steer_delta": 0.0,
                         "adapter_error": str(error),
                     }
+                    attach_action_pipeline_debug(
+                        rss_filter,
+                        rss_info,
+                        env_action_nominal,
+                        internal_action_nominal,
+                        internal_action_safe,
+                        env_action_safe,
+                    )
                     if not rss_adapter_error_printed:
                         print("[{}] Adapter failed once; continuing without filtering. Error: {}".format(runtime_label, error))
                         rss_adapter_error_printed = True
@@ -793,9 +1099,66 @@ def evaluate_ppl_once(
                 if np.linalg.norm(env_action_safe - env_action_nominal) > 1e-6:
                     rss_changed_steps += 1
 
+            speed_before = np.nan
+            heading_before = np.nan
+            ego_l_before = np.nan
+            if rss_filter is not None:
+                before_state = extract_action_probe_state(env, rss_filter)
+                speed_before = before_state.get("speed", np.nan)
+                heading_before = before_state.get("heading", np.nan)
+                ego_l_before = before_state.get("ego_l", np.nan)
+                if rss_info is not None:
+                    rss_info.update(
+                        final_action_sent_to_env=list(np.asarray(action, dtype=float)),
+                        speed_before_env_step=float(speed_before),
+                        speed_before=float(speed_before),
+                        heading_before=float(heading_before),
+                        ego_l_before_env_step=float(ego_l_before),
+                        ego_l_before=float(ego_l_before),
+                    )
+
             o, r, d, info = env.step(action)
             if rss_filter is not None and hasattr(rss_filter, "update_after_step"):
                 rss_filter.update_after_step(info)
+            if rss_filter is not None and rss_info is not None:
+                after_state = extract_action_probe_state(env, rss_filter)
+                rss_info.update(
+                    speed_after_env_step=float(after_state.get("speed", np.nan)),
+                    speed_after=float(after_state.get("speed", np.nan)),
+                    heading_after=float(after_state.get("heading", np.nan)),
+                    ego_l_after_env_step=float(after_state.get("ego_l", np.nan)),
+                    ego_l_after=float(after_state.get("ego_l", np.nan)),
+                    final_action_sent_to_env=list(np.asarray(action, dtype=float)),
+                )
+                selected_acc = float(rss_info.get("rss_filter_selected_control_action_acc", np.nan))
+                speed_before_value = float(rss_info.get("speed_before", np.nan))
+                speed_after_value = float(rss_info.get("speed_after", np.nan))
+                if (
+                    np.isfinite(selected_acc)
+                    and selected_acc < 0.0
+                    and np.isfinite(speed_before_value)
+                    and np.isfinite(speed_after_value)
+                    and speed_after_value > speed_before_value + 1e-3
+                ):
+                    print(
+                        "[RSS-ACTION-PIPELINE] negative_acc_but_speed_increased "
+                        "policy_action_raw={} rss_filter_input_action={} selected_control=[acc={:.3f}, steer={:.3f}] "
+                        "rss_filter_output_env_action={} final_action_sent_to_env={} env_components={} "
+                        "selected_acc_maps_to_brake={} action_order_detected={} "
+                        "speed_before={:.6f} speed_after={:.6f}".format(
+                            rss_info.get("policy_action_raw", []),
+                            rss_info.get("rss_filter_input_action", []),
+                            float(rss_info.get("rss_filter_selected_control_action_acc", np.nan)),
+                            float(rss_info.get("rss_filter_selected_control_action_steer", np.nan)),
+                            rss_info.get("rss_filter_output_env_action", []),
+                            rss_info.get("final_action_sent_to_env", []),
+                            rss_info.get("env_action_components", {}),
+                            rss_info.get("selected_acc_maps_to_brake", False),
+                            rss_info.get("action_order_detected", ""),
+                            speed_before_value,
+                            speed_after_value,
+                        )
+                    )
             step_count += 1
 
             if rss_filter is not None and save_runtime_step_csv:
@@ -1042,6 +1405,17 @@ if __name__ == "__main__":
         help="Save RSS-CBF step-level diagnostics. Enabled automatically by --rss_cbf.",
     )
     parser.add_argument(
+        "--rss_action_probe",
+        action="store_true",
+        help="Run forced MetaDrive action probe for action order/sign debugging, then exit.",
+    )
+    parser.add_argument(
+        "--rss_action_probe_steps",
+        type=int,
+        default=5,
+        help="Number of steps to run for each forced action in --rss_action_probe mode.",
+    )
+    parser.add_argument(
         "--disable_2d_rss_cbf",
         action="store_true",
         help="Use the original longitudinal RSS-CBF plus lateral gate behavior.",
@@ -1099,6 +1473,8 @@ if __name__ == "__main__":
             rss_2d_use_superellipse=not args.rss_2d_ellipse,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
+            rss_action_probe=args.rss_action_probe,
+            rss_action_probe_steps=args.rss_action_probe_steps,
         )
 
     elif args.ckpt_index >= 0:
@@ -1124,6 +1500,8 @@ if __name__ == "__main__":
             rss_2d_use_superellipse=not args.rss_2d_ellipse,
             eval_max_steps_per_episode=args.eval_max_steps_per_episode,
             eval_env_start=args.eval_start_seed,
+            rss_action_probe=args.rss_action_probe,
+            rss_action_probe_steps=args.rss_action_probe_steps,
         )
 
     elif args.start_ckpt >= 0:
@@ -1153,6 +1531,8 @@ if __name__ == "__main__":
                 rss_2d_use_superellipse=not args.rss_2d_ellipse,
                 eval_max_steps_per_episode=args.eval_max_steps_per_episode,
                 eval_env_start=args.eval_start_seed,
+                rss_action_probe=args.rss_action_probe,
+                rss_action_probe_steps=args.rss_action_probe_steps,
             )
             if ret is not None:
                 all_results.append(ret)

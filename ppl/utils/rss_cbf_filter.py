@@ -12,10 +12,12 @@ contract for evaluation.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -77,8 +79,41 @@ class RSSCBFConfig(StaticRSSConfig):
     rss_2d_nominal_action_weight: float = 0.5
     rss_2d_speed_preserve_weight: float = 0.3
     rss_2d_min_speed_preserve_acc: float = -0.2
+    adaptive_recovery_base_delta_h_weight: float = 8.0
+    adaptive_recovery_risk_delta_h_weight: float = 4.0
+    adaptive_recovery_h_weight: float = 4.0
+    adaptive_recovery_base_center_weight: float = 3.0
+    adaptive_recovery_risk_center_weight: float = 2.0
+    adaptive_recovery_center_distance_weight: float = 0.25
+    adaptive_recovery_base_speed_weight: float = 0.5
+    adaptive_recovery_risk_speed_weight: float = 1.5
+    adaptive_recovery_current_speed_weight: float = 0.1
+    adaptive_recovery_action_weight: float = 0.05
+    adaptive_recovery_smooth_weight: float = 0.25
+    adaptive_recovery_delta_h_tie_tolerance: float = 0.02
+    rss_2d_recovery_accel_weight: float = 2.0
+    rss_2d_recovery_action_weight: float = 0.1
+    unsafe_recovery_force_brake: bool = True
+    unsafe_recovery_speed_threshold: float = 3.0
+    unsafe_recovery_deep_violation_threshold: float = -0.5
+    unsafe_recovery_preferred_acc_max: float = -0.2
+    unsafe_recovery_brake_delta_h_tolerance: float = 0.05
+    boundary_recovery_horizon_steps: int = 3
+    rss_2d_recovery_zero_acc_fast_weight: float = 10.0
+    rss_2d_recovery_speed_weight: float = 0.2
     enable_unified_filter_profiling: bool = True
     debug_log_interval: int = 50
+    rss_debug_log_level: str = "event"
+    rss_debug_log_to_console: bool = False
+    rss_debug_log_to_file: bool = True
+    rss_debug_log_file: str = "logs/rss_cbf_debug.jsonl"
+    rss_debug_log_interval: int = 100
+    rss_debug_summary_interval: int = 100
+    rss_debug_log_only_intervention: bool = True
+    rss_debug_log_only_anomaly: bool = True
+    rss_debug_log_near_margin: float = 0.2
+    rss_debug_log_large_drop_threshold: float = 0.1
+    rss_debug_profile_interval: int = 100
     prediction_horizon_steps: int = 2
     lazy_safety_margin: float = 0.2
     candidate_search_mode: str = "lazy_coarse_to_fine"
@@ -130,6 +165,9 @@ class RSSCBFFilter(StaticRSSFilter):
         self._rss_2d_static_grid_cell_size: float = 1.0
         self._rss_2d_filter_step: int = 0
         self._rss_2d_last_profile: Dict[str, Any] = {}
+        self._rss_2d_prev_selected_action: Optional[Action] = None
+        self._rss_debug_recent_interventions: int = 0
+        self._rss_debug_file_warning_emitted: bool = False
 
     def reset(self) -> None:
         """Clear per-episode RSS-2D caches without changing configuration."""
@@ -139,6 +177,9 @@ class RSSCBFFilter(StaticRSSFilter):
         self._rss_2d_static_grid_cell_size = 1.0
         self._rss_2d_filter_step = 0
         self._rss_2d_last_profile = {}
+        self._rss_2d_prev_selected_action = None
+        self._rss_debug_recent_interventions = 0
+        self._rss_debug_file_warning_emitted = False
 
     def filter_action(self, state: State, u_nom: Sequence[float]) -> Tuple[Action, Dict[str, Any]]:
         """Return the minimally adjusted safe internal action and diagnostics."""
@@ -254,7 +295,7 @@ class RSSCBFFilter(StaticRSSFilter):
             profile["candidate_count"] = 0
             self._rss_2d_last_profile = dict(profile)
             self._maybe_log_rss_2d_profile(profile, mode="normal")
-            return u_original, self._make_rss_2d_cbf_info(
+            info = self._make_rss_2d_cbf_info(
                 state=state,
                 objects=objects,
                 mode="normal",
@@ -265,6 +306,8 @@ class RSSCBFFilter(StaticRSSFilter):
                 selected_eval=nominal_eval,
                 projection_debug={"profile": profile},
             )
+            self._rss_2d_prev_selected_action = self._clip_action(u_original)
+            return u_original, info
 
         u_safe, projection_debug = self._project_action_for_2d_rss_cbf(
             state,
@@ -289,7 +332,7 @@ class RSSCBFFilter(StaticRSSFilter):
         self._rss_2d_last_profile = dict(profile)
         self._maybe_log_rss_2d_profile(profile, mode=mode)
 
-        return u_safe, self._make_rss_2d_cbf_info(
+        info = self._make_rss_2d_cbf_info(
             state=state,
             objects=objects,
             mode=mode,
@@ -300,6 +343,8 @@ class RSSCBFFilter(StaticRSSFilter):
             selected_eval=selected_eval,
             projection_debug=projection_debug,
         )
+        self._rss_2d_prev_selected_action = self._clip_action(u_safe)
+        return u_safe, info
 
     def _rss_2d_relevant_objects(self, state: State) -> List[SafetyObject]:
         all_objects = self._rss_2d_build_safety_objects(state)
@@ -647,31 +692,36 @@ class RSSCBFFilter(StaticRSSFilter):
     def _maybe_log_rss_2d_profile(self, profile: Dict[str, Any], mode: str) -> None:
         if not bool(getattr(self.config, "enable_unified_filter_profiling", True)):
             return
-        interval = int(getattr(self.config, "debug_log_interval", 50))
+        log_level = self._rss_debug_log_level()
+        if log_level == "off":
+            return
+        interval = int(getattr(self.config, "rss_debug_profile_interval", 100))
+        if interval <= 0:
+            interval = int(getattr(self.config, "debug_log_interval", 50))
         if interval <= 0 or self._rss_2d_filter_step % interval != 0:
             return
-        LOGGER.debug(
-            "rss_2d_cbf_profile step=%s mode=%s total=%.6f build=%.6f query=%.6f "
-            "nominal=%.6f candidate_eval=%.6f geometry=%.6f objects=%s/%s candidates=%s horizon=%s",
-            self._rss_2d_filter_step,
-            mode,
-            float(profile.get("total_filter_time", 0.0)),
-            float(profile.get("build_safety_objects_time", 0.0)),
-            float(profile.get("query_local_objects_time", 0.0)),
-            float(profile.get("nominal_eval_time", 0.0)),
-            float(profile.get("candidate_eval_time", 0.0)),
-            float(profile.get("geometry_distance_time", 0.0)),
-            int(profile.get("safety_object_count_local", 0)),
-            int(profile.get("safety_object_count_total", 0)),
-            int(profile.get("candidate_count", 0)),
-            int(profile.get("horizon_steps", 0)),
+        if not (self._rss_debug_console_enabled("profile") or self._rss_debug_file_enabled("profile")):
+            return
+        self._emit_rss_debug_log(
+            {
+                "event": "profile",
+                "step": int(self._rss_2d_filter_step),
+                "mode": mode,
+                "filter_time_ms": 1000.0 * float(profile.get("total_filter_time", 0.0)),
+                "build_objects_time_ms": 1000.0 * float(profile.get("build_safety_objects_time", 0.0)),
+                "candidate_eval_time_ms": 1000.0 * float(profile.get("candidate_eval_time", 0.0)),
+                "num_safety_objects": int(profile.get("safety_object_count_local", 0)),
+                "num_candidates": int(profile.get("candidate_count", 0)),
+            },
+            level="summary",
         )
 
     def _rss_2d_prediction_horizon_steps(self) -> int:
         configured = getattr(self.config, "prediction_horizon_steps", None)
         if configured is None:
             configured = getattr(self.config, "rss_2d_prediction_horizon_steps", self.config.horizon_steps)
-        return max(0, int(configured))
+        boundary_recovery_horizon = int(getattr(self.config, "boundary_recovery_horizon_steps", 0))
+        return max(0, int(configured), boundary_recovery_horizon)
 
     def _rss_2d_reference_lane(self, state: State) -> Any:
         lane = state.get("_frenet_reference_lane", None)
@@ -719,15 +769,14 @@ class RSSCBFFilter(StaticRSSFilter):
                 "heading_ref": math.nan,
                 "reason": "local_coordinates_failed:{}".format(type(exc).__name__),
             }
-        try:
-            heading_ref = float(lane.heading_at(s_value))
-        except Exception as exc:
+        heading_ref, heading_reason = self._lane_heading_ref(lane, s_value)
+        if not math.isfinite(heading_ref):
             return {
                 "valid": False,
                 "s": s_value,
                 "l": l_value,
                 "heading_ref": math.nan,
-                "reason": "heading_at_failed:{}".format(type(exc).__name__),
+                "reason": heading_reason,
             }
         return {
             "valid": True,
@@ -780,7 +829,7 @@ class RSSCBFFilter(StaticRSSFilter):
         if payload_valid:
             return {
                 "valid": True,
-                "mode": "payload_frenet",
+                "mode": str(entity.get("frenet_source_mode", "payload_frenet")),
                 "s": payload_s,
                 "l": payload_l,
                 "heading_ref": self._safe_float(entity.get("frenet_heading_ref", math.nan), math.nan),
@@ -984,41 +1033,48 @@ class RSSCBFFilter(StaticRSSFilter):
         payload = safety_object.payload or {}
         object_kind = str(safety_object.object_kind)
         if object_kind == "no_drive_area":
-            return self._compute_no_drive_area_cbf_margin(rollout_state, safety_object)
+            return self._compute_no_drive_area_cbf_margin(reference_state, rollout_state, safety_object)
 
         side = str(payload.get("side", payload.get("boundary_side", "left")) or "left")
         if side not in {"left", "right"}:
             side = "left"
-        boundary_metrics = self._basic_road_boundary_margins_for_state(
-            reference_state,
-            rollout_state,
-            margin=0.0,
-        )
-        raw_margin = (
-            float(boundary_metrics["left_margin"])
-            if side == "left"
-            else float(boundary_metrics["right_margin"])
-        )
-        scale = max(
-            float(getattr(self.config, "rss_2d_boundary_margin_threshold", 0.5)),
-            self.config.small_tolerance,
-        )
-        h_boundary = raw_margin / scale
-        lateral = float(boundary_metrics.get("lateral", 0.0))
-        signed_lateral = raw_margin if side == "left" else -raw_margin
+        boundary_metrics = self._signed_frenet_boundary_metrics(reference_state, rollout_state)
+        h_left = float(boundary_metrics.get("h_left", math.nan))
+        h_right = float(boundary_metrics.get("h_right", math.nan))
+        raw_margin = h_right if side == "left" else h_left
+        if not math.isfinite(raw_margin):
+            fallback = self._basic_road_boundary_margins_for_state(reference_state, rollout_state, margin=0.0)
+            raw_margin = float(fallback["left_margin"] if side == "left" else fallback["right_margin"])
+            boundary_metrics.update(
+                {
+                    "h_left": float(fallback["right_margin"]),
+                    "h_right": float(fallback["left_margin"]),
+                    "h_boundary": float(min(fallback["left_margin"], fallback["right_margin"])),
+                    "boundary_margin": 0.0,
+                    "lane_l_min": float(fallback.get("lower", math.nan)),
+                    "lane_l_max": float(fallback.get("upper", math.nan)),
+                    "source": "ego_local_boundary_fallback",
+                    "frenet_fallback_reason": str(boundary_metrics.get("frenet_fallback_reason", "frenet_invalid")),
+                }
+            )
+            h_left = float(boundary_metrics.get("h_left", math.nan))
+            h_right = float(boundary_metrics.get("h_right", math.nan))
+        h_boundary = float(raw_margin)
+        lateral = float(boundary_metrics.get("ego_l", boundary_metrics.get("lateral", math.nan)))
+        signed_lateral = h_boundary if side == "left" else -h_boundary
         return {
             "h_2d": float(h_boundary),
             "h_boundary": float(h_boundary),
             "signed_boundary_margin": float(raw_margin),
             "boundary_margin": float(raw_margin),
-            "left_boundary_margin": float(boundary_metrics["left_margin"]),
-            "right_boundary_margin": float(boundary_metrics["right_margin"]),
+            "left_boundary_margin": float(h_right),
+            "right_boundary_margin": float(h_left),
             "delta_s": math.inf,
             "delta_l": float(signed_lateral),
             "long_clearance": math.inf,
             "lat_clearance": float(raw_margin),
             "d_s_safe": math.inf,
-            "d_l_safe": float(scale),
+            "d_l_safe": float(boundary_metrics.get("boundary_margin", self.config.lane_margin)),
             "object_id": safety_object.object_id,
             "object_type": safety_object.object_type,
             "object_kind": object_kind,
@@ -1032,34 +1088,71 @@ class RSSCBFFilter(StaticRSSFilter):
             "eps": float(self.config.small_tolerance),
             "road_boundary_margin_source": str(boundary_metrics.get("source", "")),
             "road_boundary_lateral_position": float(lateral),
-            "road_boundary_lower": float(boundary_metrics.get("lower", math.nan)),
-            "road_boundary_upper": float(boundary_metrics.get("upper", math.nan)),
+            "road_boundary_lower": float(boundary_metrics.get("lane_l_min", math.nan)),
+            "road_boundary_upper": float(boundary_metrics.get("lane_l_max", math.nan)),
+            "coordinate_mode": str(boundary_metrics.get("coordinate_mode", "ego_local_fallback")),
+            "frenet_valid": bool(boundary_metrics.get("ego_frenet_valid", False)),
+            "ego_ref_lane_valid": bool(boundary_metrics.get("ego_ref_lane_valid", False)),
+            "ego_frenet_valid": bool(boundary_metrics.get("ego_frenet_valid", False)),
+            "object_frenet_valid": bool(boundary_metrics.get("ego_frenet_valid", False)),
+            "frenet_fallback_reason": str(boundary_metrics.get("frenet_fallback_reason", "")),
+            "s_ego": float(boundary_metrics.get("ego_s", math.nan)),
+            "l_ego": float(boundary_metrics.get("ego_l", math.nan)),
+            "ego_s": float(boundary_metrics.get("ego_s", math.nan)),
+            "ego_l": float(boundary_metrics.get("ego_l", math.nan)),
+            "v_ego_s": float(boundary_metrics.get("ego_v_s", math.nan)),
+            "ego_v_s": float(boundary_metrics.get("ego_v_s", math.nan)),
+            "heading_ref_ego": float(boundary_metrics.get("ego_heading_ref", math.nan)),
+            "ego_heading_ref": float(boundary_metrics.get("ego_heading_ref", math.nan)),
+            "s_obj": float(boundary_metrics.get("ego_s", math.nan)),
+            "l_obj": float(boundary_metrics.get("ego_l", math.nan)),
+            "object_s": float(boundary_metrics.get("ego_s", math.nan)),
+            "object_l": float(boundary_metrics.get("ego_l", math.nan)),
+            "object_v_s": 0.0,
+            "old_delta_s": 0.0,
+            "old_delta_l": float(lateral),
+            "old_ego_local_delta_s": 0.0,
+            "old_ego_local_delta_l": float(lateral),
+            "lane_l_min": float(boundary_metrics.get("lane_l_min", math.nan)),
+            "lane_l_max": float(boundary_metrics.get("lane_l_max", math.nan)),
+            "boundary_margin_config": float(boundary_metrics.get("boundary_margin", math.nan)),
+            "h_left": float(boundary_metrics.get("h_left", math.nan)),
+            "h_right": float(boundary_metrics.get("h_right", math.nan)),
             "line_type": str(payload.get("line_type", "")),
             "line_color": str(payload.get("line_color", "")),
             "line_prohibited": bool(payload.get("line_prohibited", False)),
+            "ego_on_lane": bool(boundary_metrics.get("on_lane", True)),
+            "ego_out_of_road": bool(boundary_metrics.get("out_of_road", False)),
+            "ego_out_of_route": bool(boundary_metrics.get("out_of_route", False)),
+            "ego_crash_sidewalk": bool(boundary_metrics.get("crash_sidewalk", False)),
         }
 
     def _compute_no_drive_area_cbf_margin(
         self,
+        reference_state: State,
         rollout_state: State,
         safety_object: SafetyObject,
     ) -> Dict[str, Any]:
         ego = self._ego(rollout_state)
+        boundary_metrics = self._signed_frenet_boundary_metrics(reference_state, rollout_state)
         hard_violation = bool(
             not bool(ego.get("on_lane", True))
+            or bool(ego.get("out_of_road", False))
             or bool(ego.get("out_of_route", False))
             or bool(ego.get("crash_sidewalk", False))
             or bool(ego.get("on_yellow_continuous_line", False))
             or bool(ego.get("on_white_continuous_line", False))
         )
-        h_value = -1.0 if hard_violation else math.inf
+        h_value = float(boundary_metrics.get("h_boundary", math.nan))
+        if not math.isfinite(h_value):
+            h_value = -1.0 if hard_violation else math.inf
         return {
             "h_2d": float(h_value),
-            "h_boundary": math.nan,
+            "h_boundary": float(h_value) if math.isfinite(h_value) else math.nan,
             "delta_s": math.nan,
-            "delta_l": math.nan,
+            "delta_l": float(boundary_metrics.get("ego_l", math.nan)),
             "long_clearance": math.nan,
-            "lat_clearance": math.nan,
+            "lat_clearance": float(h_value) if math.isfinite(h_value) else math.nan,
             "d_s_safe": math.nan,
             "d_l_safe": math.nan,
             "object_id": safety_object.object_id,
@@ -1073,12 +1166,123 @@ class RSSCBFFilter(StaticRSSFilter):
             "object_width": 0.0,
             "power": 1.0,
             "eps": float(self.config.small_tolerance),
+            "coordinate_mode": str(boundary_metrics.get("coordinate_mode", "ego_local_fallback")),
+            "frenet_valid": bool(boundary_metrics.get("ego_frenet_valid", False)),
+            "ego_ref_lane_valid": bool(boundary_metrics.get("ego_ref_lane_valid", False)),
+            "ego_frenet_valid": bool(boundary_metrics.get("ego_frenet_valid", False)),
+            "object_frenet_valid": bool(boundary_metrics.get("ego_frenet_valid", False)),
+            "frenet_fallback_reason": str(boundary_metrics.get("frenet_fallback_reason", "")),
+            "s_ego": float(boundary_metrics.get("ego_s", math.nan)),
+            "l_ego": float(boundary_metrics.get("ego_l", math.nan)),
+            "ego_s": float(boundary_metrics.get("ego_s", math.nan)),
+            "ego_l": float(boundary_metrics.get("ego_l", math.nan)),
+            "v_ego_s": float(boundary_metrics.get("ego_v_s", math.nan)),
+            "ego_v_s": float(boundary_metrics.get("ego_v_s", math.nan)),
+            "heading_ref_ego": float(boundary_metrics.get("ego_heading_ref", math.nan)),
+            "ego_heading_ref": float(boundary_metrics.get("ego_heading_ref", math.nan)),
+            "s_obj": float(boundary_metrics.get("ego_s", math.nan)),
+            "l_obj": float(boundary_metrics.get("ego_l", math.nan)),
+            "object_s": float(boundary_metrics.get("ego_s", math.nan)),
+            "object_l": float(boundary_metrics.get("ego_l", math.nan)),
+            "object_v_s": 0.0,
+            "old_delta_s": 0.0,
+            "old_delta_l": float(boundary_metrics.get("ego_l", math.nan)),
+            "old_ego_local_delta_s": 0.0,
+            "old_ego_local_delta_l": float(boundary_metrics.get("ego_l", math.nan)),
+            "lane_l_min": float(boundary_metrics.get("lane_l_min", math.nan)),
+            "lane_l_max": float(boundary_metrics.get("lane_l_max", math.nan)),
+            "boundary_margin_config": float(boundary_metrics.get("boundary_margin", math.nan)),
+            "h_left": float(boundary_metrics.get("h_left", math.nan)),
+            "h_right": float(boundary_metrics.get("h_right", math.nan)),
             "ego_on_lane": bool(ego.get("on_lane", True)),
+            "ego_out_of_road": bool(ego.get("out_of_road", False)),
             "ego_out_of_route": bool(ego.get("out_of_route", False)),
             "ego_crash_sidewalk": bool(ego.get("crash_sidewalk", False)),
             "ego_on_yellow_continuous_line": bool(ego.get("on_yellow_continuous_line", False)),
             "ego_on_white_continuous_line": bool(ego.get("on_white_continuous_line", False)),
             "hard_violation": bool(hard_violation),
+        }
+
+    def _signed_frenet_boundary_metrics(self, reference_state: State, rollout_state: State) -> Dict[str, Any]:
+        reference_ego = self._ego(reference_state)
+        ego = self._ego(rollout_state)
+        ego_frenet = self._rss_project_entity_to_frenet(reference_state, ego, role="ego")
+        reference_frenet = self._rss_project_entity_to_frenet(reference_state, reference_ego, role="ego")
+        ego_l = self._safe_float(ego_frenet.get("l", math.nan), math.nan)
+        reference_l = self._safe_float(reference_frenet.get("l", math.nan), math.nan)
+        ego_width = self._object_width(ego, self.config.vehicle_width)
+        boundary_margin = max(0.0, float(getattr(self.config, "lane_margin", 0.0)))
+
+        if math.isfinite(ego_l):
+            current_width = self._current_lane_width(reference_state)
+            lanes = reference_state.get("lanes", {}) or {}
+            left_lane = lanes.get("left")
+            right_lane = lanes.get("right")
+            left_available = bool((left_lane or {}).get("available", False)) and not bool(
+                reference_ego.get("left_lane_line_prohibited", False)
+            )
+            right_available = bool((right_lane or {}).get("available", False)) and not bool(
+                reference_ego.get("right_lane_line_prohibited", False)
+            )
+            left_width = self._lane_available_width(reference_state, left_lane) if left_available else 0.0
+            right_width = self._lane_available_width(reference_state, right_lane) if right_available else 0.0
+            lane_l_min_raw = -current_width / 2.0 - right_width
+            lane_l_max_raw = current_width / 2.0 + left_width
+            source = "frenet_lane_width_estimate"
+        else:
+            reason = str(ego_frenet.get("reason", "") or reference_frenet.get("reason", "") or "missing_frenet_l")
+            return {
+                "coordinate_mode": "ego_local_fallback",
+                "ego_ref_lane_valid": bool(ego_frenet.get("ref_lane_valid", False)),
+                "ego_frenet_valid": False,
+                "frenet_fallback_reason": reason,
+                "ego_s": self._safe_float(ego_frenet.get("s", math.nan), math.nan),
+                "ego_l": ego_l,
+                "ego_v_s": self._safe_float(ego_frenet.get("v_s", math.nan), math.nan),
+                "ego_heading_ref": self._safe_float(ego_frenet.get("heading_ref", math.nan), math.nan),
+                "lane_l_min": math.nan,
+                "lane_l_max": math.nan,
+                "boundary_margin": boundary_margin,
+                "h_left": math.nan,
+                "h_right": math.nan,
+                "h_boundary": math.nan,
+                "source": "frenet_unavailable",
+                "on_lane": bool(ego.get("on_lane", True)),
+                "out_of_road": bool(ego.get("out_of_road", False)),
+                "out_of_route": bool(ego.get("out_of_route", False)),
+                "crash_sidewalk": bool(ego.get("crash_sidewalk", False)),
+            }
+
+        lane_l_min = float(lane_l_min_raw + ego_width / 2.0 + boundary_margin)
+        lane_l_max = float(lane_l_max_raw - ego_width / 2.0 - boundary_margin)
+        h_left = float(ego_l - lane_l_min) if math.isfinite(ego_l) else math.nan
+        h_right = float(lane_l_max - ego_l) if math.isfinite(ego_l) else math.nan
+        h_boundary = min(h_left, h_right) if math.isfinite(h_left) and math.isfinite(h_right) else math.nan
+        coordinate_mode = str(ego_frenet.get("mode", "ego_local_fallback"))
+        if coordinate_mode == "computed_frenet":
+            frenet_reason = ""
+        else:
+            frenet_reason = str(ego_frenet.get("reason", "") or reference_frenet.get("reason", ""))
+        return {
+            "coordinate_mode": coordinate_mode,
+            "ego_ref_lane_valid": bool(ego_frenet.get("ref_lane_valid", False)),
+            "ego_frenet_valid": bool(ego_frenet.get("valid", False)),
+            "frenet_fallback_reason": frenet_reason,
+            "ego_s": self._safe_float(ego_frenet.get("s", math.nan), math.nan),
+            "ego_l": ego_l,
+            "ego_v_s": self._safe_float(ego_frenet.get("v_s", math.nan), math.nan),
+            "ego_heading_ref": self._safe_float(ego_frenet.get("heading_ref", math.nan), math.nan),
+            "lane_l_min": lane_l_min,
+            "lane_l_max": lane_l_max,
+            "boundary_margin": boundary_margin,
+            "h_left": h_left,
+            "h_right": h_right,
+            "h_boundary": h_boundary,
+            "source": source,
+            "on_lane": bool(ego.get("on_lane", True)),
+            "out_of_road": bool(ego.get("out_of_road", False)),
+            "out_of_route": bool(ego.get("out_of_route", False)),
+            "crash_sidewalk": bool(ego.get("crash_sidewalk", False)),
         }
 
     def _compute_2d_rss_cbf_safety_object_margin(
@@ -1181,6 +1385,7 @@ class RSSCBFFilter(StaticRSSFilter):
         current_H = math.inf
         final_H = math.inf
         worst: Dict[str, Any] = {}
+        current_worst: Dict[str, Any] = {}
         constraints: List[Dict[str, Any]] = []
         constraint_object_ids = set()
         left_margins: List[float] = []
@@ -1190,6 +1395,8 @@ class RSSCBFFilter(StaticRSSFilter):
         boundary_h_current = math.inf
         boundary_h_final = math.inf
         boundary_source = ""
+        step_H_values: List[float] = []
+        boundary_step_metrics: List[Dict[str, float]] = []
         geometry_distance_time = 0.0
 
         for step in range(horizon + 1):
@@ -1217,9 +1424,14 @@ class RSSCBFFilter(StaticRSSFilter):
             step_left_margin = math.nan
             step_right_margin = math.nan
             step_lateral = math.nan
+            step_lane_l_min = math.nan
+            step_lane_l_max = math.nan
+            step_h_left = math.nan
+            step_h_right = math.nan
+            step_h_boundary = math.nan
             for constraint in step_constraints:
                 constraint_kind = str(constraint.get("object_kind", ""))
-                if constraint_kind not in self.ROAD_BOUNDARY_OBJECT_KINDS:
+                if constraint_kind not in self.ROAD_SAFETY_OBJECT_KINDS:
                     continue
                 h_value = float(constraint.get("h", constraint.get("h_2d", math.inf)))
                 step_boundary_h_values.append(h_value)
@@ -1230,6 +1442,16 @@ class RSSCBFFilter(StaticRSSFilter):
                     step_right_margin = float(constraint.get("boundary_margin", math.nan))
                 if math.isnan(step_lateral):
                     step_lateral = float(constraint.get("road_boundary_lateral_position", math.nan))
+                if math.isnan(step_lane_l_min):
+                    step_lane_l_min = float(constraint.get("lane_l_min", math.nan))
+                if math.isnan(step_lane_l_max):
+                    step_lane_l_max = float(constraint.get("lane_l_max", math.nan))
+                if math.isnan(step_h_left):
+                    step_h_left = float(constraint.get("h_left", math.nan))
+                if math.isnan(step_h_right):
+                    step_h_right = float(constraint.get("h_right", math.nan))
+                if math.isnan(step_h_boundary):
+                    step_h_boundary = float(constraint.get("h_boundary", math.nan))
                 boundary_source = str(constraint.get("road_boundary_margin_source", boundary_source))
 
             if step_boundary_h_values:
@@ -1248,8 +1470,30 @@ class RSSCBFFilter(StaticRSSFilter):
             if collect_debug:
                 constraints.extend(step_constraints)
             step_H = min((float(item["h"]) for item in step_constraints), default=math.inf)
+            step_worst = min(step_constraints, key=lambda item: float(item["h"]), default={})
+            step_H_values.append(float(step_H))
+            if math.isfinite(step_lateral) or math.isfinite(step_lane_l_min) or math.isfinite(step_lane_l_max):
+                lane_center = (
+                    0.5 * (step_lane_l_min + step_lane_l_max)
+                    if math.isfinite(step_lane_l_min) and math.isfinite(step_lane_l_max)
+                    else 0.0
+                )
+                boundary_step_metrics.append(
+                    {
+                        "step": float(step),
+                        "ego_l": float(step_lateral),
+                        "lane_l_min": float(step_lane_l_min),
+                        "lane_l_max": float(step_lane_l_max),
+                        "lane_center_l": float(lane_center),
+                        "l_error": float(step_lateral - lane_center) if math.isfinite(step_lateral) else math.nan,
+                        "h_left": float(step_h_left),
+                        "h_right": float(step_h_right),
+                        "h_boundary": float(step_h_boundary),
+                    }
+                )
             if step == 0:
                 current_H = step_H
+                current_worst = step_worst
             final_H = step_H
             for constraint in step_constraints:
                 constraint_object_ids.add(str(constraint.get("object_id", "")))
@@ -1274,23 +1518,48 @@ class RSSCBFFilter(StaticRSSFilter):
         final_boundary_margin = min(left_margins[-1], right_margins[-1]) if left_margins and right_margins else math.inf
         current_lateral = lateral_positions[0] if lateral_positions else 0.0
         final_lateral = lateral_positions[-1] if lateral_positions else 0.0
-        lower_limit, upper_limit, _ = self._basic_road_boundary_limits_from_state(state, margin=0.0)
-        center_lateral = 0.5 * (lower_limit + upper_limit)
+        first_boundary_metric = boundary_step_metrics[0] if boundary_step_metrics else {}
+        final_boundary_metric = boundary_step_metrics[-1] if boundary_step_metrics else {}
+        center_lateral = float(first_boundary_metric.get("lane_center_l", 0.0))
         centering_improvement = abs(current_lateral - center_lateral) - abs(final_lateral - center_lateral)
         boundary_h_min = min(boundary_h_values) if boundary_h_values else math.inf
         boundary_safe = boundary_h_min >= 0.0
+        H_next = final_H
+        delta_H = float(H_next - current_H) if math.isfinite(H_next) and math.isfinite(current_H) else math.nan
+        predicted_boundary_metric = final_boundary_metric
+        current_ego_l = self._safe_float(first_boundary_metric.get("ego_l", math.nan), math.nan)
+        predicted_ego_l = self._safe_float(predicted_boundary_metric.get("ego_l", math.nan), math.nan)
+        lane_center_l = self._safe_float(first_boundary_metric.get("lane_center_l", 0.0), 0.0)
+        current_l_error = current_ego_l - lane_center_l if math.isfinite(current_ego_l) else math.nan
+        predicted_l_error = predicted_ego_l - lane_center_l if math.isfinite(predicted_ego_l) else math.nan
+        boundary_recovery_score = (
+            abs(current_l_error) - abs(predicted_l_error)
+            if math.isfinite(current_l_error) and math.isfinite(predicted_l_error)
+            else math.nan
+        )
         ego = self._ego(state)
+        final_ego = self._ego(rollout_state)
+        current_speed = self._safe_float(ego.get("speed", math.nan), math.nan)
+        predicted_speed = self._safe_float(final_ego.get("speed", math.nan), math.nan)
         return {
             "safe": bool(H >= 0.0),
             "objects_safe": bool(H >= 0.0),
             "H": float(H),
             "current_H": float(current_H),
+            "H_current": float(current_H),
+            "H_next": float(H_next),
+            "delta_H": float(delta_H),
             "final_H": float(final_H),
             "min_h_2d": float(H),
             "current_h_2d": float(current_H),
             "final_h_2d": float(final_H),
             "worst_h": float(H),
             "worst": worst,
+            "current_worst": current_worst,
+            "current_worst_object_type": str(current_worst.get("object_type", "")) if current_worst else "",
+            "current_worst_object_kind": str(current_worst.get("object_kind", "")) if current_worst else "",
+            "current_speed": float(current_speed),
+            "predicted_speed": float(predicted_speed),
             "constraints": constraints,
             "object_margins": constraints,
             "safety_object_count": len(constraint_object_ids),
@@ -1322,6 +1591,12 @@ class RSSCBFFilter(StaticRSSFilter):
             "road_boundary_current_lateral_position": float(current_lateral),
             "road_boundary_center_lateral": float(center_lateral),
             "road_boundary_centering_improvement": float(centering_improvement),
+            "current_ego_l": float(current_ego_l),
+            "predicted_ego_l": float(predicted_ego_l),
+            "lane_center_l": float(lane_center_l),
+            "current_l_error": float(current_l_error),
+            "predicted_l_error": float(predicted_l_error),
+            "boundary_recovery_score": float(boundary_recovery_score),
             "ego_dist_to_left_side": self._safe_float(ego.get("dist_to_left_side", math.nan), math.nan),
             "ego_dist_to_right_side": self._safe_float(ego.get("dist_to_right_side", math.nan), math.nan),
             "ego_on_lane": bool(ego.get("on_lane", True)),
@@ -1480,6 +1755,7 @@ class RSSCBFFilter(StaticRSSFilter):
         acc_candidates: List[float] = []
         steer_candidates: List[float] = []
         search_mode = str(getattr(self.config, "candidate_search_mode", "lazy_coarse_to_fine"))
+        unsafe_boundary_recovery = self._rss_2d_unsafe_boundary_recovery_context(nominal_eval or {})
 
         if nominal_eval is not None:
             nominal_action = self._clip_action(u_original)
@@ -1502,7 +1778,11 @@ class RSSCBFFilter(StaticRSSFilter):
 
         for stage in stages:
             generation_start = time.perf_counter()
-            actions, stage_accs, stage_steers = self._rss_2d_candidate_actions(u_original, stage)
+            actions, stage_accs, stage_steers = self._rss_2d_candidate_actions(
+                u_original,
+                stage,
+                unsafe_boundary_recovery=unsafe_boundary_recovery,
+            )
             profile["candidate_generation_time"] += time.perf_counter() - generation_start
             acc_candidates.extend(stage_accs)
             steer_candidates.extend(stage_steers)
@@ -1531,6 +1811,7 @@ class RSSCBFFilter(StaticRSSFilter):
             selected = self._select_2d_rss_cbf_candidate(candidates, u_original)
             if (
                 search_mode == "lazy_coarse_to_fine"
+                and not unsafe_boundary_recovery
                 and stage == "coarse"
                 and any(float(candidate.get("H", -math.inf)) >= 0.0 for candidate in stage_candidates)
             ):
@@ -1566,12 +1847,46 @@ class RSSCBFFilter(StaticRSSFilter):
         profile["candidate_count"] = int(len(candidates))
         acc_candidates = self._unique_float_list(acc_candidates)
         steer_candidates = self._unique_float_list(steer_candidates)
+        unsafe_candidates = [
+            candidate
+            for candidate in candidates
+            if float(candidate.get("current_H", candidate.get("H_current", math.inf))) < 0.0
+        ]
+        valid_recovery_candidate_count = sum(
+            1 for candidate in unsafe_candidates if self._rss_2d_valid_recovery_candidate(candidate)
+        )
+        rejected_because_negative_delta_H_count = sum(
+            1
+            for candidate in unsafe_candidates
+            if self._safe_float(candidate.get("delta_H", math.nan), math.nan) <= self.config.small_tolerance
+        )
+        least_unsafe_candidate_count = max(0, len(unsafe_candidates) - valid_recovery_candidate_count)
+        selected_reason = str(selected.get("_selected_reason", ""))
+        if not selected_reason:
+            if float(selected.get("current_H", selected.get("H_current", math.inf))) < 0.0:
+                selected_reason = (
+                    "selected_adaptive_recovery"
+                    if self._rss_2d_valid_recovery_candidate(selected)
+                    else "least_unsafe_adaptive_recovery"
+                )
+            else:
+                selected_reason = (
+                    "selected_safe_candidate"
+                    if float(selected.get("H", -math.inf)) >= 0.0
+                    else "selected_least_unsafe"
+                )
+        selected["selected_reason"] = selected_reason
         return selected["action"], {
             "projection_failed": not bool(float(selected.get("H", -math.inf)) >= 0.0),
             "candidate_count": len(candidates),
             "candidate_reject_reasons": reject_reasons,
             "safe_candidate_count": len(safe_candidates),
             "road_safe_candidate_count": len(road_safe_candidates),
+            "valid_recovery_candidate_count": int(valid_recovery_candidate_count),
+            "least_unsafe_candidate_count": int(least_unsafe_candidate_count),
+            "rejected_because_negative_delta_H_count": int(rejected_because_negative_delta_H_count),
+            "selected_candidate_delta_H": float(selected.get("delta_H", math.nan)),
+            "selected_candidate_boundary_recovery_score": float(selected.get("boundary_recovery_score", math.nan)),
             "acc_candidates": [float(acc) for acc in acc_candidates],
             "steer_candidates": [float(steer) for steer in steer_candidates],
             "steer_sign_convention": "internal_positive_left",
@@ -1580,24 +1895,24 @@ class RSSCBFFilter(StaticRSSFilter):
             "selected": selected,
             "margins": selected.get("margins", {}),
             "candidates": compact_candidates,
-            "reason": (
-                "selected_safe_candidate"
-                if float(selected.get("H", -math.inf)) >= 0.0
-                else "selected_least_unsafe"
-            ),
+            "reason": selected_reason,
         }
 
     def _rss_2d_candidate_actions(
         self,
         u_original: Action,
         stage: str,
+        unsafe_boundary_recovery: bool = False,
     ) -> Tuple[List[Action], List[float], List[float]]:
         if stage == "coarse":
-            accs = self._rss_2d_coarse_acc_candidates(u_original)
-            steers = self._rss_2d_coarse_steer_candidates(u_original)
+            accs = self._rss_2d_coarse_acc_candidates(u_original, unsafe_boundary_recovery=unsafe_boundary_recovery)
+            steers = self._rss_2d_coarse_steer_candidates(
+                u_original,
+                unsafe_boundary_recovery=unsafe_boundary_recovery,
+            )
         else:
-            accs = self._rss_2d_acc_candidates(u_original)
-            steers = self._rss_2d_steer_candidates(u_original)
+            accs = self._rss_2d_acc_candidates(u_original, unsafe_boundary_recovery=unsafe_boundary_recovery)
+            steers = self._rss_2d_steer_candidates(u_original, unsafe_boundary_recovery=unsafe_boundary_recovery)
 
         actions: List[Action] = []
         seen = set()
@@ -1611,18 +1926,40 @@ class RSSCBFFilter(StaticRSSFilter):
                 actions.append(action)
         return actions, accs, steers
 
-    def _rss_2d_coarse_acc_candidates(self, u_original: Action) -> List[float]:
-        values: List[float] = [float(u_original[0])]
-        values.extend(float(value) for value in getattr(self.config, "coarse_acc_samples", ()))
-        values.append(float(getattr(self.config, "rss_2d_min_speed_preserve_acc", -0.2)))
+    def _rss_2d_coarse_acc_candidates(
+        self,
+        u_original: Action,
+        unsafe_boundary_recovery: bool = False,
+    ) -> List[float]:
+        if unsafe_boundary_recovery:
+            values = self._rss_2d_adaptive_recovery_acc_candidates(u_original)
+        else:
+            values = [float(u_original[0])]
+            values.extend(float(value) for value in getattr(self.config, "coarse_acc_samples", ()))
+            values.append(float(getattr(self.config, "rss_2d_min_speed_preserve_acc", -0.2)))
         return self._unique_clipped_values(values, index=0)
 
-    def _rss_2d_coarse_steer_candidates(self, u_original: Action) -> List[float]:
+    def _rss_2d_coarse_steer_candidates(
+        self,
+        u_original: Action,
+        unsafe_boundary_recovery: bool = False,
+    ) -> List[float]:
         values: List[float] = [float(u_original[1]), 0.0, -0.25, 0.25, -0.5, 0.5]
         values.extend(float(value) for value in getattr(self.config, "coarse_steer_samples", ()))
+        if unsafe_boundary_recovery:
+            values.extend(self._rss_2d_adaptive_recovery_steer_candidates(u_original))
         return self._unique_clipped_values(values, index=1)
 
-    def _rss_2d_acc_candidates(self, u_original: Action) -> List[float]:
+    def _rss_2d_acc_candidates(
+        self,
+        u_original: Action,
+        unsafe_boundary_recovery: bool = False,
+    ) -> List[float]:
+        if unsafe_boundary_recovery:
+            return self._unique_clipped_values(
+                self._rss_2d_adaptive_recovery_acc_candidates(u_original),
+                index=0,
+            )
         num_samples = int(getattr(self.config, "fine_acc_samples", 0))
         if num_samples <= 0:
             num_samples = int(getattr(self.config, "rss_2d_acc_samples", 7))
@@ -1631,13 +1968,35 @@ class RSSCBFFilter(StaticRSSFilter):
         values.extend([float(u_original[0]), 0.0, float(getattr(self.config, "rss_2d_min_speed_preserve_acc", -0.2))])
         return self._unique_clipped_values(values, index=0)
 
-    def _rss_2d_steer_candidates(self, u_original: Action) -> List[float]:
+    def _rss_2d_steer_candidates(
+        self,
+        u_original: Action,
+        unsafe_boundary_recovery: bool = False,
+    ) -> List[float]:
         values: List[float] = [float(u_original[1]), 0.0, -0.25, 0.25, -0.5, 0.5]
         values.extend(float(value) for value in getattr(self.config, "rss_2d_steer_samples", ()))
         fine_count = int(getattr(self.config, "fine_steer_samples", 0))
         if fine_count > 0:
             values.extend(np.linspace(-self.config.max_steer, self.config.max_steer, max(2, fine_count)))
+        if unsafe_boundary_recovery:
+            values.extend(self._rss_2d_adaptive_recovery_steer_candidates(u_original))
         return self._unique_clipped_values(values, index=1)
+
+    def _rss_2d_adaptive_recovery_acc_candidates(self, u_original: Action) -> List[float]:
+        nominal_acc = float(u_original[0])
+        values: List[float] = [-1.0, -0.7, -0.5, -0.2, 0.0, 0.2]
+        values.extend([nominal_acc - 0.2, nominal_acc, nominal_acc + 0.2])
+        if self._rss_2d_prev_selected_action is not None:
+            values.append(float(self._rss_2d_prev_selected_action[0]))
+        return values
+
+    def _rss_2d_adaptive_recovery_steer_candidates(self, u_original: Action) -> List[float]:
+        nominal_steer = float(u_original[1])
+        values: List[float] = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]
+        values.extend([nominal_steer - 0.25, nominal_steer, nominal_steer + 0.25])
+        if self._rss_2d_prev_selected_action is not None:
+            values.append(float(self._rss_2d_prev_selected_action[1]))
+        return values
 
     def _unique_clipped_values(self, values: Sequence[float], index: int) -> List[float]:
         unique: List[float] = []
@@ -1664,6 +2023,34 @@ class RSSCBFFilter(StaticRSSFilter):
             unique.append(float(value))
         return unique
 
+    def _rss_2d_unsafe_boundary_recovery_context(self, evaluation: Dict[str, Any]) -> bool:
+        current_H = self._safe_float(evaluation.get("current_H", evaluation.get("H_current", math.inf)), math.inf)
+        if current_H >= 0.0:
+            return False
+        object_type = str(evaluation.get("current_worst_object_type", ""))
+        object_kind = str(evaluation.get("current_worst_object_kind", ""))
+        worst = evaluation.get("current_worst", {}) if isinstance(evaluation, dict) else {}
+        if isinstance(worst, dict):
+            object_type = object_type or str(worst.get("object_type", ""))
+            object_kind = object_kind or str(worst.get("object_kind", ""))
+        return self._rss_2d_is_boundary_recovery_object(object_type, object_kind)
+
+    def _rss_2d_is_boundary_recovery_object(self, object_type: str, object_kind: str) -> bool:
+        object_type = str(object_type)
+        object_kind = str(object_kind)
+        return (
+            object_kind in self.ROAD_SAFETY_OBJECT_KINDS
+            or object_type
+            in {
+                "road_edge",
+                "no_drive_area",
+                "road_departure",
+                "yellow_line",
+                "lane_boundary",
+                "road_boundary",
+            }
+        )
+
     def _make_2d_rss_cbf_candidate(
         self,
         state: State,
@@ -1678,20 +2065,58 @@ class RSSCBFFilter(StaticRSSFilter):
         H = float(evaluation.get("H", -math.inf))
         final_H = float(evaluation.get("final_H", H))
         current_H = float(evaluation.get("current_H", H))
+        H_next = float(evaluation.get("H_next", final_H))
+        delta_H = float(evaluation.get("delta_H", H_next - current_H))
         H_improvement = final_H - current_H
         safe = H >= 0.0
         speed_preserve_score = min(0.0, float(action[0]) - float(getattr(self.config, "rss_2d_min_speed_preserve_acc", -0.2)))
         intervention_cost = self._action_distance_sq(action, u_original)
         acc_penalty = max(0.0, -float(action[0]))
+        excessive_brake_penalty = max(
+            0.0,
+            float(getattr(self.config, "rss_2d_min_speed_preserve_acc", -0.2)) - float(action[0]),
+        )
         steer_penalty = abs(float(action[1] - u_original[1]))
+        boundary_recovery_score = self._safe_float(evaluation.get("boundary_recovery_score", math.nan), math.nan)
+        if not math.isfinite(boundary_recovery_score):
+            boundary_recovery_score = 0.0
+        current_speed = self._safe_float(evaluation.get("current_speed", self._ego_speed(state)), self._ego_speed(state))
+        predicted_speed = self._safe_float(evaluation.get("predicted_speed", current_speed), current_speed)
+        speed_reduction = current_speed - predicted_speed
+        current_l_error = self._safe_float(evaluation.get("current_l_error", math.nan), math.nan)
+        center_distance = abs(current_l_error) if math.isfinite(current_l_error) else 0.0
+        adaptive_recovery_mode = bool(current_H < 0.0)
+        risk = max(0.0, -current_H) if math.isfinite(current_H) else 0.0
+        w_delta_H = (
+            float(getattr(self.config, "adaptive_recovery_base_delta_h_weight", 8.0))
+            + float(getattr(self.config, "adaptive_recovery_risk_delta_h_weight", 4.0)) * risk
+        )
+        w_H = float(getattr(self.config, "adaptive_recovery_h_weight", 4.0))
+        w_center = (
+            float(getattr(self.config, "adaptive_recovery_base_center_weight", 3.0))
+            + float(getattr(self.config, "adaptive_recovery_risk_center_weight", 2.0)) * risk
+            + float(getattr(self.config, "adaptive_recovery_center_distance_weight", 0.25)) * center_distance
+        )
+        w_speed_reduction = (
+            float(getattr(self.config, "adaptive_recovery_base_speed_weight", 0.5))
+            + float(getattr(self.config, "adaptive_recovery_risk_speed_weight", 1.5)) * risk
+            + float(getattr(self.config, "adaptive_recovery_current_speed_weight", 0.1)) * current_speed
+        )
+        w_action = float(getattr(self.config, "adaptive_recovery_action_weight", 0.05))
+        w_smooth = float(getattr(self.config, "adaptive_recovery_smooth_weight", 0.25))
+        previous_action = self._rss_2d_prev_selected_action
+        smoothness_cost = (
+            self._action_distance_sq(action, previous_action)
+            if previous_action is not None
+            else 0.0
+        )
         unsafe_score = (
-            H
-            + 0.5 * final_H
-            + 0.5 * H_improvement
-            + float(getattr(self.config, "rss_2d_boundary_penalty_weight", 2.0))
-            * float(evaluation.get("road_boundary_margin_improvement", 0.0))
-            - float(getattr(self.config, "rss_2d_nominal_action_weight", 0.5)) * intervention_cost
-            + float(getattr(self.config, "rss_2d_speed_preserve_weight", 0.3)) * speed_preserve_score
+            w_delta_H * delta_H
+            + w_H * H_next
+            + w_center * boundary_recovery_score
+            + w_speed_reduction * speed_reduction
+            - w_action * intervention_cost
+            - w_smooth * smoothness_cost
         )
         candidate = {
             "mode": "rss_2d_cbf_candidate",
@@ -1701,6 +2126,9 @@ class RSSCBFFilter(StaticRSSFilter):
             "H": H,
             "final_H": final_H,
             "current_H": current_H,
+            "H_current": current_H,
+            "H_next": H_next,
+            "delta_H": delta_H,
             "H_improvement": H_improvement,
             "objects_safe": bool(evaluation["safe"]),
             "road_boundary_safe": bool(evaluation.get("road_boundary_safe", False)),
@@ -1714,14 +2142,37 @@ class RSSCBFFilter(StaticRSSFilter):
             "right_boundary_margin": float(evaluation.get("right_boundary_margin", math.nan)),
             "final_boundary_margin": float(evaluation.get("road_boundary_margin_final_pred", math.nan)),
             "boundary_margin_improvement": float(evaluation.get("road_boundary_margin_improvement", math.nan)),
+            "current_ego_l": float(evaluation.get("current_ego_l", math.nan)),
+            "predicted_ego_l": float(evaluation.get("predicted_ego_l", math.nan)),
+            "lane_center_l": float(evaluation.get("lane_center_l", math.nan)),
+            "current_l_error": float(evaluation.get("current_l_error", math.nan)),
+            "predicted_l_error": float(evaluation.get("predicted_l_error", math.nan)),
+            "boundary_recovery_score": float(boundary_recovery_score),
+            "current_speed": float(current_speed),
+            "predicted_speed": float(predicted_speed),
+            "speed_reduction": float(speed_reduction),
+            "adaptive_recovery_mode": bool(adaptive_recovery_mode),
+            "risk": float(risk),
+            "w_delta_H": float(w_delta_H),
+            "w_H": float(w_H),
+            "w_center": float(w_center),
+            "w_speed_reduction": float(w_speed_reduction),
+            "w_action": float(w_action),
+            "w_smooth": float(w_smooth),
             "speed_preserve_score": float(speed_preserve_score),
             "selection_score": float(unsafe_score),
+            "action_distance": float(intervention_cost),
+            "smoothness_cost": float(smoothness_cost),
             "acc_penalty": float(acc_penalty),
+            "excessive_brake_penalty": float(excessive_brake_penalty),
             "steer_penalty": float(steer_penalty),
             "evaluation": evaluation,
             "margins": {
                 "H": H,
                 "final_H": final_H,
+                "H_current": current_H,
+                "H_next": H_next,
+                "delta_H": delta_H,
                 "H_improvement": H_improvement,
                 "min_h_2d": H,
                 "current_h_2d": current_H,
@@ -1729,6 +2180,17 @@ class RSSCBFFilter(StaticRSSFilter):
                 "boundary_h_current": float(evaluation.get("boundary_h_current", math.nan)),
                 "boundary_h_min_pred": float(evaluation.get("boundary_h_min_pred", math.nan)),
                 "boundary_h_final_pred": float(evaluation.get("boundary_h_final_pred", math.nan)),
+                "boundary_recovery_score": float(boundary_recovery_score),
+                "current_speed": float(current_speed),
+                "predicted_speed": float(predicted_speed),
+                "speed_reduction": float(speed_reduction),
+                "adaptive_recovery_mode": bool(adaptive_recovery_mode),
+                "risk": float(risk),
+                "w_delta_H": float(w_delta_H),
+                "w_center": float(w_center),
+                "w_speed_reduction": float(w_speed_reduction),
+                "action_distance": float(intervention_cost),
+                "smoothness_cost": float(smoothness_cost),
             },
             "intervention_cost": intervention_cost,
             "progress_score": self._score_progress_after_rollout(state, action),
@@ -1745,8 +2207,30 @@ class RSSCBFFilter(StaticRSSFilter):
             "action": list(candidate.get("action", [])),
             "safe": bool(candidate.get("safe", False)),
             "H": float(candidate.get("H", math.nan)),
+            "H_current": float(candidate.get("H_current", candidate.get("current_H", math.nan))),
+            "H_next": float(candidate.get("H_next", math.nan)),
+            "delta_H": float(candidate.get("delta_H", math.nan)),
             "final_H": float(candidate.get("final_H", math.nan)),
             "H_improvement": float(candidate.get("H_improvement", math.nan)),
+            "current_ego_l": float(candidate.get("current_ego_l", math.nan)),
+            "predicted_ego_l": float(candidate.get("predicted_ego_l", math.nan)),
+            "lane_center_l": float(candidate.get("lane_center_l", math.nan)),
+            "current_l_error": float(candidate.get("current_l_error", math.nan)),
+            "predicted_l_error": float(candidate.get("predicted_l_error", math.nan)),
+            "boundary_recovery_score": float(candidate.get("boundary_recovery_score", math.nan)),
+            "current_speed": float(candidate.get("current_speed", math.nan)),
+            "predicted_speed": float(candidate.get("predicted_speed", math.nan)),
+            "speed_reduction": float(candidate.get("speed_reduction", math.nan)),
+            "adaptive_recovery_mode": bool(candidate.get("adaptive_recovery_mode", False)),
+            "risk": float(candidate.get("risk", math.nan)),
+            "w_delta_H": float(candidate.get("w_delta_H", math.nan)),
+            "w_H": float(candidate.get("w_H", math.nan)),
+            "w_center": float(candidate.get("w_center", math.nan)),
+            "w_speed_reduction": float(candidate.get("w_speed_reduction", math.nan)),
+            "w_action": float(candidate.get("w_action", math.nan)),
+            "w_smooth": float(candidate.get("w_smooth", math.nan)),
+            "action_distance": float(candidate.get("action_distance", math.nan)),
+            "smoothness_cost": float(candidate.get("smoothness_cost", math.nan)),
             "boundary_h_current": float(candidate.get("boundary_h_current", math.nan)),
             "boundary_h_min_pred": float(candidate.get("boundary_h_min_pred", math.nan)),
             "boundary_h_final_pred": float(candidate.get("boundary_h_final_pred", math.nan)),
@@ -1765,6 +2249,18 @@ class RSSCBFFilter(StaticRSSFilter):
     ) -> Optional[Dict[str, Any]]:
         if not candidates:
             return None
+        currently_unsafe = any(float(candidate.get("current_H", candidate.get("H_current", math.inf))) < 0.0 for candidate in candidates)
+        if currently_unsafe:
+            valid_recovery_candidates = [
+                candidate for candidate in candidates if self._rss_2d_valid_recovery_candidate(candidate)
+            ]
+            if valid_recovery_candidates:
+                selected = max(valid_recovery_candidates, key=self._rss_2d_recovery_candidate_sort_key)
+                selected["_selected_reason"] = "selected_adaptive_recovery"
+                return selected
+            selected = max(candidates, key=self._rss_2d_least_unsafe_recovery_candidate_sort_key)
+            selected["_selected_reason"] = "least_unsafe_adaptive_recovery"
+            return selected
         safe_candidates = [
             candidate
             for candidate in candidates
@@ -1784,6 +2280,25 @@ class RSSCBFFilter(StaticRSSFilter):
             )
         return max(candidates, key=self._rss_2d_candidate_sort_key)
 
+    def _rss_2d_valid_recovery_candidate(self, item: Dict[str, Any]) -> bool:
+        current_H = self._safe_float(item.get("current_H", item.get("H_current", math.inf)), math.inf)
+        if current_H >= 0.0:
+            return False
+        delta_H = self._safe_float(item.get("delta_H", math.nan), math.nan)
+        if not math.isfinite(delta_H) or delta_H <= self.config.small_tolerance:
+            return False
+        return True
+
+    def _rss_2d_boundary_recovery_candidate(self, item: Dict[str, Any]) -> bool:
+        evaluation = item.get("evaluation", {}) if isinstance(item, dict) else {}
+        object_type = str(evaluation.get("current_worst_object_type", ""))
+        object_kind = str(evaluation.get("current_worst_object_kind", ""))
+        current_worst = evaluation.get("current_worst", {}) if isinstance(evaluation, dict) else {}
+        if isinstance(current_worst, dict):
+            object_type = object_type or str(current_worst.get("object_type", ""))
+            object_kind = object_kind or str(current_worst.get("object_kind", ""))
+        return self._rss_2d_is_boundary_recovery_object(object_type, object_kind)
+
     def _rss_2d_candidate_sort_key(self, item: Dict[str, Any]) -> Tuple[float, ...]:
         return (
             float(item.get("H", -math.inf)),
@@ -1796,6 +2311,42 @@ class RSSCBFFilter(StaticRSSFilter):
             -float(item.get("intervention_cost", math.inf)),
             -float(item.get("acc_penalty", math.inf)),
             -float(item.get("steer_penalty", math.inf)),
+        )
+
+    def _rss_2d_recovery_candidate_sort_key(self, item: Dict[str, Any]) -> Tuple[float, ...]:
+        delta_H = self._safe_float(item.get("delta_H", -math.inf), -math.inf)
+        return (
+            self._safe_float(item.get("selection_score", -math.inf), -math.inf),
+            delta_H,
+            self._safe_float(item.get("H_next", -math.inf), -math.inf),
+            self._safe_float(item.get("boundary_recovery_score", -math.inf), -math.inf),
+            self._safe_float(item.get("H", -math.inf), -math.inf),
+            self._safe_float(item.get("final_H", -math.inf), -math.inf),
+            -self._safe_float(item.get("intervention_cost", math.inf), math.inf),
+            -self._safe_float(item.get("excessive_brake_penalty", math.inf), math.inf),
+            -self._safe_float(item.get("acc_penalty", math.inf), math.inf),
+            -self._safe_float(item.get("steer_penalty", math.inf), math.inf),
+        )
+
+    def _rss_2d_least_unsafe_recovery_candidate_sort_key(self, item: Dict[str, Any]) -> Tuple[float, ...]:
+        delta_H = self._safe_float(item.get("delta_H", -math.inf), -math.inf)
+        tolerance = max(
+            float(getattr(self.config, "adaptive_recovery_delta_h_tie_tolerance", 0.02)),
+            self.config.small_tolerance,
+        )
+        delta_bucket = math.trunc(delta_H / tolerance) if math.isfinite(delta_H) else -math.inf
+        return (
+            float(delta_bucket),
+            self._safe_float(item.get("speed_reduction", -math.inf), -math.inf),
+            delta_H,
+            self._safe_float(item.get("H_next", -math.inf), -math.inf),
+            self._safe_float(item.get("boundary_recovery_score", -math.inf), -math.inf),
+            self._safe_float(item.get("final_H", -math.inf), -math.inf),
+            self._safe_float(item.get("selection_score", -math.inf), -math.inf),
+            -self._safe_float(item.get("intervention_cost", math.inf), math.inf),
+            -self._safe_float(item.get("excessive_brake_penalty", math.inf), math.inf),
+            -self._safe_float(item.get("acc_penalty", math.inf), math.inf),
+            -self._safe_float(item.get("steer_penalty", math.inf), math.inf),
         )
 
     def _rss_2d_candidate_reject_reason(self, evaluation: Dict[str, Any]) -> str:
@@ -1840,6 +2391,8 @@ class RSSCBFFilter(StaticRSSFilter):
             "safety_function_mode": "unified_safety_object_2d_cbf",
             "rss_cbf_variant": "unified_safety_object_2d_cbf",
             "cbf_mode": mode,
+            "prediction_action_order": "internal:[acc, steer]",
+            "control_action_order": "internal/control:[acc, steer]",
             "min_h_2d": float(selected_eval.get("min_h_2d", math.inf)),
             "current_h_2d": float(selected_eval.get("current_h_2d", math.inf)),
             "final_h_2d": float(selected_eval.get("final_h_2d", math.inf)),
@@ -1847,6 +2400,23 @@ class RSSCBFFilter(StaticRSSFilter):
             "H_selected": float(selected_eval.get("H", selected_eval.get("min_h_2d", math.inf))),
             "nominal_H": float(nominal_eval.get("H", nominal_eval.get("min_h_2d", math.inf))),
             "selected_H": float(selected_eval.get("H", selected_eval.get("min_h_2d", math.inf))),
+            "H_current": float(selected.get("H_current", selected_eval.get("H_current", selected_eval.get("current_H", math.nan)))) if isinstance(selected, dict) else float(selected_eval.get("H_current", selected_eval.get("current_H", math.nan))),
+            "H_next": float(selected.get("H_next", selected_eval.get("H_next", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("H_next", math.nan)),
+            "delta_H": float(selected.get("delta_H", selected_eval.get("delta_H", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("delta_H", math.nan)),
+            "final_H": float(selected.get("final_H", selected_eval.get("final_H", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("final_H", math.nan)),
+            "current_speed": float(selected.get("current_speed", selected_eval.get("current_speed", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("current_speed", math.nan)),
+            "predicted_speed": float(selected.get("predicted_speed", selected_eval.get("predicted_speed", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("predicted_speed", math.nan)),
+            "adaptive_recovery_mode": bool(selected.get("adaptive_recovery_mode", False)) if isinstance(selected, dict) else False,
+            "risk": float(selected.get("risk", math.nan)) if isinstance(selected, dict) else math.nan,
+            "w_delta_H": float(selected.get("w_delta_H", math.nan)) if isinstance(selected, dict) else math.nan,
+            "w_center": float(selected.get("w_center", math.nan)) if isinstance(selected, dict) else math.nan,
+            "w_speed_reduction": float(selected.get("w_speed_reduction", math.nan)) if isinstance(selected, dict) else math.nan,
+            "selected_score": float(selected.get("selection_score", math.nan)) if isinstance(selected, dict) else math.nan,
+            "selected_delta_H": float(selected.get("delta_H", math.nan)) if isinstance(selected, dict) else math.nan,
+            "selected_center_recovery": float(selected.get("boundary_recovery_score", math.nan)) if isinstance(selected, dict) else math.nan,
+            "selected_speed_reduction": float(selected.get("speed_reduction", math.nan)) if isinstance(selected, dict) else math.nan,
+            "selected_action_distance": float(selected.get("action_distance", math.nan)) if isinstance(selected, dict) else math.nan,
+            "selected_smoothness_cost": float(selected.get("smoothness_cost", math.nan)) if isinstance(selected, dict) else math.nan,
             "worst_h": float(worst.get("h", selected_eval.get("H", math.inf))) if worst else math.inf,
             "safety_object_count": int(selected_eval.get("safety_object_count", 0)),
             "fallback_used": False,
@@ -1895,6 +2465,14 @@ class RSSCBFFilter(StaticRSSFilter):
             "old_ego_local_delta_s": float(worst.get("old_ego_local_delta_s", math.nan)) if worst else math.nan,
             "old_ego_local_delta_l": float(worst.get("old_ego_local_delta_l", math.nan)) if worst else math.nan,
             "worst_h_2d": float(worst.get("h_2d", math.nan)) if worst else math.nan,
+            "lane_l_min": float(worst.get("lane_l_min", math.nan)) if worst else math.nan,
+            "lane_l_max": float(worst.get("lane_l_max", math.nan)) if worst else math.nan,
+            "boundary_margin": float(worst.get("boundary_margin_config", worst.get("boundary_margin", math.nan))) if worst else math.nan,
+            "h_left": float(worst.get("h_left", math.nan)) if worst else math.nan,
+            "h_right": float(worst.get("h_right", math.nan)) if worst else math.nan,
+            "h_boundary": float(worst.get("h_boundary", math.nan)) if worst else math.nan,
+            "on_lane": bool(worst.get("ego_on_lane", self._ego(state).get("on_lane", True))) if worst else bool(self._ego(state).get("on_lane", True)),
+            "out_of_road": bool(worst.get("ego_out_of_road", self._ego(state).get("out_of_road", False))) if worst else bool(self._ego(state).get("out_of_road", False)),
             "worst_long_clearance": long_clearance,
             "worst_lat_clearance": float(worst.get("lat_clearance", math.nan)) if worst else math.nan,
             "worst_d_s_safe": d_s_safe,
@@ -1918,14 +2496,24 @@ class RSSCBFFilter(StaticRSSFilter):
             "road_boundary_margin_min_pred": float(selected_eval.get("road_boundary_margin_min_pred", math.nan)),
             "road_boundary_margin_final_pred": float(selected_eval.get("road_boundary_margin_final_pred", math.nan)),
             "road_boundary_margin_improvement": float(selected_eval.get("road_boundary_margin_improvement", math.nan)),
+            "current_ego_l": float(selected.get("current_ego_l", selected_eval.get("current_ego_l", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("current_ego_l", math.nan)),
+            "predicted_ego_l": float(selected.get("predicted_ego_l", selected_eval.get("predicted_ego_l", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("predicted_ego_l", math.nan)),
+            "lane_center_l": float(selected.get("lane_center_l", selected_eval.get("lane_center_l", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("lane_center_l", math.nan)),
+            "current_l_error": float(selected.get("current_l_error", selected_eval.get("current_l_error", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("current_l_error", math.nan)),
+            "predicted_l_error": float(selected.get("predicted_l_error", selected_eval.get("predicted_l_error", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("predicted_l_error", math.nan)),
+            "boundary_recovery_score": float(selected.get("boundary_recovery_score", selected_eval.get("boundary_recovery_score", math.nan))) if isinstance(selected, dict) else float(selected_eval.get("boundary_recovery_score", math.nan)),
             "road_boundary_margin_source": selected_eval.get("road_boundary_margin_source", ""),
             "predicted_lateral_position": float(selected_eval.get("predicted_lateral_position", math.nan)),
             "predicted_lane_offset": float(selected_eval.get("predicted_lane_offset", math.nan)),
             "road_boundary_centering_improvement": float(selected_eval.get("road_boundary_centering_improvement", math.nan)),
+            "rss_filter_selected_control_action": self.control_action_from_internal(u_safe),
+            "rss_filter_selected_acc": float(u_safe[0]),
+            "rss_filter_selected_steer": float(u_safe[1]),
             "selected_action": list(u_safe),
             "selected_acc": float(u_safe[0]),
             "selected_steer": float(u_safe[1]),
             "nominal_action": list(u_original),
+            "selected_reason": selected.get("selected_reason", projection_debug.get("reason", reason)) if isinstance(selected, dict) else projection_debug.get("reason", reason),
             "filter_intervened": bool(self._action_distance_sq(u_safe, u_original) > self.config.small_tolerance),
             "candidate_reject_reasons": projection_debug.get("candidate_reject_reasons", ""),
             "candidate_count": int(projection_debug.get("candidate_count", 0)),
@@ -1935,6 +2523,15 @@ class RSSCBFFilter(StaticRSSFilter):
             ),
             "safe_candidate_count": int(projection_debug.get("safe_candidate_count", 0)),
             "road_safe_candidate_count": int(projection_debug.get("road_safe_candidate_count", 0)),
+            "valid_recovery_candidate_count": int(projection_debug.get("valid_recovery_candidate_count", 0)),
+            "least_unsafe_candidate_count": int(projection_debug.get("least_unsafe_candidate_count", 0)),
+            "rejected_because_negative_delta_H_count": int(
+                projection_debug.get("rejected_because_negative_delta_H_count", 0)
+            ),
+            "selected_candidate_delta_H": float(projection_debug.get("selected_candidate_delta_H", math.nan)),
+            "selected_candidate_boundary_recovery_score": float(
+                projection_debug.get("selected_candidate_boundary_recovery_score", math.nan)
+            ),
             "rss_2d_acc_candidate_count": len(projection_debug.get("acc_candidates", [])),
             "rss_2d_steer_candidate_count": len(projection_debug.get("steer_candidates", [])),
             "build_safety_objects_time": float(profile.get("build_safety_objects_time", 0.0)),
@@ -2016,7 +2613,313 @@ class RSSCBFFilter(StaticRSSFilter):
         ]:
             if key in selected_eval:
                 info[key] = selected_eval[key]
-        return self._with_action_debug(info, u_original, u_safe)
+        info = self._with_action_debug(info, u_original, u_safe)
+        self._maybe_log_frenet_runtime_verification(info)
+        return info
+
+    def _maybe_log_frenet_runtime_verification(self, info: Dict[str, Any]) -> None:
+        if not bool(getattr(self.config, "frenet_debug_log", True)):
+            return
+        log_level = self._rss_debug_log_level()
+        if log_level == "off":
+            return
+
+        filter_intervened = bool(info.get("filter_intervened", False))
+        if filter_intervened:
+            self._rss_debug_recent_interventions += 1
+
+        if log_level == "verbose":
+            self._log_frenet_runtime_verbose(info, filter_intervened)
+            return
+
+        if log_level == "summary":
+            self._maybe_log_frenet_runtime_summary(info)
+            return
+
+        if log_level == "event" and self._rss_debug_event_should_log(info, filter_intervened):
+            self._log_frenet_runtime_event(info, filter_intervened)
+
+    def _rss_debug_log_level(self) -> str:
+        level = str(getattr(self.config, "rss_debug_log_level", "event")).strip().lower()
+        if level not in {"off", "summary", "event", "verbose"}:
+            return "event"
+        return level
+
+    def _rss_debug_interval(self) -> int:
+        interval = int(getattr(self.config, "rss_debug_log_interval", 50))
+        if interval <= 0:
+            interval = int(getattr(self.config, "debug_log_interval", 50))
+        return max(1, interval)
+
+    def _rss_debug_summary_interval(self) -> int:
+        interval = int(getattr(self.config, "rss_debug_summary_interval", self._rss_debug_interval()))
+        if interval <= 0:
+            interval = self._rss_debug_interval()
+        return max(1, interval)
+
+    def _rss_debug_event_should_log(self, info: Dict[str, Any], filter_intervened: bool) -> bool:
+        worst_type = str(info.get("worst_object_type", ""))
+        selected_reason = str(info.get("selected_reason", ""))
+        coordinate_mode = str(info.get("coordinate_mode", ""))
+        h_current = self._safe_float(info.get("H_current", math.inf), math.inf)
+        h_next = self._safe_float(info.get("H_next", math.inf), math.inf)
+        delta_h = self._safe_float(info.get("delta_H", math.inf), math.inf)
+        near_margin = float(getattr(self.config, "rss_debug_log_near_margin", 0.2))
+        large_drop = float(getattr(self.config, "rss_debug_log_large_drop_threshold", 0.1))
+        anomaly = bool(
+            h_current < 0.0
+            or h_next < near_margin
+            or delta_h < -large_drop
+            or "least_unsafe" in selected_reason
+            or "fallback" in selected_reason
+            or (worst_type in {"road_edge", "no_drive_area"} and h_current < 0.0)
+            or coordinate_mode != "computed_frenet"
+            or bool(info.get("out_of_road", info.get("ego_out_of_road", False)))
+            or bool(info.get("crash", False))
+            or bool(info.get("ego_crash_sidewalk", False))
+            or bool(info.get("crash_sidewalk", False))
+            or bool(info.get("road_boundary_hard_violation", False))
+        )
+        only_intervention = bool(getattr(self.config, "rss_debug_log_only_intervention", True))
+        only_anomaly = bool(getattr(self.config, "rss_debug_log_only_anomaly", True))
+        if only_intervention and only_anomaly:
+            return bool(filter_intervened or anomaly)
+        if only_intervention:
+            return bool(filter_intervened)
+        if only_anomaly:
+            return bool(anomaly)
+        return True
+
+    def _rss_debug_console_enabled(self, level: str) -> bool:
+        log_level = self._rss_debug_log_level()
+        if log_level == "off" or not LOGGER.isEnabledFor(logging.INFO):
+            return False
+        if log_level == "verbose":
+            return True
+        if log_level == "summary":
+            return level in {"summary", "profile"}
+        if log_level == "event":
+            return bool(getattr(self.config, "rss_debug_log_to_console", False)) and level == "event"
+        return False
+
+    def _rss_debug_file_enabled(self, level: str) -> bool:
+        log_level = self._rss_debug_log_level()
+        if log_level == "off" or not bool(getattr(self.config, "rss_debug_log_to_file", True)):
+            return False
+        if log_level == "verbose":
+            return True
+        if log_level == "summary":
+            return level in {"summary", "profile"}
+        if log_level == "event":
+            return level in {"event", "profile"}
+        return False
+
+    def _emit_rss_debug_log(self, event_dict: Dict[str, Any], level: str = "event") -> None:
+        if not event_dict:
+            return
+        should_console = self._rss_debug_console_enabled(level)
+        should_file = self._rss_debug_file_enabled(level)
+        if not should_console and not should_file:
+            return
+
+        if should_console:
+            self._emit_rss_debug_console(event_dict, level)
+        if should_file:
+            self._write_rss_debug_jsonl(event_dict)
+
+    def _emit_rss_debug_console(self, event: Dict[str, Any], level: str) -> None:
+        event_name = str(event.get("event", level))
+        if event_name == "summary":
+            LOGGER.info(
+                "RSS-CBF summary step=%s filter_ms=%.3f H=%.3f worst=%s v=%.3f "
+                "l=%.3f intv_recent=%s/%s objs=%s cands=%s reason=%s",
+                int(event.get("step", self._rss_2d_filter_step)),
+                self._safe_float(event.get("filter_time_ms", math.nan), math.nan),
+                self._safe_float(event.get("H_current", math.nan), math.nan),
+                str(event.get("worst_object_type", "")),
+                self._safe_float(event.get("current_speed", math.nan), math.nan),
+                self._safe_float(event.get("ego_l", math.nan), math.nan),
+                int(event.get("filter_intervened_count_recent", 0)),
+                int(event.get("summary_interval", self._rss_debug_summary_interval())),
+                int(event.get("num_safety_objects", 0)),
+                int(event.get("num_candidates", 0)),
+                str(event.get("selected_reason", "")),
+            )
+            return
+        if event_name == "profile":
+            LOGGER.info(
+                "RSS-CBF profile step=%s filter_ms=%.3f build_ms=%.3f eval_ms=%.3f objs=%s cands=%s",
+                int(event.get("step", self._rss_2d_filter_step)),
+                self._safe_float(event.get("filter_time_ms", math.nan), math.nan),
+                self._safe_float(event.get("build_objects_time_ms", math.nan), math.nan),
+                self._safe_float(event.get("candidate_eval_time_ms", math.nan), math.nan),
+                int(event.get("num_safety_objects", 0)),
+                int(event.get("num_candidates", 0)),
+            )
+            return
+        if event_name == "verbose":
+            LOGGER.info("RSS-CBF verbose %s", self._json_safe(event))
+            return
+        LOGGER.info(
+            "RSS-CBF event step=%s intv=%s coord=%s worst=%s H=%.3f Hn=%.3f "
+            "dH=%.3f l=%.3f v=%.3f action=%s reason=%s",
+            int(event.get("step", self._rss_2d_filter_step)),
+            bool(event.get("filter_intervened", False)),
+            str(event.get("coordinate_mode", "")),
+            str(event.get("worst_object_type", "")),
+            self._safe_float(event.get("H_current", math.nan), math.nan),
+            self._safe_float(event.get("H_next", math.nan), math.nan),
+            self._safe_float(event.get("delta_H", math.nan), math.nan),
+            self._safe_float(event.get("ego_l", math.nan), math.nan),
+            self._safe_float(event.get("current_speed", math.nan), math.nan),
+            list(event.get("selected_action", [])),
+            str(event.get("selected_reason", "")),
+        )
+
+    def _write_rss_debug_jsonl(self, event: Dict[str, Any]) -> None:
+        path_text = str(getattr(self.config, "rss_debug_log_file", "logs/rss_cbf_debug.jsonl"))
+        if not path_text:
+            return
+        path = Path(path_text)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(self._json_safe(event), ensure_ascii=True, sort_keys=True) + "\n")
+        except OSError as exc:
+            if not self._rss_debug_file_warning_emitted and LOGGER.isEnabledFor(logging.WARNING):
+                LOGGER.warning("RSS-CBF debug log file write failed: %s", exc)
+                self._rss_debug_file_warning_emitted = True
+
+    def _json_safe(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key): self._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(item) for item in value]
+        if isinstance(value, np.ndarray):
+            return self._json_safe(value.tolist())
+        if isinstance(value, np.generic):
+            return self._json_safe(value.item())
+        if isinstance(value, float):
+            if math.isfinite(value):
+                return value
+            return None
+        if isinstance(value, (str, int, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _rss_debug_event_payload(self, info: Dict[str, Any], filter_intervened: bool) -> Dict[str, Any]:
+        return {
+            "event": "event",
+            "step": int(self._rss_2d_filter_step),
+            "filter_intervened": bool(filter_intervened),
+            "coordinate_mode": str(info.get("coordinate_mode", "")),
+            "worst_object_type": str(info.get("worst_object_type", "")),
+            "worst_h": self._safe_float(info.get("worst_h", math.nan), math.nan),
+            "H_current": self._safe_float(info.get("H_current", math.nan), math.nan),
+            "H_next": self._safe_float(info.get("H_next", math.nan), math.nan),
+            "delta_H": self._safe_float(info.get("delta_H", math.nan), math.nan),
+            "final_H": self._safe_float(info.get("final_H", math.nan), math.nan),
+            "ego_l": self._safe_float(info.get("ego_l", info.get("l_ego", info.get("current_ego_l", math.nan))), math.nan),
+            "lane_l_min": self._safe_float(info.get("lane_l_min", math.nan), math.nan),
+            "lane_l_max": self._safe_float(info.get("lane_l_max", math.nan), math.nan),
+            "current_speed": self._safe_float(info.get("current_speed", math.nan), math.nan),
+            "predicted_speed": self._safe_float(info.get("predicted_speed", math.nan), math.nan),
+            "selected_action": list(info.get("selected_action", [])),
+            "nominal_action": list(info.get("nominal_action", [])),
+            "selected_reason": str(info.get("selected_reason", "")),
+            "ego_frenet_valid": bool(info.get("ego_frenet_valid", False)),
+            "obj_frenet_valid": bool(info.get("object_frenet_valid", False)),
+            "adaptive_recovery_mode": bool(info.get("adaptive_recovery_mode", False)),
+            "risk": self._safe_float(info.get("risk", math.nan), math.nan),
+            "valid_recovery_candidate_count": int(info.get("valid_recovery_candidate_count", 0)),
+            "least_unsafe_candidate_count": int(info.get("least_unsafe_candidate_count", 0)),
+            "rejected_because_negative_delta_H_count": int(info.get("rejected_because_negative_delta_H_count", 0)),
+            "num_safety_objects": int(info.get("safety_object_count_local", info.get("safety_object_count", 0))),
+            "num_candidates": int(info.get("candidate_count", 0)),
+        }
+
+    def _rss_debug_summary_payload(self, info: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "event": "summary",
+            "step": int(self._rss_2d_filter_step),
+            "summary_interval": int(self._rss_debug_summary_interval()),
+            "filter_time_ms": 1000.0 * self._safe_float(info.get("total_filter_time", math.nan), math.nan),
+            "filter_intervened_count_recent": int(self._rss_debug_recent_interventions),
+            "H_current": self._safe_float(info.get("H_current", math.nan), math.nan),
+            "worst_object_type": str(info.get("worst_object_type", "")),
+            "selected_reason": str(info.get("selected_reason", "")),
+            "current_speed": self._safe_float(info.get("current_speed", math.nan), math.nan),
+            "ego_l": self._safe_float(info.get("ego_l", info.get("l_ego", info.get("current_ego_l", math.nan))), math.nan),
+            "selected_action": list(info.get("selected_action", [])),
+            "num_safety_objects": int(info.get("safety_object_count_local", info.get("safety_object_count", 0))),
+            "num_candidates": int(info.get("candidate_count", 0)),
+        }
+
+    def _log_frenet_runtime_event(self, info: Dict[str, Any], filter_intervened: bool) -> None:
+        if not (self._rss_debug_console_enabled("event") or self._rss_debug_file_enabled("event")):
+            return
+        self._emit_rss_debug_log(self._rss_debug_event_payload(info, filter_intervened), level="event")
+
+    def _maybe_log_frenet_runtime_summary(self, info: Dict[str, Any]) -> None:
+        interval = self._rss_debug_summary_interval()
+        if self._rss_2d_filter_step % interval != 0:
+            return
+        if not (self._rss_debug_console_enabled("summary") or self._rss_debug_file_enabled("summary")):
+            return
+        self._emit_rss_debug_log(self._rss_debug_summary_payload(info), level="summary")
+        self._rss_debug_recent_interventions = 0
+
+    def _log_frenet_runtime_verbose(self, info: Dict[str, Any], filter_intervened: bool) -> None:
+        if not (self._rss_debug_console_enabled("verbose") or self._rss_debug_file_enabled("verbose")):
+            return
+        verbose_payload = self._rss_debug_event_payload(info, filter_intervened)
+        verbose_payload.update(
+            {
+                "event": "verbose",
+                "ego_s": self._safe_float(info.get("ego_s", info.get("s_ego", math.nan)), math.nan),
+                "object_s": self._safe_float(info.get("object_s", info.get("worst_s_obj", math.nan)), math.nan),
+                "object_l": self._safe_float(info.get("object_l", info.get("worst_l_obj", math.nan)), math.nan),
+                "worst_delta_s": self._safe_float(info.get("worst_delta_s", math.nan), math.nan),
+                "worst_delta_l": self._safe_float(info.get("worst_delta_l", math.nan), math.nan),
+                "old_ego_local_delta_s": self._safe_float(
+                    info.get("old_ego_local_delta_s", info.get("old_delta_s", math.nan)), math.nan
+                ),
+                "old_ego_local_delta_l": self._safe_float(
+                    info.get("old_ego_local_delta_l", info.get("old_delta_l", math.nan)), math.nan
+                ),
+                "frenet_fallback_reason": str(info.get("frenet_fallback_reason", "")),
+                "boundary_margin": self._safe_float(info.get("boundary_margin", math.nan), math.nan),
+                "h_left": self._safe_float(info.get("h_left", math.nan), math.nan),
+                "h_right": self._safe_float(info.get("h_right", math.nan), math.nan),
+                "h_boundary": self._safe_float(info.get("h_boundary", math.nan), math.nan),
+                "on_lane": bool(info.get("on_lane", info.get("ego_on_lane", True))),
+                "out_of_road": bool(info.get("out_of_road", info.get("ego_out_of_road", False))),
+                "current_ego_l": self._safe_float(info.get("current_ego_l", math.nan), math.nan),
+                "predicted_ego_l": self._safe_float(info.get("predicted_ego_l", math.nan), math.nan),
+                "lane_center_l": self._safe_float(info.get("lane_center_l", math.nan), math.nan),
+                "current_l_error": self._safe_float(info.get("current_l_error", math.nan), math.nan),
+                "predicted_l_error": self._safe_float(info.get("predicted_l_error", math.nan), math.nan),
+                "boundary_recovery_score": self._safe_float(info.get("boundary_recovery_score", math.nan), math.nan),
+                "selected_acc": self._safe_float(info.get("selected_acc", math.nan), math.nan),
+                "selected_steer": self._safe_float(info.get("selected_steer", math.nan), math.nan),
+                "w_delta_H": self._safe_float(info.get("w_delta_H", math.nan), math.nan),
+                "w_center": self._safe_float(info.get("w_center", math.nan), math.nan),
+                "w_speed_reduction": self._safe_float(info.get("w_speed_reduction", math.nan), math.nan),
+                "selected_score": self._safe_float(info.get("selected_score", math.nan), math.nan),
+                "selected_delta_H": self._safe_float(info.get("selected_delta_H", math.nan), math.nan),
+                "selected_center_recovery": self._safe_float(info.get("selected_center_recovery", math.nan), math.nan),
+                "selected_speed_reduction": self._safe_float(info.get("selected_speed_reduction", math.nan), math.nan),
+                "selected_action_distance": self._safe_float(info.get("selected_action_distance", math.nan), math.nan),
+                "selected_smoothness_cost": self._safe_float(info.get("selected_smoothness_cost", math.nan), math.nan),
+                "selected_candidate_delta_H": self._safe_float(info.get("selected_candidate_delta_H", math.nan), math.nan),
+                "selected_candidate_boundary_recovery_score": self._safe_float(
+                    info.get("selected_candidate_boundary_recovery_score", math.nan), math.nan
+                ),
+            }
+        )
+        self._emit_rss_debug_log(verbose_payload, level="verbose")
 
     def _select_front_rss_object(
         self, state: State
@@ -2405,6 +3308,9 @@ class RSSCBFFilter(StaticRSSFilter):
             "worst_d_s_safe": math.nan,
             "worst_d_l_safe": math.nan,
             "selected_action": list(u_safe),
+            "rss_filter_selected_control_action": self.control_action_from_internal(u_safe),
+            "rss_filter_selected_acc": float(u_safe[0]),
+            "rss_filter_selected_steer": float(u_safe[1]),
             "nominal_action": list(u_original),
             "filter_intervened": bool(self._action_distance_sq(u_safe, u_original) > self.config.small_tolerance),
             "candidate_reject_reasons": "",

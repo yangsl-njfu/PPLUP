@@ -250,6 +250,10 @@ class RSSMPCFilter(RSSCBFFilter):
         """
         self._tick_corridor_memory()
         u_original = self._clip_action(u_nom)
+        reference_lane = state.get("_frenet_reference_lane", self._last_frenet_reference_lane)
+        if reference_lane is not None:
+            self._last_frenet_reference_lane = reference_lane
+            self.rss_cbf_filter._last_frenet_reference_lane = reference_lane
         cbf_safe, cbf_info = self.rss_cbf_filter.filter_action(state, u_original)
         cbf_safe = self._clip_action(cbf_safe)
         front = self._select_front_rss_object(state)
@@ -4678,6 +4682,41 @@ class RSSMPCFilter(RSSCBFFilter):
             "old_ego_local_delta_l": cbf_log_info.get("old_ego_local_delta_l", math.nan),
             "h_2d": cbf_log_info.get("h_2d", cbf_log_info.get("worst_h_2d", math.nan)),
             "worst_object_type": cbf_log_info.get("worst_object_type", ""),
+            "prediction_action_order": cbf_log_info.get("prediction_action_order", "internal:[acc, steer]"),
+            "control_action_order": cbf_log_info.get("control_action_order", "internal/control:[acc, steer]"),
+            "H_current": cbf_log_info.get("H_current", math.nan),
+            "H_next": cbf_log_info.get("H_next", math.nan),
+            "delta_H": cbf_log_info.get("delta_H", math.nan),
+            "final_H": cbf_log_info.get("final_H", math.nan),
+            "current_speed": cbf_log_info.get("current_speed", math.nan),
+            "predicted_speed": cbf_log_info.get("predicted_speed", math.nan),
+            "adaptive_recovery_mode": cbf_log_info.get("adaptive_recovery_mode", False),
+            "risk": cbf_log_info.get("risk", math.nan),
+            "w_delta_H": cbf_log_info.get("w_delta_H", math.nan),
+            "w_center": cbf_log_info.get("w_center", math.nan),
+            "w_speed_reduction": cbf_log_info.get("w_speed_reduction", math.nan),
+            "selected_score": cbf_log_info.get("selected_score", math.nan),
+            "selected_delta_H": cbf_log_info.get("selected_delta_H", math.nan),
+            "selected_center_recovery": cbf_log_info.get("selected_center_recovery", math.nan),
+            "selected_speed_reduction": cbf_log_info.get("selected_speed_reduction", math.nan),
+            "selected_action_distance": cbf_log_info.get("selected_action_distance", math.nan),
+            "selected_smoothness_cost": cbf_log_info.get("selected_smoothness_cost", math.nan),
+            "current_ego_l": cbf_log_info.get("current_ego_l", math.nan),
+            "predicted_ego_l": cbf_log_info.get("predicted_ego_l", math.nan),
+            "lane_center_l": cbf_log_info.get("lane_center_l", math.nan),
+            "current_l_error": cbf_log_info.get("current_l_error", math.nan),
+            "predicted_l_error": cbf_log_info.get("predicted_l_error", math.nan),
+            "boundary_recovery_score": cbf_log_info.get("boundary_recovery_score", math.nan),
+            "valid_recovery_candidate_count": cbf_log_info.get("valid_recovery_candidate_count", 0),
+            "least_unsafe_candidate_count": cbf_log_info.get("least_unsafe_candidate_count", 0),
+            "selected_candidate_delta_H": cbf_log_info.get("selected_candidate_delta_H", math.nan),
+            "selected_candidate_boundary_recovery_score": cbf_log_info.get(
+                "selected_candidate_boundary_recovery_score", math.nan
+            ),
+            "rejected_because_negative_delta_H_count": cbf_log_info.get(
+                "rejected_because_negative_delta_H_count", 0
+            ),
+            "selected_reason": cbf_log_info.get("selected_reason", ""),
             "cbf_reference_mode": (cbf_reference_info or {}).get("mode", ""),
             "cbf_reference_action_delta": (cbf_reference_info or {}).get("action_delta", math.nan),
             "cbf_reference_acc_safe": (cbf_reference_info or {}).get("acc_safe", math.nan),
