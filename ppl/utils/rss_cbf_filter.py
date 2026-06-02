@@ -309,7 +309,9 @@ class RSSCBFFilter(StaticRSSFilter):
         static_obstacles = list(state.get("static_obstacles", []) or [])
         static_objects: List[SafetyObject]
         signature = self._rss_2d_static_obstacle_signature(static_obstacles)
-        cache_enabled = bool(getattr(self.config, "enable_static_safety_object_cache", True))
+        cache_enabled = bool(getattr(self.config, "enable_static_safety_object_cache", True)) and not bool(
+            getattr(self.config, "enable_frenet_coordinates", False)
+        )
         if (
             cache_enabled
             and self._rss_2d_static_cache_signature == signature
@@ -541,7 +543,10 @@ class RSSCBFFilter(StaticRSSFilter):
         dynamic_radius = max(broad_radius, float(getattr(self.config, "dynamic_check_distance", broad_radius)))
         static_rows: List[Tuple[float, float, SafetyObject]] = []
         dynamic_rows: List[Tuple[float, float, SafetyObject]] = []
-        if bool(getattr(self.config, "enable_static_safety_object_cache", True)):
+        static_cache_enabled = bool(getattr(self.config, "enable_static_safety_object_cache", True)) and not bool(
+            getattr(self.config, "enable_frenet_coordinates", False)
+        )
+        if static_cache_enabled:
             static_candidates = self._query_rss_2d_static_grid(state, broad_radius)
             dynamic_candidates = [obj for obj in spatial_objects if obj.is_dynamic]
             candidate_objects = static_candidates + dynamic_candidates
@@ -550,7 +555,7 @@ class RSSCBFFilter(StaticRSSFilter):
 
         if bool(getattr(self.config, "enable_vectorized_broad_phase", True)):
             static_rows, dynamic_rows = self._rss_2d_broad_phase_rows_vectorized(
-                ego,
+                state,
                 candidate_objects,
                 broad_radius,
                 dynamic_radius,
@@ -560,7 +565,9 @@ class RSSCBFFilter(StaticRSSFilter):
                 payload = safety_object.payload
                 if payload is None:
                     continue
-                delta_s, delta_l = self._relative_position(ego, payload)
+                relative = self._rss_2d_relative_position_metrics(state, payload)
+                delta_s = float(relative["delta_s"])
+                delta_l = float(relative["delta_l"])
                 center_distance = math.hypot(delta_s, delta_l)
                 radius = max(0.0, float(safety_object.radius))
                 check_radius = dynamic_radius if safety_object.is_dynamic else broad_radius
@@ -589,7 +596,7 @@ class RSSCBFFilter(StaticRSSFilter):
 
     def _rss_2d_broad_phase_rows_vectorized(
         self,
-        ego: Dict[str, Any],
+        state: State,
         candidate_objects: Sequence[SafetyObject],
         broad_radius: float,
         dynamic_radius: float,
@@ -598,49 +605,24 @@ class RSSCBFFilter(StaticRSSFilter):
         if not active_objects:
             return [], []
 
-        centers = np.asarray([item.center for item in active_objects], dtype=float)
-        radii = np.asarray([max(0.0, float(item.radius)) for item in active_objects], dtype=float)
-        dynamic_mask = np.asarray([bool(item.is_dynamic) for item in active_objects], dtype=bool)
-        use_frenet = (
-            bool(getattr(self.config, "enable_frenet_coordinates", False))
-            and bool(ego.get("frenet_valid", False))
-            and all(
-                item.payload is not None and bool(item.payload.get("frenet_valid", False))
-                for item in active_objects
-            )
-        )
-        if use_frenet:
-            ego_s = self._safe_float(ego.get("frenet_s", math.nan), math.nan)
-            ego_l = self._safe_float(ego.get("frenet_l", math.nan), math.nan)
-            obj_s = np.asarray([self._safe_float(item.payload.get("frenet_s", math.nan), math.nan) for item in active_objects], dtype=float)
-            obj_l = np.asarray([self._safe_float(item.payload.get("frenet_l", math.nan), math.nan) for item in active_objects], dtype=float)
-            if math.isfinite(ego_s) and math.isfinite(ego_l) and np.all(np.isfinite(obj_s)) and np.all(np.isfinite(obj_l)):
-                delta_s = obj_s - ego_s
-                delta_l = obj_l - ego_l
-            else:
-                use_frenet = False
-        if not use_frenet:
-            ego_x = self._safe_float(ego.get("x", 0.0), 0.0)
-            ego_y = self._safe_float(ego.get("y", 0.0), 0.0)
-            heading = self._safe_float(ego.get("heading", 0.0), 0.0)
-            dx = centers[:, 0] - ego_x
-            dy = centers[:, 1] - ego_y
-            cos_h = math.cos(heading)
-            sin_h = math.sin(heading)
-            delta_s = dx * cos_h + dy * sin_h
-            delta_l = -dx * sin_h + dy * cos_h
-        center_distance = np.hypot(delta_s, delta_l)
-        check_radius = np.where(dynamic_mask, float(dynamic_radius), float(broad_radius))
-        too_far_radial = center_distance - radii > check_radius
-        too_far_box = (np.abs(delta_s) - radii > check_radius) & (np.abs(delta_l) - radii > check_radius)
-        keep_indices = np.flatnonzero(~too_far_radial & ~too_far_box)
-
         static_rows: List[Tuple[float, float, SafetyObject]] = []
         dynamic_rows: List[Tuple[float, float, SafetyObject]] = []
-        for index in keep_indices:
-            safety_object = active_objects[int(index)]
-            risk_key = max(0.0, float(center_distance[index] - radii[index]))
-            row = (risk_key, abs(float(delta_s[index])), safety_object)
+        for safety_object in active_objects:
+            payload = safety_object.payload
+            if payload is None:
+                continue
+            relative = self._rss_2d_relative_position_metrics(state, payload)
+            delta_s = float(relative["delta_s"])
+            delta_l = float(relative["delta_l"])
+            center_distance = math.hypot(delta_s, delta_l)
+            radius = max(0.0, float(safety_object.radius))
+            check_radius = dynamic_radius if safety_object.is_dynamic else broad_radius
+            if center_distance - radius > check_radius:
+                continue
+            if abs(delta_s) - radius > check_radius and abs(delta_l) - radius > check_radius:
+                continue
+            risk_key = max(0.0, center_distance - radius)
+            row = (risk_key, abs(delta_s), safety_object)
             if safety_object.is_dynamic:
                 dynamic_rows.append(row)
             else:
@@ -691,6 +673,227 @@ class RSSCBFFilter(StaticRSSFilter):
             configured = getattr(self.config, "rss_2d_prediction_horizon_steps", self.config.horizon_steps)
         return max(0, int(configured))
 
+    def _rss_2d_reference_lane(self, state: State) -> Any:
+        lane = state.get("_frenet_reference_lane", None)
+        if lane is not None:
+            return lane
+        ego_source = self._runtime_entity_source(self._ego(state))
+        if ego_source is not None:
+            lane = self._metadrive_current_lane(ego_source)
+            if lane is not None:
+                self._last_frenet_reference_lane = lane
+                return lane
+        return self._last_frenet_reference_lane
+
+    def _runtime_entity_source(self, entity: Any) -> Any:
+        if isinstance(entity, dict):
+            return entity.get("_metadrive_source", None)
+        return entity
+
+    def _rss_project_point_to_lane(self, point: Any, lane: Any) -> Dict[str, Any]:
+        if lane is None:
+            return {
+                "valid": False,
+                "s": math.nan,
+                "l": math.nan,
+                "heading_ref": math.nan,
+                "reason": "missing_reference_lane",
+            }
+        if point is None:
+            return {
+                "valid": False,
+                "s": math.nan,
+                "l": math.nan,
+                "heading_ref": math.nan,
+                "reason": "missing_position",
+            }
+        try:
+            s_value, l_value = lane.local_coordinates(point)
+            s_value = float(s_value)
+            l_value = float(l_value)
+        except Exception as exc:
+            return {
+                "valid": False,
+                "s": math.nan,
+                "l": math.nan,
+                "heading_ref": math.nan,
+                "reason": "local_coordinates_failed:{}".format(type(exc).__name__),
+            }
+        try:
+            heading_ref = float(lane.heading_at(s_value))
+        except Exception as exc:
+            return {
+                "valid": False,
+                "s": s_value,
+                "l": l_value,
+                "heading_ref": math.nan,
+                "reason": "heading_at_failed:{}".format(type(exc).__name__),
+            }
+        return {
+            "valid": True,
+            "s": s_value,
+            "l": l_value,
+            "heading_ref": heading_ref,
+            "reason": "",
+        }
+
+    def _rss_project_entity_to_frenet(self, state: State, entity: Dict[str, Any], role: str) -> Dict[str, Any]:
+        if not bool(getattr(self.config, "enable_frenet_coordinates", False)):
+            return {
+                "valid": False,
+                "mode": "ego_local_fallback",
+                "s": math.nan,
+                "l": math.nan,
+                "heading_ref": math.nan,
+                "v_s": math.nan,
+                "v_l": math.nan,
+                "ref_lane_valid": False,
+                "reason": "disabled",
+            }
+
+        lane = self._rss_2d_reference_lane(state)
+        source = self._runtime_entity_source(entity)
+        computed_reason = ""
+        if source is not None and lane is not None:
+            projection = self._rss_project_point_to_lane(self._frenet_position(source), lane)
+            if bool(projection.get("valid", False)):
+                heading_ref = float(projection["heading_ref"])
+                heading = self._entity_heading(source, self._entity_heading(entity, heading_ref))
+                speed = self._entity_speed(source, self._entity_speed(entity, 0.0))
+                heading_error = heading - heading_ref
+                return {
+                    "valid": True,
+                    "mode": "computed_frenet",
+                    "s": float(projection["s"]),
+                    "l": float(projection["l"]),
+                    "heading_ref": heading_ref,
+                    "v_s": float(speed * math.cos(heading_error)),
+                    "v_l": float(speed * math.sin(heading_error)),
+                    "ref_lane_valid": True,
+                    "reason": "",
+                }
+            computed_reason = str(projection.get("reason", "projection_failed"))
+
+        payload_s = self._safe_float(entity.get("frenet_s", math.nan), math.nan)
+        payload_l = self._safe_float(entity.get("frenet_l", math.nan), math.nan)
+        payload_valid = bool(entity.get("frenet_valid", False)) and math.isfinite(payload_s) and math.isfinite(payload_l)
+        if payload_valid:
+            return {
+                "valid": True,
+                "mode": "payload_frenet",
+                "s": payload_s,
+                "l": payload_l,
+                "heading_ref": self._safe_float(entity.get("frenet_heading_ref", math.nan), math.nan),
+                "v_s": self._safe_float(entity.get("frenet_v_s", math.nan), math.nan),
+                "v_l": self._safe_float(entity.get("frenet_v_l", math.nan), math.nan),
+                "ref_lane_valid": lane is not None,
+                "reason": "",
+            }
+
+        if computed_reason:
+            reason = computed_reason
+        elif lane is None:
+            reason = "missing_reference_lane"
+        elif source is None:
+            reason = "missing_runtime_source"
+        else:
+            reason = str(entity.get("frenet_fallback_reason", "") or "frenet_invalid")
+        return {
+            "valid": False,
+            "mode": "ego_local_fallback",
+            "s": self._safe_float(entity.get("frenet_s", math.nan), math.nan),
+            "l": self._safe_float(entity.get("frenet_l", math.nan), math.nan),
+            "heading_ref": self._safe_float(entity.get("frenet_heading_ref", math.nan), math.nan),
+            "v_s": self._safe_float(entity.get("frenet_v_s", math.nan), math.nan),
+            "v_l": self._safe_float(entity.get("frenet_v_l", math.nan), math.nan),
+            "ref_lane_valid": lane is not None,
+            "reason": reason,
+        }
+
+    def _rss_2d_relative_position_metrics(self, state: State, obj: Dict[str, Any]) -> Dict[str, Any]:
+        ego = self._ego(state)
+        old_delta_s, old_delta_l = self._ego_local_relative_position(ego, obj)
+        fallback_allowed = bool(getattr(self.config, "frenet_fallback_to_ego_local", True))
+        ego_frenet = self._rss_project_entity_to_frenet(state, ego, role="ego")
+        obj_frenet = self._rss_project_entity_to_frenet(state, obj, role="object")
+        if bool(ego_frenet.get("valid", False)) and bool(obj_frenet.get("valid", False)):
+            s_ego = float(ego_frenet["s"])
+            l_ego = float(ego_frenet["l"])
+            s_obj = float(obj_frenet["s"])
+            l_obj = float(obj_frenet["l"])
+            coordinate_mode = (
+                "computed_frenet"
+                if ego_frenet.get("mode") == "computed_frenet" or obj_frenet.get("mode") == "computed_frenet"
+                else "payload_frenet"
+            )
+            return {
+                "delta_s": float(s_obj - s_ego),
+                "delta_l": float(l_obj - l_ego),
+                "coordinate_mode": coordinate_mode,
+                "frenet_valid": True,
+                "frenet_fallback_reason": "",
+                "ego_ref_lane_valid": bool(ego_frenet.get("ref_lane_valid", False)),
+                "ego_frenet_valid": True,
+                "object_frenet_valid": True,
+                "s_ego": s_ego,
+                "l_ego": l_ego,
+                "heading_ref_ego": self._safe_float(ego_frenet.get("heading_ref", math.nan), math.nan),
+                "v_ego_s": self._safe_float(ego_frenet.get("v_s", math.nan), math.nan),
+                "v_ego_l": self._safe_float(ego_frenet.get("v_l", math.nan), math.nan),
+                "s_obj": s_obj,
+                "l_obj": l_obj,
+                "heading_ref_obj": self._safe_float(obj_frenet.get("heading_ref", math.nan), math.nan),
+                "v_obj_s": self._safe_float(obj_frenet.get("v_s", math.nan), math.nan),
+                "v_obj_l": self._safe_float(obj_frenet.get("v_l", math.nan), math.nan),
+                "old_delta_s": float(old_delta_s),
+                "old_delta_l": float(old_delta_l),
+                "old_ego_local_delta_s": float(old_delta_s),
+                "old_ego_local_delta_l": float(old_delta_l),
+                "ego_s": s_ego,
+                "ego_l": l_ego,
+                "ego_v_s": self._safe_float(ego_frenet.get("v_s", math.nan), math.nan),
+                "ego_heading_ref": self._safe_float(ego_frenet.get("heading_ref", math.nan), math.nan),
+                "object_s": s_obj,
+                "object_l": l_obj,
+                "object_v_s": self._safe_float(obj_frenet.get("v_s", math.nan), math.nan),
+            }
+
+        if not fallback_allowed and bool(getattr(self.config, "enable_frenet_coordinates", False)):
+            reason = "frenet_invalid"
+        else:
+            reason = str(ego_frenet.get("reason", "") or obj_frenet.get("reason", "") or "frenet_invalid")
+        return {
+            "delta_s": float(old_delta_s),
+            "delta_l": float(old_delta_l),
+            "coordinate_mode": "ego_local_fallback",
+            "frenet_valid": False,
+            "frenet_fallback_reason": reason,
+            "ego_ref_lane_valid": bool(ego_frenet.get("ref_lane_valid", False)),
+            "ego_frenet_valid": bool(ego_frenet.get("valid", False)),
+            "object_frenet_valid": bool(obj_frenet.get("valid", False)),
+            "s_ego": self._safe_float(ego_frenet.get("s", math.nan), math.nan),
+            "l_ego": self._safe_float(ego_frenet.get("l", math.nan), math.nan),
+            "heading_ref_ego": self._safe_float(ego_frenet.get("heading_ref", math.nan), math.nan),
+            "v_ego_s": self._safe_float(ego_frenet.get("v_s", math.nan), math.nan),
+            "v_ego_l": self._safe_float(ego_frenet.get("v_l", math.nan), math.nan),
+            "s_obj": self._safe_float(obj_frenet.get("s", math.nan), math.nan),
+            "l_obj": self._safe_float(obj_frenet.get("l", math.nan), math.nan),
+            "heading_ref_obj": self._safe_float(obj_frenet.get("heading_ref", math.nan), math.nan),
+            "v_obj_s": self._safe_float(obj_frenet.get("v_s", math.nan), math.nan),
+            "v_obj_l": self._safe_float(obj_frenet.get("v_l", math.nan), math.nan),
+            "old_delta_s": float(old_delta_s),
+            "old_delta_l": float(old_delta_l),
+            "old_ego_local_delta_s": float(old_delta_s),
+            "old_ego_local_delta_l": float(old_delta_l),
+            "ego_s": self._safe_float(ego_frenet.get("s", math.nan), math.nan),
+            "ego_l": self._safe_float(ego_frenet.get("l", math.nan), math.nan),
+            "ego_v_s": self._safe_float(ego_frenet.get("v_s", math.nan), math.nan),
+            "ego_heading_ref": self._safe_float(ego_frenet.get("heading_ref", math.nan), math.nan),
+            "object_s": self._safe_float(obj_frenet.get("s", math.nan), math.nan),
+            "object_l": self._safe_float(obj_frenet.get("l", math.nan), math.nan),
+            "object_v_s": self._safe_float(obj_frenet.get("v_s", math.nan), math.nan),
+        }
+
     def compute_2d_rss_cbf_margin(
         self,
         state: State,
@@ -699,7 +902,7 @@ class RSSCBFFilter(StaticRSSFilter):
     ) -> Dict[str, Any]:
         """Compute one RSS-informed 2D CBF margin in the configured coordinate frame."""
         ego = self._ego(state)
-        relative = self._relative_position_metrics(ego, obj)
+        relative = self._rss_2d_relative_position_metrics(state, obj)
         delta_s = float(relative["delta_s"])
         delta_l = float(relative["delta_l"])
         ego_length = self._object_length(ego, self.config.vehicle_length)
@@ -747,6 +950,9 @@ class RSSCBFFilter(StaticRSSFilter):
             "coordinate_mode": str(relative.get("coordinate_mode", "ego_local_fallback")),
             "frenet_valid": bool(relative.get("frenet_valid", False)),
             "frenet_fallback_reason": str(relative.get("frenet_fallback_reason", "")),
+            "ego_ref_lane_valid": bool(relative.get("ego_ref_lane_valid", False)),
+            "ego_frenet_valid": bool(relative.get("ego_frenet_valid", False)),
+            "object_frenet_valid": bool(relative.get("object_frenet_valid", False)),
             "s_ego": float(relative.get("s_ego", math.nan)),
             "l_ego": float(relative.get("l_ego", math.nan)),
             "heading_ref_ego": float(relative.get("heading_ref_ego", math.nan)),
@@ -759,6 +965,8 @@ class RSSCBFFilter(StaticRSSFilter):
             "v_obj_l": float(relative.get("v_obj_l", math.nan)),
             "old_delta_s": float(relative.get("old_delta_s", math.nan)),
             "old_delta_l": float(relative.get("old_delta_l", math.nan)),
+            "old_ego_local_delta_s": float(relative.get("old_ego_local_delta_s", math.nan)),
+            "old_ego_local_delta_l": float(relative.get("old_ego_local_delta_l", math.nan)),
         }
 
     def compute_signed_boundary_cbf_margin(
@@ -915,8 +1123,9 @@ class RSSCBFFilter(StaticRSSFilter):
     ) -> float:
         if object_kind != "dynamic":
             return 0.0
-        if bool(getattr(self.config, "enable_frenet_coordinates", False)) and bool(obj.get("frenet_valid", False)):
-            v_s = self._safe_float(obj.get("frenet_v_s", math.nan), math.nan)
+        if bool(getattr(self.config, "enable_frenet_coordinates", False)):
+            frenet = self._rss_project_entity_to_frenet(state, obj, role="object")
+            v_s = self._safe_float(frenet.get("v_s", math.nan), math.nan)
             if math.isfinite(v_s):
                 return v_s
         speed = max(0.0, float(obj.get("speed", 0.0)))
@@ -926,8 +1135,9 @@ class RSSCBFFilter(StaticRSSFilter):
 
     def _rss_ego_longitudinal_speed(self, state: State) -> float:
         ego = self._ego(state)
-        if bool(getattr(self.config, "enable_frenet_coordinates", False)) and bool(ego.get("frenet_valid", False)):
-            v_s = self._safe_float(ego.get("frenet_v_s", math.nan), math.nan)
+        if bool(getattr(self.config, "enable_frenet_coordinates", False)):
+            frenet = self._rss_project_entity_to_frenet(state, ego, role="ego")
+            v_s = self._safe_float(frenet.get("v_s", math.nan), math.nan)
             if math.isfinite(v_s):
                 return max(0.0, v_s)
         return self._ego_speed(state)
@@ -1127,7 +1337,7 @@ class RSSCBFFilter(StaticRSSFilter):
             object_type=safety_object.object_type,
             geometry_type=safety_object.geometry_type,
             object_kind=safety_object.object_kind,
-            payload=copy.deepcopy(safety_object.payload),
+            payload=self._copy_entity_preserving_runtime_refs(safety_object.payload),
             is_dynamic=safety_object.is_dynamic,
             center=safety_object.center,
             radius=safety_object.radius,
@@ -1663,15 +1873,27 @@ class RSSCBFFilter(StaticRSSFilter):
             "coordinate_mode": worst.get("coordinate_mode", "ego_local_fallback") if worst else "ego_local_fallback",
             "frenet_valid": bool(worst.get("frenet_valid", False)) if worst else False,
             "frenet_fallback_reason": worst.get("frenet_fallback_reason", "") if worst else "",
+            "ego_ref_lane_valid": bool(worst.get("ego_ref_lane_valid", False)) if worst else False,
+            "ego_frenet_valid": bool(worst.get("ego_frenet_valid", False)) if worst else False,
+            "object_frenet_valid": bool(worst.get("object_frenet_valid", False)) if worst else False,
             "s_ego": float(worst.get("s_ego", math.nan)) if worst else math.nan,
             "l_ego": float(worst.get("l_ego", math.nan)) if worst else math.nan,
             "heading_ref_ego": float(worst.get("heading_ref_ego", math.nan)) if worst else math.nan,
             "v_ego_s": float(worst.get("v_ego_s", math.nan)) if worst else math.nan,
+            "ego_s": float(worst.get("ego_s", worst.get("s_ego", math.nan))) if worst else math.nan,
+            "ego_l": float(worst.get("ego_l", worst.get("l_ego", math.nan))) if worst else math.nan,
+            "ego_v_s": float(worst.get("ego_v_s", worst.get("v_ego_s", math.nan))) if worst else math.nan,
+            "ego_heading_ref": float(worst.get("ego_heading_ref", worst.get("heading_ref_ego", math.nan))) if worst else math.nan,
             "worst_s_obj": float(worst.get("s_obj", math.nan)) if worst else math.nan,
             "worst_l_obj": float(worst.get("l_obj", math.nan)) if worst else math.nan,
             "worst_v_obj_s": float(worst.get("v_obj_s", math.nan)) if worst else math.nan,
+            "object_s": float(worst.get("object_s", worst.get("s_obj", math.nan))) if worst else math.nan,
+            "object_l": float(worst.get("object_l", worst.get("l_obj", math.nan))) if worst else math.nan,
+            "object_v_s": float(worst.get("object_v_s", worst.get("v_obj_s", math.nan))) if worst else math.nan,
             "old_delta_s": float(worst.get("old_delta_s", math.nan)) if worst else math.nan,
             "old_delta_l": float(worst.get("old_delta_l", math.nan)) if worst else math.nan,
+            "old_ego_local_delta_s": float(worst.get("old_ego_local_delta_s", math.nan)) if worst else math.nan,
+            "old_ego_local_delta_l": float(worst.get("old_ego_local_delta_l", math.nan)) if worst else math.nan,
             "worst_h_2d": float(worst.get("h_2d", math.nan)) if worst else math.nan,
             "worst_long_clearance": long_clearance,
             "worst_lat_clearance": float(worst.get("lat_clearance", math.nan)) if worst else math.nan,
@@ -2061,7 +2283,7 @@ class RSSCBFFilter(StaticRSSFilter):
         )
 
     def _advance_object_for_rss_cbf(self, state: State, obj: Dict[str, Any], object_kind: str) -> Dict[str, Any]:
-        next_obj = copy.deepcopy(obj)
+        next_obj = self._copy_entity_without_runtime_refs(obj)
         if object_kind == "dynamic":
             heading = float(next_obj.get("heading", self._ego(state).get("heading", 0.0)))
             speed = max(0.0, float(next_obj.get("speed", 0.0)))
@@ -2084,7 +2306,7 @@ class RSSCBFFilter(StaticRSSFilter):
     ) -> Dict[str, Any]:
         initial = self.compute_lateral_rss_metrics(state, obj)
         rollout_state = state
-        rollout_obj = copy.deepcopy(obj)
+        rollout_obj = self._copy_entity_without_runtime_refs(obj)
         final = initial
         min_lateral_rss_margin = float(initial["lateral_rss_margin"])
         min_path_overlap_amount = float(initial["path_overlap_amount"])
@@ -2136,7 +2358,7 @@ class RSSCBFFilter(StaticRSSFilter):
 
         selected = projection_debug.get("selected", {}) if isinstance(projection_debug, dict) else {}
         candidates = projection_debug.get("candidates", []) if isinstance(projection_debug, dict) else []
-        relative = self._relative_position_metrics(self._ego(state), obj) if obj is not None else {}
+        relative = self._rss_2d_relative_position_metrics(state, obj) if obj is not None else {}
         info = {
             "mode": mode,
             "reason": reason,
@@ -2157,15 +2379,27 @@ class RSSCBFFilter(StaticRSSFilter):
             "coordinate_mode": relative.get("coordinate_mode", "ego_local_fallback") if relative else "ego_local_fallback",
             "frenet_valid": bool(relative.get("frenet_valid", False)) if relative else False,
             "frenet_fallback_reason": relative.get("frenet_fallback_reason", "") if relative else "",
+            "ego_ref_lane_valid": bool(relative.get("ego_ref_lane_valid", False)) if relative else False,
+            "ego_frenet_valid": bool(relative.get("ego_frenet_valid", False)) if relative else False,
+            "object_frenet_valid": bool(relative.get("object_frenet_valid", False)) if relative else False,
             "s_ego": float(relative.get("s_ego", math.nan)) if relative else math.nan,
             "l_ego": float(relative.get("l_ego", math.nan)) if relative else math.nan,
             "heading_ref_ego": float(relative.get("heading_ref_ego", math.nan)) if relative else math.nan,
             "v_ego_s": float(relative.get("v_ego_s", math.nan)) if relative else math.nan,
+            "ego_s": float(relative.get("ego_s", relative.get("s_ego", math.nan))) if relative else math.nan,
+            "ego_l": float(relative.get("ego_l", relative.get("l_ego", math.nan))) if relative else math.nan,
+            "ego_v_s": float(relative.get("ego_v_s", relative.get("v_ego_s", math.nan))) if relative else math.nan,
+            "ego_heading_ref": float(relative.get("ego_heading_ref", relative.get("heading_ref_ego", math.nan))) if relative else math.nan,
             "worst_s_obj": float(relative.get("s_obj", math.nan)) if relative else math.nan,
             "worst_l_obj": float(relative.get("l_obj", math.nan)) if relative else math.nan,
             "worst_v_obj_s": float(relative.get("v_obj_s", math.nan)) if relative else math.nan,
+            "object_s": float(relative.get("object_s", relative.get("s_obj", math.nan))) if relative else math.nan,
+            "object_l": float(relative.get("object_l", relative.get("l_obj", math.nan))) if relative else math.nan,
+            "object_v_s": float(relative.get("object_v_s", relative.get("v_obj_s", math.nan))) if relative else math.nan,
             "old_delta_s": float(relative.get("old_delta_s", math.nan)) if relative else math.nan,
             "old_delta_l": float(relative.get("old_delta_l", math.nan)) if relative else math.nan,
+            "old_ego_local_delta_s": float(relative.get("old_ego_local_delta_s", math.nan)) if relative else math.nan,
+            "old_ego_local_delta_l": float(relative.get("old_ego_local_delta_l", math.nan)) if relative else math.nan,
             "worst_long_clearance": math.nan,
             "worst_lat_clearance": math.nan,
             "worst_d_s_safe": math.nan,

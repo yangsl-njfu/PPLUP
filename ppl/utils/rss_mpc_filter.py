@@ -2952,7 +2952,7 @@ class RSSMPCFilter(RSSCBFFilter):
     ) -> Dict[str, Any]:
         corridor = corridor or {}
         rollout_state = self._copy_state_preserving_frenet_reference(state)
-        rollout_obj = copy.deepcopy(obj)
+        rollout_obj = self._copy_entity_without_runtime_refs(obj)
         margins: List[float] = []
         lateral_clearance_margins: List[float] = []
         lateral_rss_margins: List[float] = []
@@ -4535,7 +4535,7 @@ class RSSMPCFilter(RSSCBFFilter):
         action: Sequence[float],
     ) -> Tuple[State, Dict[str, Any]]:
         next_state = self._simulate_next_state(state, action)
-        next_obj = copy.deepcopy(obj)
+        next_obj = self._copy_entity_without_runtime_refs(obj)
 
         if object_kind == "dynamic":
             heading = float(next_obj.get("heading", self._ego(next_state).get("heading", 0.0)))
@@ -4653,17 +4653,29 @@ class RSSMPCFilter(RSSCBFFilter):
             "coordinate_mode": cbf_log_info.get("coordinate_mode", ""),
             "frenet_valid": bool(cbf_log_info.get("frenet_valid", False)),
             "frenet_fallback_reason": cbf_log_info.get("frenet_fallback_reason", ""),
+            "ego_ref_lane_valid": bool(cbf_log_info.get("ego_ref_lane_valid", False)),
+            "ego_frenet_valid": bool(cbf_log_info.get("ego_frenet_valid", False)),
+            "object_frenet_valid": bool(cbf_log_info.get("object_frenet_valid", False)),
             "s_ego": cbf_log_info.get("s_ego", math.nan),
             "l_ego": cbf_log_info.get("l_ego", math.nan),
             "heading_ref_ego": cbf_log_info.get("heading_ref_ego", math.nan),
             "v_ego_s": cbf_log_info.get("v_ego_s", math.nan),
+            "ego_s": cbf_log_info.get("ego_s", cbf_log_info.get("s_ego", math.nan)),
+            "ego_l": cbf_log_info.get("ego_l", cbf_log_info.get("l_ego", math.nan)),
+            "ego_v_s": cbf_log_info.get("ego_v_s", cbf_log_info.get("v_ego_s", math.nan)),
+            "ego_heading_ref": cbf_log_info.get("ego_heading_ref", cbf_log_info.get("heading_ref_ego", math.nan)),
             "worst_s_obj": cbf_log_info.get("worst_s_obj", math.nan),
             "worst_l_obj": cbf_log_info.get("worst_l_obj", math.nan),
             "worst_delta_s": cbf_log_info.get("worst_delta_s", math.nan),
             "worst_delta_l": cbf_log_info.get("worst_delta_l", math.nan),
             "worst_v_obj_s": cbf_log_info.get("worst_v_obj_s", math.nan),
+            "object_s": cbf_log_info.get("object_s", cbf_log_info.get("worst_s_obj", math.nan)),
+            "object_l": cbf_log_info.get("object_l", cbf_log_info.get("worst_l_obj", math.nan)),
+            "object_v_s": cbf_log_info.get("object_v_s", cbf_log_info.get("worst_v_obj_s", math.nan)),
             "old_delta_s": cbf_log_info.get("old_delta_s", math.nan),
             "old_delta_l": cbf_log_info.get("old_delta_l", math.nan),
+            "old_ego_local_delta_s": cbf_log_info.get("old_ego_local_delta_s", math.nan),
+            "old_ego_local_delta_l": cbf_log_info.get("old_ego_local_delta_l", math.nan),
             "h_2d": cbf_log_info.get("h_2d", cbf_log_info.get("worst_h_2d", math.nan)),
             "worst_object_type": cbf_log_info.get("worst_object_type", ""),
             "cbf_reference_mode": (cbf_reference_info or {}).get("mode", ""),

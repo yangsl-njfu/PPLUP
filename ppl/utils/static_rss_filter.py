@@ -770,6 +770,7 @@ class StaticRSSFilter:
             self._last_frenet_reference_lane = reference_lane
 
         ego = self._metadrive_vehicle_to_dict(vehicle, default_speed=0.0)
+        ego["_metadrive_source"] = vehicle
         self._attach_frenet_to_entity(ego, vehicle, reference_lane, role="ego")
         ego["lane_width"] = self._metadrive_current_lane_width(vehicle)
         ego["lane_id"] = self._metadrive_lane_id(vehicle)
@@ -788,6 +789,7 @@ class StaticRSSFilter:
             if obj is vehicle:
                 continue
             parsed = self._metadrive_object_to_dict(obj, default_speed=0.0)
+            parsed["_metadrive_source"] = obj
             self._attach_frenet_to_entity(parsed, obj, reference_lane, role="object")
             if self._distance_xy(ego, parsed) > self.config.metadrive_object_scan_radius:
                 continue
@@ -1437,12 +1439,37 @@ class StaticRSSFilter:
 
     def _copy_state_preserving_frenet_reference(self, state: State) -> State:
         reference_lane = state.get("_frenet_reference_lane", None)
+        copy_state = self._strip_runtime_object_refs(state)
         if reference_lane is None:
-            return copy.deepcopy(state)
-        copy_state = dict(state)
+            return copy.deepcopy(copy_state)
         copy_state["_frenet_reference_lane"] = None
         copied = copy.deepcopy(copy_state)
         copied["_frenet_reference_lane"] = reference_lane
+        return copied
+
+    def _strip_runtime_object_refs(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: self._strip_runtime_object_refs(item)
+                for key, item in value.items()
+                if key != "_metadrive_source"
+            }
+        if isinstance(value, list):
+            return [self._strip_runtime_object_refs(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._strip_runtime_object_refs(item) for item in value)
+        return value
+
+    def _copy_entity_without_runtime_refs(self, entity: Any) -> Any:
+        return copy.deepcopy(self._strip_runtime_object_refs(entity))
+
+    def _copy_entity_preserving_runtime_refs(self, entity: Any) -> Any:
+        if not isinstance(entity, dict):
+            return copy.deepcopy(entity)
+        source = entity.get("_metadrive_source", None)
+        copied = self._copy_entity_without_runtime_refs(entity)
+        if source is not None and isinstance(copied, dict):
+            copied["_metadrive_source"] = source
         return copied
 
     def _obstacle_clearance_margin(self, state: State, obstacle: Dict[str, Any]) -> float:
@@ -2051,6 +2078,9 @@ class StaticRSSFilter:
                     return current_lanes[0]
                 except Exception:
                     pass
+            current_lane = self._resolve_attr(navigation, "current_lane", None)
+            if current_lane is not None:
+                return current_lane
         return self._resolve_attr(vehicle, "lane", None)
 
     def _metadrive_lane_boundary_info(self, vehicle: Any) -> Dict[str, Any]:
