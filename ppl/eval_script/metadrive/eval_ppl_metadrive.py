@@ -114,6 +114,39 @@ def summarize_recovery_episode(step_infos):
     return summary
 
 
+def compact_episode_result_for_terminal(result):
+    """Print only the original base evaluation result fields."""
+    preferred_keys = [
+        "episode",
+        "ckpt_index",
+        "env_id",
+        "num_ep_in_one_env",
+        "success",
+        "crash",
+        "crash_vehicle",
+        "out_of_road",
+        "route_completion",
+        "velocity_step_mean",
+        "episode_reward",
+        "episode_cost",
+        "episode_length",
+    ]
+    return {key: result.get(key) for key in preferred_keys if key in result}
+
+
+def append_recovery_episode_log(path, recovery_summary, episode_meta):
+    if not path or not recovery_summary:
+        return
+    row = {}
+    row.update(episode_meta)
+    row.update(recovery_summary)
+    folder = osp.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    file_exists = osp.exists(path)
+    pd.DataFrame([row]).to_csv(path, mode="a", header=not file_exists, index=False)
+
+
 def evaluate_ppl_once(
     ckpt_path,
     ckpt_index,
@@ -125,6 +158,7 @@ def evaluate_ppl_once(
     enable_predictive_recovery=False,
     recovery_config=None,
     progress_interval=0,
+    recovery_episode_log_csv="",
 ):
     """
     Evaluate one PPL checkpoint on `total_env_num` environments,
@@ -171,6 +205,8 @@ def evaluate_ppl_once(
     if enable_predictive_recovery:
         predictive_filter = PredictiveRecoveryFilter(recovery_config or PredictiveRecoveryConfig())
         print("[PredictiveRecovery] Enabled.")
+        if not recovery_episode_log_csv:
+            recovery_episode_log_csv = osp.join(folder_name, "{}_recovery_episode.csv".format(ckpt_name))
 
     saved_results = []
     ep_velocities = []
@@ -197,7 +233,6 @@ def evaluate_ppl_once(
 
             o, r, d, info = env.step(safe_action)
             if safety_info:
-                info.update(safety_info)
                 recovery_step_infos.append(safety_info)
             step_count += 1
 
@@ -208,22 +243,7 @@ def evaluate_ppl_once(
                 env.render()
 
             if progress_interval and step_count % progress_interval == 0:
-                if safety_info:
-                    print(
-                        "[EvalProgress] env {} ep_in_env {} step {} recovery={} certified={} "
-                        "filter_ms={:.1f} hard_safe={}/{}".format(
-                            env_index,
-                            num_ep_in + 1,
-                            step_count,
-                            safety_info.get("recovery_mode", ""),
-                            safety_info.get("recovery_certified", False),
-                            float(safety_info.get("filter_time_ms", 0.0)),
-                            int(safety_info.get("num_hard_safe_candidates", 0)),
-                            int(safety_info.get("num_candidates", 0)),
-                        )
-                    )
-                else:
-                    print("[EvalProgress] env {} ep_in_env {} step {}".format(env_index, num_ep_in + 1, step_count))
+                print("[EvalProgress] env {} ep_in_env {} step {}".format(env_index, num_ep_in + 1, step_count))
 
             if d or step_count >= 3000:
                 ep_times.append(time.time() - last_time)
@@ -245,7 +265,7 @@ def evaluate_ppl_once(
                     route_completion=info.get("route_completion", 0),
                     velocity_step_mean=np.mean(ep_velocities) if ep_velocities else 0,
                 ))
-                res.update(summarize_recovery_episode(recovery_step_infos))
+                recovery_summary = summarize_recovery_episode(recovery_step_infos)
                 ep_velocities = []
                 recovery_step_infos = []
 
@@ -264,7 +284,17 @@ def evaluate_ppl_once(
                         ep_times[-1], time.time() - start, ckpt_name
                     )
                 )
-                print(pretty_print(res))
+                append_recovery_episode_log(
+                    recovery_episode_log_csv,
+                    recovery_summary,
+                    {
+                        "episode": ep_count,
+                        "ckpt_index": ckpt_index,
+                        "env_id": env_id_recorded,
+                        "num_ep_in_one_env": num_ep_in_recorded,
+                    },
+                )
+                print(pretty_print(compact_episode_result_for_terminal(res)))
 
                 # Backup CSV
                 tmp_path = osp.join(folder_name, "{}_tmp.csv".format(ckpt_name))
@@ -438,6 +468,15 @@ if __name__ == "__main__":
         default="",
         help="Optional per-step recovery diagnostic CSV path.",
     )
+    parser.add_argument(
+        "--recovery_episode_log_csv",
+        type=str,
+        default="",
+        help=(
+            "Optional episode-level recovery diagnostic CSV path. "
+            "Defaults to <ret_save_folder>/<checkpoint>_recovery_episode.csv when recovery is enabled."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -470,6 +509,7 @@ if __name__ == "__main__":
             enable_predictive_recovery=args.enable_predictive_recovery,
             recovery_config=recovery_config,
             progress_interval=args.progress_interval,
+            recovery_episode_log_csv=args.recovery_episode_log_csv,
         )
 
     elif args.ckpt_index >= 0:
@@ -488,6 +528,7 @@ if __name__ == "__main__":
             enable_predictive_recovery=args.enable_predictive_recovery,
             recovery_config=recovery_config,
             progress_interval=args.progress_interval,
+            recovery_episode_log_csv=args.recovery_episode_log_csv,
         )
 
     elif args.start_ckpt >= 0:
@@ -510,6 +551,7 @@ if __name__ == "__main__":
                 enable_predictive_recovery=args.enable_predictive_recovery,
                 recovery_config=recovery_config,
                 progress_interval=args.progress_interval,
+                recovery_episode_log_csv=args.recovery_episode_log_csv,
             )
             if ret is not None:
                 all_results.append(ret)
