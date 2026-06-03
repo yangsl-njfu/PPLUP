@@ -29,6 +29,11 @@ import pandas as pd
 from ppl.experiments.metadrive.driving_env import DrivingEnv
 from ppl.ppl import PPL
 from ppl.sb3.td3.policies import TD3Policy
+from ppl.utils.predictive_recovery_filter import (
+    RECOVERY_DIAGNOSTIC_FIELDS,
+    PredictiveRecoveryConfig,
+    PredictiveRecoveryFilter,
+)
 from ppl.utils.print_dict_utils import pretty_print, RecorderEnv
 
 EVAL_ENV_START = 1000  # Evaluation seeds start from 1000
@@ -85,6 +90,30 @@ def reset_eval_env(env, seed):
             raise force_seed_error
 
 
+def summarize_recovery_episode(step_infos):
+    """Keep exact last-step diagnostics and add episode means for numeric fields."""
+    if not step_infos:
+        return {}
+    summary = {}
+    last_info = step_infos[-1]
+    for field in RECOVERY_DIAGNOSTIC_FIELDS:
+        summary[field] = last_info.get(field)
+        numeric_values = []
+        for item in step_infos:
+            value = item.get(field)
+            if isinstance(value, (bool, np.bool_)):
+                numeric_values.append(float(value))
+            elif isinstance(value, (int, float, np.number)) and np.isfinite(value):
+                numeric_values.append(float(value))
+        if numeric_values:
+            summary["recovery_mean_{}".format(field)] = float(np.mean(numeric_values))
+    summary["recovery_num_steps"] = len(step_infos)
+    summary["recovery_certified_rate"] = float(np.mean([bool(item.get("recovery_certified", False)) for item in step_infos]))
+    summary["recovery_min_hard_safe_candidates"] = int(min(item.get("num_hard_safe_candidates", 0) for item in step_infos))
+    summary["recovery_max_filter_time_ms"] = float(max(item.get("filter_time_ms", 0.0) for item in step_infos))
+    return summary
+
+
 def evaluate_ppl_once(
     ckpt_path,
     ckpt_index,
@@ -93,6 +122,9 @@ def evaluate_ppl_once(
     num_ep_in_one_env=5,
     total_env_num=50,
     deterministic=True,
+    enable_predictive_recovery=False,
+    recovery_config=None,
+    progress_interval=0,
 ):
     """
     Evaluate one PPL checkpoint on `total_env_num` environments,
@@ -135,8 +167,14 @@ def evaluate_ppl_once(
         env.close()
         return None
 
+    predictive_filter = None
+    if enable_predictive_recovery:
+        predictive_filter = PredictiveRecoveryFilter(recovery_config or PredictiveRecoveryConfig())
+        print("[PredictiveRecovery] Enabled.")
+
     saved_results = []
     ep_velocities = []
+    recovery_step_infos = []
 
     try:
         start = time.time()
@@ -151,7 +189,16 @@ def evaluate_ppl_once(
 
         while True:
             action = policy_function(o, deterministic=deterministic)[0]
-            o, r, d, info = env.step(action)
+            raw_action = action
+            if predictive_filter is not None:
+                safe_action, safety_info = predictive_filter.filter(env, o, raw_action)
+            else:
+                safe_action, safety_info = raw_action, {}
+
+            o, r, d, info = env.step(safe_action)
+            if safety_info:
+                info.update(safety_info)
+                recovery_step_infos.append(safety_info)
             step_count += 1
 
             if info:
@@ -159,6 +206,24 @@ def evaluate_ppl_once(
 
             if use_render:
                 env.render()
+
+            if progress_interval and step_count % progress_interval == 0:
+                if safety_info:
+                    print(
+                        "[EvalProgress] env {} ep_in_env {} step {} recovery={} certified={} "
+                        "filter_ms={:.1f} hard_safe={}/{}".format(
+                            env_index,
+                            num_ep_in + 1,
+                            step_count,
+                            safety_info.get("recovery_mode", ""),
+                            safety_info.get("recovery_certified", False),
+                            float(safety_info.get("filter_time_ms", 0.0)),
+                            int(safety_info.get("num_hard_safe_candidates", 0)),
+                            int(safety_info.get("num_candidates", 0)),
+                        )
+                    )
+                else:
+                    print("[EvalProgress] env {} ep_in_env {} step {}".format(env_index, num_ep_in + 1, step_count))
 
             if d or step_count >= 3000:
                 ep_times.append(time.time() - last_time)
@@ -180,7 +245,9 @@ def evaluate_ppl_once(
                     route_completion=info.get("route_completion", 0),
                     velocity_step_mean=np.mean(ep_velocities) if ep_velocities else 0,
                 ))
+                res.update(summarize_recovery_episode(recovery_step_infos))
                 ep_velocities = []
+                recovery_step_infos = []
 
                 res["episode"] = ep_count
                 res["ckpt_index"] = ckpt_index
@@ -300,10 +367,93 @@ if __name__ == "__main__":
         action="store_true",
         help="Use stochastic policy during evaluation (default: deterministic).",
     )
+    parser.add_argument(
+        "--progress_interval",
+        type=int,
+        default=0,
+        help="Print an evaluation progress line every N environment steps. 0 disables step progress logs.",
+    )
+    parser.add_argument(
+        "--enable_predictive_recovery",
+        action="store_true",
+        help="Enable RSS-risk-guided predictive runtime recovery.",
+    )
+    parser.add_argument(
+        "--recovery_horizon",
+        type=float,
+        default=PredictiveRecoveryConfig.horizon,
+        help="Predictive recovery horizon in seconds.",
+    )
+    parser.add_argument(
+        "--recovery_dt",
+        type=float,
+        default=PredictiveRecoveryConfig.dt,
+        help="Predictive recovery rollout time step in seconds.",
+    )
+    parser.add_argument(
+        "--recovery_num_lateral_targets",
+        type=int,
+        default=PredictiveRecoveryConfig.num_lateral_targets,
+        help="Number of lateral target offsets used to generate candidates.",
+    )
+    parser.add_argument(
+        "--recovery_num_speed_targets",
+        type=int,
+        default=PredictiveRecoveryConfig.num_speed_targets,
+        help="Number of speed targets used to generate candidates.",
+    )
+    parser.add_argument(
+        "--recovery_max_objects",
+        type=int,
+        default=PredictiveRecoveryConfig.max_objects,
+        help="Maximum number of nearby scene objects considered per step.",
+    )
+    parser.add_argument(
+        "--recovery_max_candidates",
+        type=int,
+        default=PredictiveRecoveryConfig.max_candidates,
+        help="Maximum number of trajectory candidates evaluated per step.",
+    )
+    parser.add_argument(
+        "--recovery_max_rollout_steps",
+        type=int,
+        default=PredictiveRecoveryConfig.max_rollout_steps,
+        help="Maximum sampled rollout points per candidate.",
+    )
+    parser.add_argument(
+        "--recovery_object_scan_limit",
+        type=int,
+        default=PredictiveRecoveryConfig.object_scan_limit,
+        help="Maximum raw environment objects scanned before nearest-object filtering.",
+    )
+    parser.add_argument(
+        "--recovery_debug",
+        action="store_true",
+        help="Enable verbose recovery fallback diagnostics.",
+    )
+    parser.add_argument(
+        "--recovery_log_csv",
+        nargs="?",
+        const="evaluate_results/ppl/recovery_step_log.csv",
+        default="",
+        help="Optional per-step recovery diagnostic CSV path.",
+    )
 
     args = parser.parse_args()
 
     deterministic = not args.stochastic
+    recovery_config = PredictiveRecoveryConfig(
+        horizon=args.recovery_horizon,
+        dt=args.recovery_dt,
+        num_lateral_targets=args.recovery_num_lateral_targets,
+        num_speed_targets=args.recovery_num_speed_targets,
+        max_objects=args.recovery_max_objects,
+        max_candidates=args.recovery_max_candidates,
+        max_rollout_steps=args.recovery_max_rollout_steps,
+        object_scan_limit=args.recovery_object_scan_limit,
+        debug=args.recovery_debug,
+        log_csv_path=args.recovery_log_csv or "",
+    )
 
     # --- Decide evaluation mode ---
     if args.path.endswith(".zip"):
@@ -317,6 +467,9 @@ if __name__ == "__main__":
             num_ep_in_one_env=args.num_ep_in_one_env,
             total_env_num=args.total_env_num,
             deterministic=deterministic,
+            enable_predictive_recovery=args.enable_predictive_recovery,
+            recovery_config=recovery_config,
+            progress_interval=args.progress_interval,
         )
 
     elif args.ckpt_index >= 0:
@@ -332,6 +485,9 @@ if __name__ == "__main__":
             num_ep_in_one_env=args.num_ep_in_one_env,
             total_env_num=args.total_env_num,
             deterministic=deterministic,
+            enable_predictive_recovery=args.enable_predictive_recovery,
+            recovery_config=recovery_config,
+            progress_interval=args.progress_interval,
         )
 
     elif args.start_ckpt >= 0:
@@ -351,6 +507,9 @@ if __name__ == "__main__":
                 num_ep_in_one_env=args.num_ep_in_one_env,
                 total_env_num=args.total_env_num,
                 deterministic=deterministic,
+                enable_predictive_recovery=args.enable_predictive_recovery,
+                recovery_config=recovery_config,
+                progress_interval=args.progress_interval,
             )
             if ret is not None:
                 all_results.append(ret)
