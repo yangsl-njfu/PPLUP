@@ -53,7 +53,6 @@ class PolicyFunction:
             policy=TD3Policy,
             env=env,
             policy_kwargs=dict(net_arch=[256, 256]),
-            # Minimal required hyper-params (not used during inference):
             replay_buffer_kwargs=dict(),
             learning_starts=1,
             buffer_size=100,
@@ -91,7 +90,7 @@ def reset_eval_env(env, seed):
 
 
 def summarize_recovery_episode(step_infos):
-    """Keep exact last-step diagnostics and add episode means for numeric fields."""
+    """Summarize recovery diagnostics for one episode."""
     if not step_infos:
         return {}
     summary = {}
@@ -112,7 +111,7 @@ def summarize_recovery_episode(step_infos):
     summary["recovery_min_hard_safe_candidates"] = int(min(item.get("num_hard_safe_candidates", 0) for item in step_infos))
     summary["recovery_max_filter_time_ms"] = float(max(item.get("filter_time_ms", 0.0) for item in step_infos))
 
-    # 统计接管相关
+    # 统计接管
     filter_intervened_count = sum(1 for item in step_infos if item.get("filter_intervened", False))
     summary["intervention_count"] = filter_intervened_count
     summary["intervention_rate"] = filter_intervened_count / max(1, len(step_infos))
@@ -121,7 +120,7 @@ def summarize_recovery_episode(step_infos):
     intervention_reasons = [item.get("intervention_reason", "none") for item in step_infos if item.get("filter_intervened", False)]
     summary["intervention_reasons"] = ";".join(intervention_reasons) if intervention_reasons else ""
 
-    # 平均分数差值
+    # 平均 action 差值
     delta_steer_values = [item.get("safe_raw_steer_delta", 0.0) for item in step_infos if isinstance(item.get("safe_raw_steer_delta"), (int, float))]
     delta_acc_values = [item.get("safe_raw_acc_delta", 0.0) for item in step_infos if isinstance(item.get("safe_raw_acc_delta"), (int, float))]
     summary["mean_safe_raw_steer_delta"] = float(np.mean(delta_steer_values)) if delta_steer_values else 0.0
@@ -135,17 +134,13 @@ def summarize_recovery_episode(step_infos):
     summary["min_static_margin"] = float(np.min(static_margin_values)) if static_margin_values else float("inf")
     summary["min_boundary_margin"] = float(np.min(boundary_margin_values)) if boundary_margin_values else float("inf")
 
-    # 拒绝原因统计
-    all_reject_reasons = []
-    for item in step_infos:
-        reasons_str = item.get("early_reject_reasons", "")
-        if reasons_str:
-            all_reject_reasons.append(reasons_str)
-    summary["all_early_reject_reasons"] = ";".join(all_reject_reasons) if all_reject_reasons else ""
-
-    # Raw action 对照
-    raw_safe_count = sum(1 for item in step_infos if item.get("raw_hard_safe", True))
+    # Raw action 对照统计
+    raw_safe_count = sum(1 for item in step_infos if item.get("raw_predicted_collision", False) == False and item.get("raw_predicted_out_of_road", False) == False)
     summary["raw_safe_rate"] = raw_safe_count / max(1, len(step_infos))
+
+    # 拒绝原因统计
+    all_reject_reasons = [item.get("early_reject_reasons", "") for item in step_infos if item.get("early_reject_reasons", "")]
+    summary["all_early_reject_reasons"] = ";".join(all_reject_reasons) if all_reject_reasons else ""
 
     return summary
 
@@ -197,25 +192,25 @@ def evaluate_ppl_once(
     recovery_episode_log_csv="",
 ):
     """
-    Evaluate one PPL checkpoint on `total_env_num` environments,
-    each run for `num_ep_in_one_env` episodes.
+    Evaluate one PPL checkpoint on `total_env_num` environments.
 
     Args:
-        ckpt_path:        Directory that contains "rl_model_<ckpt_index>_steps.zip",
-                          OR a full path to a .zip file.
-        ckpt_index:       Checkpoint step index (used to locate the zip file and
-                          as a label in the result CSV). Ignored if ckpt_path already
-                          ends with ".zip".
-        folder_name:      Directory to save result CSV files.
-        use_render:       Whether to render the environment.
-        num_ep_in_one_env: Number of episodes per environment seed.
-        total_env_num:    Number of different environment seeds to evaluate.
-        deterministic:    Whether the policy acts deterministically.
+        ckpt_path: Directory containing checkpoint or full path to .zip
+        ckpt_index: Checkpoint step index
+        folder_name: Directory to save result CSV files
+        use_render: Whether to render the environment
+        num_ep_in_one_env: Episodes per environment seed
+        total_env_num: Number of different environment seeds
+        deterministic: Whether the policy acts deterministically
+        enable_predictive_recovery: Enable runtime assurance filter
+        recovery_config: Configuration for the filter
+        progress_interval: Print progress every N steps
+        recovery_episode_log_csv: Path to save recovery diagnostics
 
     Returns:
-        pd.DataFrame with per-episode results, or None on failure.
+        pd.DataFrame with per-episode results
     """
-    # Resolve the zip path
+    # Resolve zip path
     if ckpt_path.endswith(".zip"):
         zip_path = ckpt_path
         ckpt_name = os.path.splitext(os.path.basename(ckpt_path))[0]
@@ -240,7 +235,7 @@ def evaluate_ppl_once(
     predictive_filter = None
     if enable_predictive_recovery:
         predictive_filter = PredictiveRecoveryFilter(recovery_config or PredictiveRecoveryConfig())
-        print("[PredictiveRecovery] Enabled.")
+        print("[Runtime Assurance] Enabled.")
         if not recovery_episode_log_csv:
             recovery_episode_log_csv = osp.join(folder_name, "{}_recovery_episode.csv".format(ckpt_name))
 
@@ -259,16 +254,38 @@ def evaluate_ppl_once(
         num_ep_in = 0
         o = reset_eval_env(env, EVAL_ENV_START + env_index)
 
+        # 重置过滤器 episode 状态
+        if predictive_filter is not None:
+            predictive_filter.reset_episode()
+
         while True:
             action = policy_function(o, deterministic=deterministic)[0]
             raw_action = action
+
+            # 运行时保障过滤器
             if predictive_filter is not None:
                 safe_action, safety_info = predictive_filter.filter(env, o, raw_action)
             else:
                 safe_action, safety_info = raw_action, {}
 
-            o, r, d, info = env.step(safe_action)
+            # 影子模式：实际执行 raw_action
+            if enable_predictive_recovery and recovery_config is not None and recovery_config._debug_shadow_record:
+                action_to_env = raw_action
+            else:
+                action_to_env = safe_action
+
+            # 记录 step cost
+            o, r, d, info = env.step(action_to_env)
             if safety_info:
+                # 记录 cost 信息
+                step_cost = info.get("cost", 0.0) if info else 0.0
+                safety_info["step_cost"] = step_cost
+                # episode_cost_so_far 由 RecorderEnv 维护
+                episode_cost_so_far = env.user_data.get("cost", [0.0])
+                if isinstance(episode_cost_so_far, list):
+                    safety_info["episode_cost_so_far"] = sum(episode_cost_so_far)
+                else:
+                    safety_info["episode_cost_so_far"] = episode_cost_so_far
                 recovery_step_infos.append(safety_info)
             step_count += 1
 
@@ -291,7 +308,6 @@ def evaluate_ppl_once(
                 env_id_recorded = EVAL_ENV_START + env_index
                 num_ep_in_recorded = num_ep_in
 
-                # Collect comprehensive results from both RecorderEnv and raw info
                 res = env.get_episode_result()
                 res.update(dict(
                     success=info.get("arrive_dest", 0),
@@ -332,13 +348,12 @@ def evaluate_ppl_once(
                 )
                 print(pretty_print(compact_episode_result_for_terminal(res)))
 
-                # Backup CSV
                 tmp_path = osp.join(folder_name, "{}_tmp.csv".format(ckpt_name))
                 df.to_csv(tmp_path)
 
                 step_count = 0
 
-                # Advance to next env seed if enough episodes in this one
+                # Advance to next env seed
                 if num_ep_in >= num_ep_in_one_env:
                     env_index += 1
                     num_ep_in = 0
@@ -346,6 +361,9 @@ def evaluate_ppl_once(
                         break
 
                 o = reset_eval_env(env, EVAL_ENV_START + env_index)
+                # 重置过滤器 episode 状态
+                if predictive_filter is not None:
+                    predictive_filter.reset_episode()
 
     except Exception as e:
         raise e
@@ -353,7 +371,6 @@ def evaluate_ppl_once(
         env.close()
 
     df = pd.DataFrame(saved_results)
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
     # Compute key rates
     success_rate = df["success"].mean() * 100 if "success" in df.columns else 0
@@ -395,26 +412,19 @@ if __name__ == "__main__":
         "--path",
         type=str,
         default="",
-        help=(
-            "Directory containing rl_model_<step>_steps.zip files "
-            "(e.g. runs/PPL/PPL_xxxx/models), OR a single .zip file path."
-        ),
+        help="Directory containing checkpoint or full path to .zip",
     )
     parser.add_argument(
         "--ckpt_index",
         type=int,
         default=-1,
-        help=(
-            "Single checkpoint step to evaluate. "
-            "If set, only this checkpoint is evaluated. "
-            "Ignored if --path already points to a .zip file."
-        ),
+        help="Single checkpoint step to evaluate",
     )
 
     # --- Batch evaluation ---
     parser.add_argument("--start_ckpt", type=int, default=-1, help="First checkpoint step for batch evaluation.")
     parser.add_argument("--num_ckpt", type=int, default=10, help="Number of checkpoints to evaluate.")
-    parser.add_argument("--skip", type=int, default=150, help="Step interval between checkpoints (= save_freq).")
+    parser.add_argument("--skip", type=int, default=150, help="Step interval between checkpoints.")
 
     # --- Output ---
     parser.add_argument(
@@ -437,31 +447,33 @@ if __name__ == "__main__":
         "--progress_interval",
         type=int,
         default=0,
-        help="Print an evaluation progress line every N environment steps. 0 disables step progress logs.",
+        help="Print progress every N steps. 0 disables.",
     )
+
+    # --- Runtime Assurance ---
     parser.add_argument(
         "--enable_predictive_recovery",
         action="store_true",
         help="Enable runtime assurance filter for predictive collision/departure prevention.",
     )
-    # 运行时保障可选参数
+    # Runtime Assurance 可选参数
     parser.add_argument(
         "--recovery_intervention_score_margin",
         type=float,
         default=PredictiveRecoveryConfig.intervention_score_margin,
-        help="Minimum score improvement required for filter to intervene (default: 1.5).",
+        help="Minimum score improvement required for filter to intervene (default: 2.5).",
     )
     parser.add_argument(
         "--recovery_max_steer_delta_from_raw",
         type=float,
         default=PredictiveRecoveryConfig.max_steer_delta_from_raw,
-        help="Maximum steering delta from raw action (default: 0.25).",
+        help="Maximum steering delta from raw action (default: 0.20).",
     )
     parser.add_argument(
         "--recovery_max_acc_delta_from_raw",
         type=float,
         default=PredictiveRecoveryConfig.max_acc_delta_from_raw,
-        help="Maximum acceleration delta from raw action (default: 0.35).",
+        help="Maximum acceleration delta from raw action (default: 0.30).",
     )
     parser.add_argument(
         "--recovery_log_csv",
@@ -476,7 +488,8 @@ if __name__ == "__main__":
         default="",
         help="Optional episode-level recovery diagnostic CSV path.",
     )
-    # --- Debug / Developer options ---
+
+    # --- Debug options ---
     parser.add_argument(
         "--recovery_debug_shadow",
         action="store_true",
@@ -502,7 +515,6 @@ if __name__ == "__main__":
 
     # --- Decide evaluation mode ---
     if args.path.endswith(".zip"):
-        # Single explicit zip path
         print("===== Evaluating single checkpoint (zip): {} =====".format(args.path))
         ret = evaluate_ppl_once(
             ckpt_path=args.path,
@@ -519,7 +531,6 @@ if __name__ == "__main__":
         )
 
     elif args.ckpt_index >= 0:
-        # Single checkpoint by step index
         if not args.path:
             parser.error("--path is required when using --ckpt_index")
         print("===== Evaluating checkpoint {} in {} =====".format(args.ckpt_index, args.path))
@@ -538,7 +549,6 @@ if __name__ == "__main__":
         )
 
     elif args.start_ckpt >= 0:
-        # Batch evaluation over a range of checkpoints
         if not args.path:
             parser.error("--path is required when using --start_ckpt")
         all_results = []
@@ -569,7 +579,7 @@ if __name__ == "__main__":
             summary_path = osp.join(args.ret_save_folder, "all_checkpoints_summary.csv")
             combined.to_csv(summary_path)
             print("\n===== All checkpoints summary saved to: {} =====".format(summary_path))
-        ret = None  # suppress final print
+        ret = None
 
     else:
         parser.error(
