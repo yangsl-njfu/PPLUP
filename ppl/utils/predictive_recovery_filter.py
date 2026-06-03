@@ -11,6 +11,8 @@ import numpy as np
 RECOVERY_DIAGNOSTIC_FIELDS = [
     "recovery_mode",
     "recovery_certified",
+    "accepted_by_filter",
+    "model_predicted_safe",
     "selected_candidate_type",
     "selected_lateral_target",
     "selected_speed_target",
@@ -42,6 +44,7 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "front_blocking_object_distance",
     "left_space_available",
     "right_space_available",
+    "ultra_light_gate_reason",
     "ultra_fast_gate_reason",
     "route_cache_hit",
     "route_build_time_ms",
@@ -54,6 +57,7 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "selected_terminal_recoverable",
     "blocker_left_gap",
     "blocker_right_gap",
+    "ultra_light_gate_passed",
 ]
 
 
@@ -64,15 +68,15 @@ class PredictiveRecoveryConfig:
     num_lateral_targets: int = 9
     num_speed_targets: int = 5
     max_objects: int = 6
-    max_candidates: int = 12
+    max_candidates: int = 10
     max_rollout_steps: int = 12
     object_scan_limit: int = 12
     debug: bool = False
     log_csv_path: str = ""
 
-    route_sample_interval: float = 4.0
+    route_sample_interval: float = 3.0
     route_min_length: float = 40.0
-    route_extra_length: float = 30.0
+    route_extra_length: float = 15.0
     route_cache_steps: int = 30
     route_cache_distance: float = 20.0
     route_max_future_groups: int = 1
@@ -81,7 +85,9 @@ class PredictiveRecoveryConfig:
     max_projection_distance: float = 5.5
     max_heading_error: float = math.radians(115.0)
 
-    safety_margin: float = 0.35
+    safety_margin: float = 0.6
+    boundary_hard_margin: float = 0.15
+    boundary_comfort_margin: float = 1.0
     obstacle_margin: float = 0.45
     hard_collision_margin: float = 0.10
     max_lateral_offset: float = 5.0
@@ -106,7 +112,7 @@ class PredictiveRecoveryConfig:
 
     blocking_speed_threshold: float = 2.0
     low_speed_ratio: float = 0.45
-    filter_time_warn_ms: float = 40.0
+    filter_time_warn_ms: float = 35.0
     ultra_brake_threshold: float = -0.15
     ultra_low_throttle_threshold: float = 0.05
     ultra_low_speed_threshold: float = 1.0
@@ -114,13 +120,16 @@ class PredictiveRecoveryConfig:
     ultra_low_progress_steps: int = 5
     ultra_front_block_distance: float = 28.0
     ultra_front_lateral_window: float = 2.8
+    max_lateral_without_blocker: float = 0.45
+    max_lateral_when_frenet_unstable: float = 0.7
+    max_steer_delta_from_raw: float = 0.35
 
     w_progress: float = 1.8
     w_deadlock: float = 5.0
     w_rss_longitudinal: float = 4.0
     w_rss_lateral: float = 3.0
     w_obstacle: float = 5.0
-    w_boundary: float = 2.0
+    w_boundary: float = 8.0
     w_smoothness: float = 0.3
     w_nominal: float = 0.18
     w_continuity: float = 0.5
@@ -913,19 +922,45 @@ class PredictiveRecoveryFilter:
             ego_length, ego_width = _get_size(vehicle)
             max_steer_rad = self._max_steer_rad(vehicle)
 
-            gate_reason = self._ultra_fast_gate(env, vehicle, ego_pos, ego_heading, ego_speed, raw_action_np)
+            gate_reason = self._ultra_light_gate(env, vehicle, ego_pos, ego_heading, ego_speed, raw_action_np)
+            info["ultra_light_gate_reason"] = gate_reason
             info["ultra_fast_gate_reason"] = gate_reason
-            if gate_reason == "low_risk_passthrough":
+            if gate_reason == "vehicle_risk_flag":
+                safe_action = self._minimum_risk_stop(vehicle)
+                info.update({
+                    "recovery_mode": "minimum_risk_stop",
+                    "recovery_certified": False,
+                    "accepted_by_filter": True,
+                    "model_predicted_safe": False,
+                    "selected_candidate_type": "minimum_risk_stop_vehicle_risk",
+                    "control_feasible": True,
+                    "fallback_reason": "vehicle_risk_before_route_build",
+                    "route_cache_hit": False,
+                    "ultra_light_gate_passed": False,
+                })
+                self._last_recovery_active = True
+                elapsed_ms = (time.time() - start) * 1000.0
+                info["filter_time_ms"] = elapsed_ms
+                if elapsed_ms > self.config.filter_time_warn_ms:
+                    info["filter_time_warning"] = True
+                if self._should_write_detailed_log(info):
+                    self._write_csv(info)
+                return safe_action, info
+
+            if gate_reason != "coarse_front_blocker":
                 safe_action = raw_action_np.astype(np.float32)
                 info.update({
-                    "recovery_mode": "ultra_fast_passthrough",
-                    "recovery_certified": True,
+                    "recovery_mode": "inactive_raw_action",
+                    "recovery_certified": False,
+                    "accepted_by_filter": False,
+                    "model_predicted_safe": False,
                     "selected_candidate_type": "raw_action",
                     "collision_free": True,
                     "boundary_safe": True,
                     "control_feasible": True,
-                    "fallback_reason": "",
+                    "fallback_reason": "" if gate_reason == "low_risk_passthrough" else "ultra_light_gate:{}".format(gate_reason),
                     "route_cache_hit": False,
+                    "ultra_light_gate_passed": True,
                 })
                 self._last_recovery_active = False
                 elapsed_ms = (time.time() - start) * 1000.0
@@ -938,6 +973,46 @@ class PredictiveRecoveryFilter:
             scene_start = time.time()
             objects, scene_info = self._parse_scene(env, frame, ego_projection, ego_speed, ego_width)
             scene_parse_time_ms = (time.time() - scene_start) * 1000.0
+            blocking_distance = _safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))
+            has_front_blocker = np.isfinite(blocking_distance)
+
+            if not has_front_blocker:
+                if gate_reason == "vehicle_risk_flag":
+                    safe_action = self._minimum_risk_stop(vehicle)
+                    info.update({
+                        "recovery_mode": "minimum_risk_stop",
+                        "recovery_certified": False,
+                        "accepted_by_filter": True,
+                        "model_predicted_safe": False,
+                        "selected_candidate_type": "minimum_risk_stop_no_blocker_risk",
+                        "fallback_reason": "vehicle_risk_without_front_blocker",
+                        "route_cache_hit": bool(self._last_route_cache_hit),
+                        "route_build_time_ms": route_build_time_ms,
+                        "scene_parse_time_ms": scene_parse_time_ms,
+                    })
+                    info.update(scene_info)
+                else:
+                    safe_action = raw_action_np.astype(np.float32)
+                    info.update({
+                        "recovery_mode": "inactive_raw_action",
+                        "recovery_certified": False,
+                        "accepted_by_filter": False,
+                        "model_predicted_safe": False,
+                        "selected_candidate_type": "raw_action_no_front_blocker",
+                        "fallback_reason": "no_front_blocking_object",
+                        "route_cache_hit": bool(self._last_route_cache_hit),
+                        "route_build_time_ms": route_build_time_ms,
+                        "scene_parse_time_ms": scene_parse_time_ms,
+                    })
+                    info.update(scene_info)
+                self._last_recovery_active = False
+                elapsed_ms = (time.time() - start) * 1000.0
+                info["filter_time_ms"] = elapsed_ms
+                if elapsed_ms > self.config.filter_time_warn_ms:
+                    info["filter_time_warning"] = True
+                if self._should_write_detailed_log(info):
+                    self._write_csv(info)
+                return np.asarray(safe_action, dtype=np.float32), info
 
             candidate_specs = self._generate_candidate_specs(
                 frame,
@@ -1007,7 +1082,9 @@ class PredictiveRecoveryFilter:
                 info.update(self._score_to_info(selected_score))
                 info.update({
                     "recovery_mode": "predictive_recovery",
-                    "recovery_certified": True,
+                    "recovery_certified": self._is_conservatively_certified(selected_score, selected_rollout, ego_projection),
+                    "accepted_by_filter": True,
+                    "model_predicted_safe": True,
                     "selected_candidate_type": selected_rollout.candidate.candidate_type,
                     "selected_lateral_target": selected_rollout.candidate.lateral_target,
                     "selected_speed_target": selected_rollout.candidate.speed_target,
@@ -1024,6 +1101,8 @@ class PredictiveRecoveryFilter:
                 info.update({
                     "recovery_mode": "minimum_risk_stop",
                     "recovery_certified": False,
+                    "accepted_by_filter": True,
+                    "model_predicted_safe": False,
                     "selected_candidate_type": "minimum_risk_stop",
                     "selected_lateral_target": 0.0,
                     "selected_speed_target": 0.0,
@@ -1039,6 +1118,8 @@ class PredictiveRecoveryFilter:
             info.update({
                 "recovery_mode": "exception_fallback",
                 "recovery_certified": False,
+                "accepted_by_filter": True,
+                "model_predicted_safe": False,
                 "selected_candidate_type": "exception_fallback",
                 "fallback_reason": "exception:{}".format(type(exc).__name__),
                 "control_feasible": True,
@@ -1060,6 +1141,8 @@ class PredictiveRecoveryFilter:
         info.update({
             "recovery_mode": "inactive",
             "recovery_certified": False,
+            "accepted_by_filter": False,
+            "model_predicted_safe": False,
             "selected_candidate_type": "",
             "fallback_reason": "",
             "front_blocking_object_type": "",
@@ -1068,6 +1151,7 @@ class PredictiveRecoveryFilter:
             "rss_lateral_margin": float("inf"),
             "left_space_available": 0.0,
             "right_space_available": 0.0,
+            "ultra_light_gate_reason": "",
             "ultra_fast_gate_reason": "",
             "early_reject_reasons": "",
             "route_cache_hit": False,
@@ -1075,6 +1159,7 @@ class PredictiveRecoveryFilter:
             "selected_terminal_recoverable": False,
             "blocker_left_gap": 0.0,
             "blocker_right_gap": 0.0,
+            "ultra_light_gate_passed": False,
         })
         return info
 
@@ -1152,7 +1237,7 @@ class PredictiveRecoveryFilter:
             return _clip(accel / max(self.config.max_accel, 1e-6), 0.0, 1.0)
         return _clip(accel / max(self.config.max_decel, 1e-6), -1.0, 0.0)
 
-    def _ultra_fast_gate(
+    def _ultra_light_gate(
         self,
         env: Any,
         vehicle: Any,
@@ -1172,6 +1257,10 @@ class PredictiveRecoveryFilter:
         else:
             self._low_progress_count = 0
 
+        if self._vehicle_risk_flag(vehicle):
+            return "vehicle_risk_flag"
+        if self._coarse_front_blocker(env, vehicle, ego_pos, ego_heading):
+            return "coarse_front_blocker"
         if raw_action[1] <= self.config.ultra_brake_threshold:
             return "raw_action_brake"
         if raw_action[1] <= self.config.ultra_low_throttle_threshold and ego_speed < 3.0:
@@ -1180,16 +1269,12 @@ class PredictiveRecoveryFilter:
             return "low_speed_low_progress"
         if self._last_recovery_active:
             return "previous_recovery"
-        if self._vehicle_risk_flag(vehicle):
-            return "vehicle_risk_flag"
-        if self._coarse_front_blocker(env, vehicle, ego_pos, ego_heading):
-            return "coarse_front_blocker"
         return "low_risk_passthrough"
 
     def _vehicle_risk_flag(self, vehicle: Any) -> bool:
         if vehicle is None:
             return False
-        for attr in ("crash_vehicle", "crash_object", "crash_sidewalk", "crash_building", "out_of_route"):
+        for attr in ("crash_vehicle", "crash_object", "crash_sidewalk", "crash_building", "out_of_route", "out_of_road"):
             try:
                 if bool(getattr(vehicle, attr, False)):
                     return True
@@ -1239,6 +1324,7 @@ class PredictiveRecoveryFilter:
         return bool(
             mode in ("predictive_recovery", "minimum_risk_stop", "exception_fallback")
             or info.get("filter_time_warning", False)
+            or info.get("ultra_light_gate_reason", "") == "vehicle_risk_flag"
         )
 
     def _low_risk_fast_path(
@@ -1270,8 +1356,11 @@ class PredictiveRecoveryFilter:
         if abs(float(raw_action[0])) > 0.85 or abs(float(raw_action[1])) > 0.95:
             return None
         return {
-            "recovery_mode": "low_risk_pass_through",
-            "recovery_certified": True,
+            "recovery_mode": "inactive_raw_action",
+            "recovery_certified": False,
+            "accepted_by_filter": False,
+            "model_predicted_safe": False,
+            "ultra_light_gate_passed": True,
             "selected_candidate_type": "raw_action_low_risk",
             "selected_lateral_target": ego_projection.l,
             "selected_speed_target": 0.0,
@@ -1299,7 +1388,7 @@ class PredictiveRecoveryFilter:
         candidates = []
         seen = set()
         scanned = 0
-        scan_limit = max(int(self.config.object_scan_limit), int(self.config.max_objects) * 6)
+        scan_limit = max(1, int(self.config.object_scan_limit))
         for obj in self._iter_environment_objects(env):
             scanned += 1
             if scanned > scan_limit:
@@ -1513,13 +1602,23 @@ class PredictiveRecoveryFilter:
             l_low = -self.config.default_lane_width * 0.5
             l_high = self.config.default_lane_width * 0.5
 
-        target_values = [current_l, 0.0]
+        has_blocker = np.isfinite(_safe_float(scene_info.get("front_blocking_object_distance"), float("inf")))
+        target_values = [current_l]
+        if has_blocker and ego_projection.frenet_valid:
+            target_values.append(0.0)
         n_lat = max(1, int(self.config.num_lateral_targets))
-        offsets = np.linspace(-self.config.max_lateral_offset, self.config.max_lateral_offset, num=n_lat)
-        target_values.extend([current_l + float(offset) for offset in offsets])
+        if has_blocker:
+            lateral_limit = self.config.max_lateral_offset if ego_projection.frenet_valid else self.config.max_lateral_when_frenet_unstable
+            offsets = np.linspace(-lateral_limit, lateral_limit, num=n_lat)
+            target_values.extend([current_l + float(offset) for offset in offsets])
+        else:
+            target_values.extend([
+                current_l - self.config.max_lateral_without_blocker,
+                current_l + self.config.max_lateral_without_blocker,
+            ])
 
         blocking_distance = _safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))
-        if np.isfinite(blocking_distance):
+        if np.isfinite(blocking_distance) and ego_projection.frenet_valid:
             blocking_l = _safe_float(scene_info.get("front_blocking_object_l"), current_l)
             blocking_width = _safe_float(scene_info.get("front_blocking_object_width"), ego_width)
             target_values.append(blocking_l + blocking_width * 0.5 + ego_width * 0.5 + 0.8)
@@ -1528,6 +1627,11 @@ class PredictiveRecoveryFilter:
         lateral_targets = []
         for value in target_values:
             clipped = _clip(value, l_low, l_high)
+            if (
+                not ego_projection.frenet_valid
+                and abs(clipped - current_l) > self.config.max_lateral_when_frenet_unstable
+            ):
+                continue
             if all(abs(clipped - existing) > 0.25 for existing in lateral_targets):
                 lateral_targets.append(clipped)
         lateral_targets = sorted(lateral_targets, key=lambda x: abs(x - current_l))[:max(1, n_lat + 2)]
@@ -1672,6 +1776,10 @@ class PredictiveRecoveryFilter:
                 hard_safe = False
                 failure_reason = "control_limit"
                 break
+            if idx == 0 and abs(steer_action - float(candidate.raw_action[0])) > self.config.max_steer_delta_from_raw:
+                hard_safe = False
+                failure_reason = "steer_delta_from_raw"
+                break
             steer_rate = abs(steer_action - prev_steer) / dt
             if steer_rate > self.config.max_steer_rate:
                 hard_safe = False
@@ -1680,7 +1788,7 @@ class PredictiveRecoveryFilter:
 
             boundary = frame.boundary_at(s_value, l_value, ego_width, self.config.safety_margin)
             min_boundary_margin = min(min_boundary_margin, boundary.boundary_margin)
-            if not boundary.valid:
+            if not boundary.valid or boundary.boundary_margin < self.config.boundary_hard_margin:
                 hard_safe = False
                 failure_reason = "boundary"
                 break
@@ -1906,6 +2014,8 @@ class PredictiveRecoveryFilter:
         rss_lat_score, rss_lat_margin = self._lateral_rss_score(rollout, objects, ego_length, ego_width)
         obstacle_margin_score = 1.0 / max(rollout.min_obstacle_margin, 0.2) if np.isfinite(rollout.min_obstacle_margin) else 0.0
         boundary_margin_score = 1.0 / max(rollout.min_boundary_margin, 0.2) if np.isfinite(rollout.min_boundary_margin) else 0.0
+        if np.isfinite(rollout.min_boundary_margin) and rollout.min_boundary_margin < self.config.boundary_comfort_margin:
+            boundary_margin_score += (self.config.boundary_comfort_margin - rollout.min_boundary_margin) * 8.0
         if rollout.frenet_l.size > 1:
             lateral_velocity = np.diff(rollout.frenet_l) / np.maximum(np.diff(rollout.times), 1e-3)
             boundary_margin_score += max(0.0, float(np.max(np.abs(lateral_velocity))) - 1.5) * 0.1
@@ -1927,18 +2037,17 @@ class PredictiveRecoveryFilter:
             front_s = ego_projection.s + blocking_distance
             lateral_clearance_at_terminal = abs(terminal_l - blocker_l) - blocker_width * 0.5 - ego_width * 0.5
             terminal_passed_blocker = terminal_s > front_s + ego_length * 0.5
-            terminal_recoverable = terminal_passed_blocker or (
+            terminal_recoverable = side_channel_available and (terminal_passed_blocker or (
                 lateral_clearance_at_terminal > self.config.safety_margin + 0.25
                 and terminal_s > front_s - ego_length
-            )
+            ))
             if terminal_recoverable:
                 terminal_recovery_score -= 12.0
                 progress_score -= 0.5 * max(0.0, progress - blocking_distance)
-            elif rollout.speeds[-1] < 1.0 and terminal_s < front_s:
-                terminal_recovery_score += 14.0 if side_channel_available else 5.0
-                deadlock_penalty += 8.0 if side_channel_available else 2.0
-            elif terminal_s < front_s and avg_speed < 2.0:
-                terminal_recovery_score += 8.0 if side_channel_available else 3.0
+            elif terminal_s < front_s or lateral_clearance_at_terminal <= self.config.safety_margin:
+                terminal_recovery_score += 16.0 if side_channel_available else 8.0
+                if rollout.speeds[-1] < 1.0 or avg_speed < 2.0:
+                    deadlock_penalty += 8.0 if side_channel_available else 2.0
 
         rss_risk_score = rss_long_score + rss_lat_score
         total = (
@@ -2064,6 +2173,26 @@ class PredictiveRecoveryFilter:
             "selected_terminal_passed_blocker": score.terminal_passed_blocker,
             "selected_terminal_recoverable": score.terminal_recoverable,
         }
+
+    def _is_conservatively_certified(
+        self,
+        score: TrajectoryScore,
+        rollout: TrajectoryRollout,
+        ego_projection: FrenetProjection,
+    ) -> bool:
+        if not ego_projection.frenet_valid or not rollout.hard_safe:
+            return False
+        if not (score.collision_free and score.boundary_safe and score.control_feasible):
+            return False
+        if not score.terminal_recoverable:
+            return False
+        if not np.isfinite(rollout.min_boundary_margin):
+            return False
+        if rollout.min_boundary_margin < self.config.boundary_comfort_margin:
+            return False
+        if np.isfinite(rollout.min_obstacle_margin) and rollout.min_obstacle_margin < self.config.obstacle_margin + 0.3:
+            return False
+        return True
 
     def _predict_object_position(self, obj: SceneObject, t: float) -> np.ndarray:
         direction = _unit_from_heading(obj.heading)
