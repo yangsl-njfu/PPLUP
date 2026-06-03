@@ -9,23 +9,26 @@ import numpy as np
 
 
 RECOVERY_DIAGNOSTIC_FIELDS = [
+    # 运行时状态
     "recovery_mode",
     "recovery_certified",
     "accepted_by_filter",
+    "filter_intervened",
     "model_predicted_safe",
+    # 选中的候选
     "selected_candidate_type",
     "selected_lateral_target",
     "selected_speed_target",
     "num_candidates",
     "num_hard_safe_candidates",
+    # 安全指标
     "collision_free",
     "boundary_safe",
     "control_feasible",
     "rss_longitudinal_margin",
     "rss_lateral_margin",
     "rss_risk_score",
-    "rss_longitudinal_score",
-    "rss_lateral_score",
+    # 评分
     "obstacle_margin_score",
     "boundary_margin_score",
     "progress_score",
@@ -35,6 +38,7 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "continuity_score",
     "terminal_recovery_score",
     "total_score",
+    # 诊断信息
     "fallback_reason",
     "filter_time_ms",
     "frenet_valid",
@@ -45,7 +49,7 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "left_space_available",
     "right_space_available",
     "ultra_light_gate_reason",
-    "ultra_fast_gate_reason",
+    "ultra_light_gate_passed",
     "route_cache_hit",
     "route_build_time_ms",
     "scene_parse_time_ms",
@@ -57,7 +61,34 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "selected_terminal_recoverable",
     "blocker_left_gap",
     "blocker_right_gap",
-    "ultra_light_gate_passed",
+    # Raw action 对照
+    "raw_hard_safe",
+    "raw_collision_risk",
+    "raw_boundary_risk",
+    "raw_deadlock_risk",
+    "raw_total_score",
+    # 接管判断
+    "allow_intervention",
+    "intervention_reason",
+    "intervention_score_gain",
+    "filter_would_intervene",
+    # Action 限幅
+    "action_limited_by_raw_delta",
+    "safe_raw_steer_delta",
+    "safe_raw_acc_delta",
+    # 候选评估
+    "vehicle_margin_min",
+    "static_margin_min",
+    "boundary_margin_min",
+    "collision_hard_reject_count",
+    "severe_lateral_rss_reject_count",
+    # Episode 统计
+    "intervention_count_this_ep",
+    # 调试选项（开发时使用）
+    "debug_shadow_record",
+    "would_selected_candidate_type",
+    "would_safe_steer",
+    "would_safe_acc",
 ]
 
 
@@ -65,8 +96,8 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
 class PredictiveRecoveryConfig:
     horizon: float = 3.0
     dt: float = 0.2
-    num_lateral_targets: int = 9
-    num_speed_targets: int = 5
+    num_lateral_targets: int = 7
+    num_speed_targets: int = 4
     max_objects: int = 6
     max_candidates: int = 10
     max_rollout_steps: int = 12
@@ -80,20 +111,20 @@ class PredictiveRecoveryConfig:
     route_cache_steps: int = 30
     route_cache_distance: float = 20.0
     route_max_future_groups: int = 1
+    route_front_distance: float = 60.0
     default_lane_width: float = 3.5
     default_road_half_width: float = 5.25
     max_projection_distance: float = 5.5
     max_heading_error: float = math.radians(115.0)
 
-    safety_margin: float = 0.6
+    safety_margin: float = 0.60
     boundary_hard_margin: float = 0.15
     boundary_comfort_margin: float = 1.0
-    obstacle_margin: float = 0.45
-    hard_collision_margin: float = 0.10
+    obstacle_margin: float = 0.80
+    hard_collision_margin: float = 0.35
     max_lateral_offset: float = 5.0
     route_lateral_ignore: float = 12.0
     far_behind_s: float = 12.0
-    route_front_distance: float = 60.0
 
     max_speed: float = 35.0
     max_accel: float = 3.0
@@ -118,12 +149,30 @@ class PredictiveRecoveryConfig:
     ultra_low_speed_threshold: float = 1.0
     ultra_low_progress_threshold: float = 0.25
     ultra_low_progress_steps: int = 5
-    ultra_front_block_distance: float = 28.0
+    ultra_front_block_distance: float = 25.0
     ultra_front_lateral_window: float = 2.8
-    max_lateral_without_blocker: float = 0.45
-    max_lateral_when_frenet_unstable: float = 0.7
-    max_steer_delta_from_raw: float = 0.35
+    max_lateral_without_blocker: float = 0.35
+    max_lateral_when_frenet_unstable: float = 0.5
 
+    # 新增：接管限制 ---
+    intervention_score_margin: float = 1.5
+    max_steer_delta_from_raw: float = 0.25
+    max_acc_delta_from_raw: float = 0.35
+    max_steer_delta_from_prev: float = 0.20
+    max_acc_delta_from_prev: float = 0.30
+    raw_safe_passthrough_enabled: bool = True
+    _debug_shadow_record: bool = False  # 开发调试用：记录过滤器行为但不执行接管
+
+    # --- 新增：车辆碰撞硬约束 ---
+    hard_vehicle_lateral_margin: float = 0.80
+    hard_vehicle_longitudinal_margin: float = 1.50
+    hard_static_lateral_margin: float = 0.60
+    hard_static_longitudinal_margin: float = 1.00
+    severe_lateral_rss_margin: float = -0.50
+    min_boundary_margin_for_bypass: float = 0.45
+    comfort_boundary_margin: float = 1.00
+
+    # --- 新增：成本权重 ---
     w_progress: float = 1.8
     w_deadlock: float = 5.0
     w_rss_longitudinal: float = 4.0
@@ -203,6 +252,9 @@ class TrajectoryRollout:
     failure_reason: str = ""
     min_boundary_margin: float = float("inf")
     min_obstacle_margin: float = float("inf")
+    # 新增：车辆和静态障碍物 margin
+    min_vehicle_margin: float = float("inf")
+    min_static_margin: float = float("inf")
 
 
 @dataclass
@@ -908,12 +960,23 @@ class PredictiveRecoveryFilter:
         self._last_recovery_active = False
         self._last_route_cache_hit = False
         self._last_route_build_time_ms = 0.0
+        # --- 新增：用于归因统计 ---
+        self._prev_safe_steer: Optional[float] = None
+        self._prev_safe_acc: Optional[float] = None
+        self._intervention_count_this_ep: int = 0
+        self._non_intervention_collision_count: int = 0
+        self._non_intervention_out_of_road_count: int = 0
+        self._intervention_collision_count: int = 0
+        self._intervention_out_of_road_count: int = 0
 
     def filter(self, env: Any, obs: Any, raw_action: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
         del obs
         start = time.time()
         raw_action_np = self._coerce_action(raw_action)
         info = self._empty_info()
+        # 调试标记
+        info["debug_shadow_record"] = self.config._debug_shadow_record
+        info["intervention_count_this_ep"] = self._intervention_count_this_ep
         try:
             vehicle = _get_ego_vehicle(env)
             ego_pos = _get_position(vehicle)
@@ -922,9 +985,12 @@ class PredictiveRecoveryFilter:
             ego_length, ego_width = _get_size(vehicle)
             max_steer_rad = self._max_steer_rad(vehicle)
 
+            # ===== 步骤0：超轻量门控（最优先，最便宜） =====
             gate_reason = self._ultra_light_gate(env, vehicle, ego_pos, ego_heading, ego_speed, raw_action_np)
             info["ultra_light_gate_reason"] = gate_reason
-            info["ultra_fast_gate_reason"] = gate_reason
+            info["ultra_light_gate_passed"] = True
+
+            # 车辆风险标志 - 立即最小风险停车
             if gate_reason == "vehicle_risk_flag":
                 safe_action = self._minimum_risk_stop(vehicle)
                 info.update({
@@ -939,6 +1005,7 @@ class PredictiveRecoveryFilter:
                     "ultra_light_gate_passed": False,
                 })
                 self._last_recovery_active = True
+                self._intervention_count_this_ep += 1
                 elapsed_ms = (time.time() - start) * 1000.0
                 info["filter_time_ms"] = elapsed_ms
                 if elapsed_ms > self.config.filter_time_warn_ms:
@@ -947,7 +1014,8 @@ class PredictiveRecoveryFilter:
                     self._write_csv(info)
                 return safe_action, info
 
-            if gate_reason != "coarse_front_blocker":
+            # 低风险场景 - 直接返回 raw_action，不构建道路、不解析场景、不生成候选
+            if gate_reason == "low_risk_passthrough":
                 safe_action = raw_action_np.astype(np.float32)
                 info.update({
                     "recovery_mode": "inactive_raw_action",
@@ -958,39 +1026,37 @@ class PredictiveRecoveryFilter:
                     "collision_free": True,
                     "boundary_safe": True,
                     "control_feasible": True,
-                    "fallback_reason": "" if gate_reason == "low_risk_passthrough" else "ultra_light_gate:{}".format(gate_reason),
+                    "fallback_reason": "low_risk_passthrough",
                     "route_cache_hit": False,
                     "ultra_light_gate_passed": True,
+                    "allow_intervention": False,
+                    "intervention_reason": "none",
+                    "filter_intervened": False,
                 })
                 self._last_recovery_active = False
+                self._reset_prev_safe()
                 elapsed_ms = (time.time() - start) * 1000.0
                 info["filter_time_ms"] = elapsed_ms
                 return safe_action, info
 
+            # ===== 步骤1：构建道路坐标（仅当 gate_reason != low_risk_passthrough 时） =====
             frame = self._get_route_frame(env, vehicle, ego_pos)
             route_build_time_ms = self._last_route_build_time_ms
             ego_projection = frame.project_point(ego_pos, ego_heading) if ego_pos is not None else FrenetProjection(False, reason="missing_ego_position")
+
+            # ===== 步骤2：解析场景物体 =====
             scene_start = time.time()
             objects, scene_info = self._parse_scene(env, frame, ego_projection, ego_speed, ego_width)
             scene_parse_time_ms = (time.time() - scene_start) * 1000.0
+            info.update(scene_info)
             blocking_distance = _safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))
             has_front_blocker = np.isfinite(blocking_distance)
 
+            # 无前方阻塞物时 - 返回 raw_action（除非有明确风险信号）
             if not has_front_blocker:
-                if gate_reason == "vehicle_risk_flag":
-                    safe_action = self._minimum_risk_stop(vehicle)
-                    info.update({
-                        "recovery_mode": "minimum_risk_stop",
-                        "recovery_certified": False,
-                        "accepted_by_filter": True,
-                        "model_predicted_safe": False,
-                        "selected_candidate_type": "minimum_risk_stop_no_blocker_risk",
-                        "fallback_reason": "vehicle_risk_without_front_blocker",
-                        "route_cache_hit": bool(self._last_route_cache_hit),
-                        "route_build_time_ms": route_build_time_ms,
-                        "scene_parse_time_ms": scene_parse_time_ms,
-                    })
-                    info.update(scene_info)
+                if gate_reason == "raw_action_brake" or gate_reason == "low_speed_low_progress":
+                    # 明确的减速/卡死风险，允许候选替换
+                    pass
                 else:
                     safe_action = raw_action_np.astype(np.float32)
                     info.update({
@@ -1003,17 +1069,19 @@ class PredictiveRecoveryFilter:
                         "route_cache_hit": bool(self._last_route_cache_hit),
                         "route_build_time_ms": route_build_time_ms,
                         "scene_parse_time_ms": scene_parse_time_ms,
+                        "allow_intervention": False,
+                        "intervention_reason": "none",
+                        "filter_intervened": False,
                     })
-                    info.update(scene_info)
-                self._last_recovery_active = False
-                elapsed_ms = (time.time() - start) * 1000.0
-                info["filter_time_ms"] = elapsed_ms
-                if elapsed_ms > self.config.filter_time_warn_ms:
-                    info["filter_time_warning"] = True
-                if self._should_write_detailed_log(info):
-                    self._write_csv(info)
-                return np.asarray(safe_action, dtype=np.float32), info
+                    self._last_recovery_active = False
+                    self._reset_prev_safe()
+                    elapsed_ms = (time.time() - start) * 1000.0
+                    info["filter_time_ms"] = elapsed_ms
+                    if elapsed_ms > self.config.filter_time_warn_ms:
+                        info["filter_time_warning"] = True
+                    return np.asarray(safe_action, dtype=np.float32), info
 
+            # ===== 步骤3：生成候选规范（不生成完整轨迹） =====
             candidate_specs = self._generate_candidate_specs(
                 frame,
                 ego_projection,
@@ -1025,14 +1093,46 @@ class PredictiveRecoveryFilter:
                 scene_info,
                 max_steer_rad,
             )
-            safe_rollouts: List[TrajectoryRollout] = []
-            scored: List[Tuple[TrajectoryScore, TrajectoryRollout]] = []
+            info["num_candidate_specs"] = len(candidate_specs)
+
+            # ===== 步骤4：对 raw_action 做对照预测 =====
+            raw_eval = self._evaluate_raw_action(
+                frame,
+                ego_projection,
+                ego_pos,
+                ego_heading,
+                ego_speed,
+                ego_length,
+                ego_width,
+                raw_action_np,
+                scene_info,
+            )
+            info.update({
+                "raw_hard_safe": raw_eval.get("hard_safe", False),
+                "raw_collision_risk": raw_eval.get("collision_risk", 0.0),
+                "raw_boundary_risk": raw_eval.get("boundary_risk", 0.0),
+                "raw_deadlock_risk": raw_eval.get("deadlock_risk", 0.0),
+                "raw_progress_score": raw_eval.get("progress_score", 0.0),
+                "raw_total_score": raw_eval.get("total_score", float("inf")),
+                "raw_rss_risk_score": raw_eval.get("rss_risk_score", 0.0),
+                "raw_obstacle_margin_score": raw_eval.get("obstacle_margin_score", 0.0),
+                "raw_boundary_margin_score": raw_eval.get("boundary_margin_score", 0.0),
+            })
+
+            # ===== 步骤5：Rollout 候选并边展开边淘汰 =====
+            safe_rollouts: List[Tuple[TrajectoryScore, TrajectoryRollout]] = []
+            boundary_hard_reject_count = 0
+            collision_hard_reject_count = 0
+            severe_lateral_rss_reject_count = 0
+            vehicle_margin_min = float("inf")
+            static_margin_min = float("inf")
+            boundary_margin_min = float("inf")
             early_rejected = 0
             early_reject_reasons: Dict[str, int] = {}
 
             candidate_start = time.time()
             for candidate in candidate_specs:
-                rollout = self._rollout_and_check_candidate(
+                rollout, reject_reason = self._rollout_candidate_with_hard_check(
                     candidate,
                     frame,
                     objects,
@@ -1046,17 +1146,26 @@ class PredictiveRecoveryFilter:
                 )
                 if rollout.hard_safe:
                     score = self._score_rollout(rollout, frame, objects, ego_projection, ego_length, ego_width, raw_action_np, scene_info)
-                    scored.append((score, rollout))
-                    safe_rollouts.append(rollout)
+                    safe_rollouts.append((score, rollout))
+                    # 记录最小 margin
+                    vehicle_margin_min = min(vehicle_margin_min, rollout.min_vehicle_margin)
+                    static_margin_min = min(static_margin_min, rollout.min_static_margin)
+                    boundary_margin_min = min(boundary_margin_min, rollout.min_boundary_margin)
                 else:
                     early_rejected += 1
-                    reason = rollout.failure_reason or "unknown"
+                    reason = reject_reason or rollout.failure_reason or "unknown"
                     early_reject_reasons[reason] = early_reject_reasons.get(reason, 0) + 1
+                    if "boundary" in reason:
+                        boundary_hard_reject_count += 1
+                    if "collision" in reason or "vehicle_margin" in reason or "static_margin" in reason:
+                        collision_hard_reject_count += 1
+                    if "severe_lateral_rss" in reason or "lateral_rss" in reason:
+                        severe_lateral_rss_reject_count += 1
+
             candidate_eval_time_ms = (time.time() - candidate_start) * 1000.0
 
             info.update({
                 "num_candidates": len(candidate_specs),
-                "num_candidate_specs": len(candidate_specs),
                 "num_hard_safe_candidates": len(safe_rollouts),
                 "num_early_rejected": early_rejected,
                 "early_reject_reasons": self._format_reject_reasons(early_reject_reasons),
@@ -1068,50 +1177,138 @@ class PredictiveRecoveryFilter:
                 "route_build_time_ms": route_build_time_ms,
                 "scene_parse_time_ms": scene_parse_time_ms,
                 "candidate_eval_time_ms": candidate_eval_time_ms,
+                "vehicle_margin_min": vehicle_margin_min,
+                "static_margin_min": static_margin_min,
+                "boundary_margin_min": boundary_margin_min,
+                "boundary_hard_reject_count": boundary_hard_reject_count,
+                "collision_hard_reject_count": collision_hard_reject_count,
+                "severe_lateral_rss_reject_count": severe_lateral_rss_reject_count,
             })
-            info.update(scene_info)
 
-            if scored:
-                selected_score, selected_rollout = min(scored, key=lambda item: item[0].total_score)
-                safe_action = np.array(
-                    [selected_rollout.steer_actions[0], selected_rollout.throttle_actions[0]],
+            # ===== 步骤6：判断是否接管 =====
+            allow_intervention = False
+            intervention_reason = "none"
+            best_score: Optional[TrajectoryScore] = None
+            best_rollout: Optional[TrajectoryRollout] = None
+
+            if safe_rollouts:
+                # 找到最优候选
+                best_score, best_rollout = min(safe_rollouts, key=lambda item: item[0].total_score)
+
+                # 接管条件：raw_action 有明确风险，且候选显著优于 raw_action
+                raw_has_clear_risk = (
+                    not raw_eval.get("hard_safe", False)
+                    or raw_eval.get("collision_risk", 0.0) > 2.0
+                    or raw_eval.get("boundary_risk", 0.0) > 2.0
+                    or raw_eval.get("deadlock_risk", 0.0) > 3.0
+                    or (gate_reason == "low_speed_low_progress" and not raw_eval.get("hard_safe", False))
+                    or (gate_reason == "raw_action_brake" and not raw_eval.get("hard_safe", False))
+                )
+
+                score_gain = raw_eval.get("total_score", float("inf")) - best_score.total_score
+
+                if raw_has_clear_risk and best_score.hard_safe:
+                    if score_gain >= self.config.intervention_score_margin:
+                        allow_intervention = True
+                        if raw_eval.get("collision_risk", 0.0) > 2.0:
+                            intervention_reason = "raw_collision_risk"
+                        elif raw_eval.get("boundary_risk", 0.0) > 2.0:
+                            intervention_reason = "raw_boundary_risk"
+                        elif raw_eval.get("deadlock_risk", 0.0) > 3.0:
+                            intervention_reason = "raw_deadlock_risk"
+                        elif gate_reason == "low_speed_low_progress":
+                            intervention_reason = "low_speed_deadlock"
+                        elif gate_reason == "raw_action_brake":
+                            intervention_reason = "front_blocker_recovery"
+                        else:
+                            intervention_reason = "raw_clear_risk"
+                    else:
+                        intervention_reason = "candidate_not_significantly_better"
+                else:
+                    intervention_reason = "raw_action_safe"
+
+                info["allow_intervention"] = allow_intervention
+                info["intervention_reason"] = intervention_reason
+                info["intervention_score_gain"] = score_gain
+            else:
+                info["allow_intervention"] = False
+                info["intervention_reason"] = "no_safe_candidate"
+                info["intervention_score_gain"] = 0.0
+
+            # ===== 步骤7：调试影子模式 - 记录但不执行接管 =====
+            if self.config._debug_shadow_record:
+                if allow_intervention and best_rollout is not None:
+                    info["filter_would_intervene"] = True
+                    info["would_selected_candidate_type"] = best_rollout.candidate.candidate_type
+                    info["would_safe_steer"] = float(best_rollout.steer_actions[0])
+                    info["would_safe_acc"] = float(best_rollout.throttle_actions[0])
+                else:
+                    info["filter_would_intervene"] = False
+                # 调试模式下实际执行 raw_action
+                safe_action = raw_action_np.astype(np.float32)
+                info["filter_intervened"] = False
+                info["recovery_mode"] = "inactive_raw_action"  # 调试模式下仍标记为 inactive
+            elif allow_intervention and best_rollout is not None:
+                # 实际接管
+                self._intervention_count_this_ep += 1
+                candidate_action = np.array(
+                    [best_rollout.steer_actions[0], best_rollout.throttle_actions[0]],
                     dtype=np.float32,
                 )
-                self.last_selected_lateral = selected_rollout.candidate.lateral_target
-                self.last_selected_speed = selected_rollout.candidate.speed_target
-                info.update(self._score_to_info(selected_score))
+                # 限幅：safe_action 不能与 raw_action 差太多
+                safe_action, action_info = self._clip_action_to_raw_delta(
+                    candidate_action, raw_action_np, self._prev_safe_steer, self._prev_safe_acc
+                )
+                info.update(action_info)
+                # 限幅后再次检查是否仍安全
+                if not self._is_action_safe_after_clip(safe_action, raw_action_np, best_score, best_rollout):
+                    safe_action = raw_action_np.astype(np.float32)
+                    info["intervention_reason"] = "action_clipped_unsafe"
+                    allow_intervention = False
+
+                self.last_selected_lateral = best_rollout.candidate.lateral_target
+                self.last_selected_speed = best_rollout.candidate.speed_target
+                info.update(self._score_to_info(best_score))
                 info.update({
                     "recovery_mode": "predictive_recovery",
-                    "recovery_certified": self._is_conservatively_certified(selected_score, selected_rollout, ego_projection),
+                    "recovery_certified": self._is_conservatively_certified(best_score, best_rollout, ego_projection, action_info),
                     "accepted_by_filter": True,
                     "model_predicted_safe": True,
-                    "selected_candidate_type": selected_rollout.candidate.candidate_type,
-                    "selected_lateral_target": selected_rollout.candidate.lateral_target,
-                    "selected_speed_target": selected_rollout.candidate.speed_target,
+                    "selected_candidate_type": best_rollout.candidate.candidate_type,
+                    "selected_lateral_target": best_rollout.candidate.lateral_target,
+                    "selected_speed_target": best_rollout.candidate.speed_target,
                     "collision_free": True,
                     "boundary_safe": True,
                     "control_feasible": True,
                     "fallback_reason": info.get("fallback_reason", ""),
-                    "selected_terminal_passed_blocker": selected_score.terminal_passed_blocker,
-                    "selected_terminal_recoverable": selected_score.terminal_recoverable,
+                    "selected_terminal_passed_blocker": best_score.terminal_passed_blocker,
+                    "selected_terminal_recoverable": best_score.terminal_recoverable,
                 })
-                self._last_recovery_active = bool(np.isfinite(_safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))))
-            else:
-                safe_action = self._minimum_risk_stop(vehicle)
-                info.update({
-                    "recovery_mode": "minimum_risk_stop",
-                    "recovery_certified": False,
-                    "accepted_by_filter": True,
-                    "model_predicted_safe": False,
-                    "selected_candidate_type": "minimum_risk_stop",
-                    "selected_lateral_target": 0.0,
-                    "selected_speed_target": 0.0,
-                    "collision_free": False,
-                    "boundary_safe": False,
-                    "control_feasible": True,
-                    "fallback_reason": "no_hard_safe_candidate",
-                })
+                info["filter_intervened"] = True
                 self._last_recovery_active = True
+                self._prev_safe_steer = safe_action[0]
+                self._prev_safe_acc = safe_action[1]
+            else:
+                # 不接管，返回 raw_action
+                safe_action = raw_action_np.astype(np.float32)
+                info.update({
+                    "recovery_mode": "inactive_raw_action",
+                    "recovery_certified": False,
+                    "accepted_by_filter": False,
+                    "model_predicted_safe": False,
+                    "selected_candidate_type": "raw_action",
+                    "collision_free": raw_eval.get("hard_safe", True),
+                    "boundary_safe": raw_eval.get("boundary_risk", 0.0) < 1.0,
+                    "control_feasible": True,
+                    "fallback_reason": intervention_reason,
+                })
+                info["filter_intervened"] = False
+                self._last_recovery_active = False
+                self._reset_prev_safe()
+
+            info["would_selected_candidate_type"] = info.get("selected_candidate_type", "raw_action")
+            info["would_safe_steer"] = float(safe_action[0])
+            info["would_safe_acc"] = float(safe_action[1])
 
         except Exception as exc:
             safe_action = self._minimum_risk_stop(_get_ego_vehicle(env))
@@ -1123,8 +1320,12 @@ class PredictiveRecoveryFilter:
                 "selected_candidate_type": "exception_fallback",
                 "fallback_reason": "exception:{}".format(type(exc).__name__),
                 "control_feasible": True,
+                "allow_intervention": False,
+                "intervention_reason": "exception",
+                "filter_intervened": True,
             })
             self._last_recovery_active = True
+            self._intervention_count_this_ep += 1
             if self.config.debug:
                 info["debug_exception"] = str(exc)
 
@@ -1142,6 +1343,7 @@ class PredictiveRecoveryFilter:
             "recovery_mode": "inactive",
             "recovery_certified": False,
             "accepted_by_filter": False,
+            "filter_intervened": False,
             "model_predicted_safe": False,
             "selected_candidate_type": "",
             "fallback_reason": "",
@@ -1149,17 +1351,45 @@ class PredictiveRecoveryFilter:
             "front_blocking_object_distance": float("inf"),
             "rss_longitudinal_margin": float("inf"),
             "rss_lateral_margin": float("inf"),
+            "rss_risk_score": 0.0,
             "left_space_available": 0.0,
             "right_space_available": 0.0,
             "ultra_light_gate_reason": "",
-            "ultra_fast_gate_reason": "",
+            "ultra_light_gate_passed": False,
             "early_reject_reasons": "",
             "route_cache_hit": False,
             "selected_terminal_passed_blocker": False,
             "selected_terminal_recoverable": False,
             "blocker_left_gap": 0.0,
             "blocker_right_gap": 0.0,
-            "ultra_light_gate_passed": False,
+            # Raw action 对照
+            "raw_hard_safe": True,
+            "raw_collision_risk": 0.0,
+            "raw_boundary_risk": 0.0,
+            "raw_deadlock_risk": 0.0,
+            "raw_total_score": float("inf"),
+            # 接管判断
+            "allow_intervention": False,
+            "intervention_reason": "none",
+            "intervention_score_gain": 0.0,
+            "filter_would_intervene": False,
+            # Action 限幅
+            "action_limited_by_raw_delta": False,
+            "safe_raw_steer_delta": 0.0,
+            "safe_raw_acc_delta": 0.0,
+            # 候选评估
+            "vehicle_margin_min": float("inf"),
+            "static_margin_min": float("inf"),
+            "boundary_margin_min": float("inf"),
+            "collision_hard_reject_count": 0,
+            "severe_lateral_rss_reject_count": 0,
+            # Episode 统计
+            "intervention_count_this_ep": 0,
+            # 调试选项
+            "debug_shadow_record": False,
+            "would_selected_candidate_type": "raw_action",
+            "would_safe_steer": 0.0,
+            "would_safe_acc": 0.0,
         })
         return info
 
@@ -1699,7 +1929,7 @@ class PredictiveRecoveryFilter:
             return "right_" + base
         return "keep_" + base
 
-    def _rollout_and_check_candidate(
+    def _rollout_candidate_with_hard_check(
         self,
         candidate: TrajectoryCandidate,
         frame: RouteFrenetFrame,
@@ -1711,7 +1941,8 @@ class PredictiveRecoveryFilter:
         ego_length: float,
         ego_width: float,
         max_steer_rad: float,
-    ) -> TrajectoryRollout:
+    ) -> Tuple[TrajectoryRollout, str]:
+        """边展开边淘汰的候选 rollout，返回 (rollout, reject_reason)。"""
         if ego_pos is None:
             ego_pos = np.zeros(2, dtype=float)
         current_s = ego_projection.s
@@ -1738,8 +1969,40 @@ class PredictiveRecoveryFilter:
         s_value = current_s
         min_boundary_margin = float("inf")
         min_obstacle_margin = float("inf")
+        min_vehicle_margin = float("inf")
+        min_static_margin = float("inf")
         hard_safe = True
         failure_reason = ""
+
+        # 无阻塞物时，禁止大幅侧向候选
+        has_blocking = False
+        for obj in objects:
+            if obj.is_blocking:
+                has_blocking = True
+                break
+        lateral_shift = abs(candidate.lateral_target - current_l)
+        candidate_type = candidate.candidate_type
+        if not has_blocking:
+            if "left_" in candidate_type or "right_" in candidate_type:
+                if lateral_shift > self.config.max_lateral_without_blocker:
+                    return TrajectoryRollout(
+                        candidate=candidate,
+                        times=np.zeros(0, dtype=float),
+                        positions=np.zeros((0, 2), dtype=float),
+                        headings=np.zeros(0, dtype=float),
+                        speeds=np.zeros(0, dtype=float),
+                        accelerations=np.zeros(0, dtype=float),
+                        steer_actions=np.zeros(0, dtype=float),
+                        throttle_actions=np.zeros(0, dtype=float),
+                        frenet_s=np.zeros(0, dtype=float),
+                        frenet_l=np.zeros(0, dtype=float),
+                        hard_safe=False,
+                        failure_reason="no_blocker_lateral_shift",
+                        min_boundary_margin=float("inf"),
+                        min_obstacle_margin=float("inf"),
+                        min_vehicle_margin=float("inf"),
+                        min_static_margin=float("inf"),
+                    ), "no_blocker_lateral_shift"
 
         for idx in range(steps):
             t = (idx + 1) * dt
@@ -1768,6 +2031,7 @@ class PredictiveRecoveryFilter:
             frenet_s_values.append(s_value)
             frenet_l_values.append(l_value)
 
+            # 控制限制检查
             if speed < -1e-4:
                 hard_safe = False
                 failure_reason = "negative_speed"
@@ -1786,37 +2050,116 @@ class PredictiveRecoveryFilter:
                 failure_reason = "steer_rate_limit"
                 break
 
+            # 边界检查
             boundary = frame.boundary_at(s_value, l_value, ego_width, self.config.safety_margin)
             min_boundary_margin = min(min_boundary_margin, boundary.boundary_margin)
             if not boundary.valid or boundary.boundary_margin < self.config.boundary_hard_margin:
                 hard_safe = False
                 failure_reason = "boundary"
                 break
+            # 边界余量不足时检查是否允许绕行
+            if boundary.boundary_margin < self.config.min_boundary_margin_for_bypass:
+                if "left_" in candidate_type or "right_" in candidate_type:
+                    hard_safe = False
+                    failure_reason = "boundary_margin_for_bypass"
+                    break
 
+            # 增强的障碍物检查
             for obj in objects:
                 obj_pos = self._predict_object_position(obj, t)
                 gap = self._center_gap(position, ego_length, ego_width, obj_pos, obj.length, obj.width)
                 min_obstacle_margin = min(min_obstacle_margin, gap)
-                if gap < self.config.obstacle_margin and _rectangles_intersect(
-                    position,
-                    heading,
-                    ego_length + 2.0 * self.config.hard_collision_margin,
-                    ego_width + 2.0 * self.config.hard_collision_margin,
-                    obj_pos,
-                    obj.heading,
-                    obj.length + 2.0 * self.config.hard_collision_margin,
-                    obj.width + 2.0 * self.config.hard_collision_margin,
-                ):
-                    hard_safe = False
-                    failure_reason = "collision"
-                    break
-                if obj.is_vehicle and obj.frenet_valid:
-                    rel_s = obj.s - s_value
-                    lateral_gap = abs(obj.l - l_value) - ego_width * 0.5 - obj.width * 0.5
-                    if -4.0 < rel_s < 3.0 and lateral_gap < -0.1:
+
+                # 膨胀 ego footprint
+                inflated_ego_length = ego_length + 2.0 * self.config.hard_collision_margin
+                inflated_ego_width = ego_width + 2.0 * self.config.hard_collision_margin
+
+                if obj.is_vehicle:
+                    # 车辆膨胀
+                    inflated_obj_length = obj.length + 2.0 * self.config.hard_collision_margin
+                    inflated_obj_width = obj.width + 2.0 * self.config.hard_collision_margin
+
+                    # 车辆侧向/纵向硬 margin 检查
+                    if obj.frenet_valid:
+                        rel_s = obj.s - s_value
+                        rel_l = obj.l - l_value
+                        lateral_gap = abs(rel_l) - inflated_ego_width * 0.5 - inflated_obj_width * 0.5
+
+                        # 严重横向 RSS 检查
+                        if obj.speed < 1.0:
+                            if lateral_gap < self.config.severe_lateral_rss_margin:
+                                hard_safe = False
+                                failure_reason = "severe_lateral_rss"
+                                break
+
+                        # 切入风险
+                        if -4.0 < rel_s < 3.0 and lateral_gap < -0.1:
+                            hard_safe = False
+                            failure_reason = "cut_in_danger"
+                            break
+
+                        # 车辆侧向硬距离
+                        if abs(rel_s) < self.config.hard_vehicle_longitudinal_margin:
+                            if lateral_gap < self.config.hard_vehicle_lateral_margin:
+                                hard_safe = False
+                                failure_reason = "vehicle_lateral_margin_violation"
+                                break
+
+                        # 并排行驶时横向距离不足
+                        if -1.0 < rel_s < 1.0 and lateral_gap < self.config.hard_vehicle_lateral_margin:
+                            hard_safe = False
+                            failure_reason = "parallel_lateral_violation"
+                            break
+
+                    # 碰撞检查
+                    if _rectangles_intersect(
+                        position,
+                        heading,
+                        inflated_ego_length,
+                        inflated_ego_width,
+                        obj_pos,
+                        obj.heading,
+                        inflated_obj_length,
+                        inflated_obj_width,
+                    ):
                         hard_safe = False
-                        failure_reason = "cut_in_danger"
+                        failure_reason = "collision"
                         break
+
+                    min_vehicle_margin = min(min_vehicle_margin, gap)
+                else:
+                    # 静态障碍物膨胀
+                    inflated_obj_length = obj.length + 2.0 * self.config.hard_collision_margin
+                    inflated_obj_width = obj.width + 2.0 * self.config.hard_collision_margin
+
+                    # 静态障碍物侧向/纵向硬 margin 检查
+                    if obj.frenet_valid:
+                        rel_s = obj.s - s_value
+                        rel_l = obj.l - l_value
+                        if abs(rel_s) < self.config.hard_static_longitudinal_margin:
+                            lateral_gap = abs(rel_l) - inflated_ego_width * 0.5 - inflated_obj_width * 0.5
+                            if lateral_gap < self.config.hard_static_lateral_margin:
+                                hard_safe = False
+                                failure_reason = "static_margin_violation"
+                                break
+
+                    # 碰撞检查
+                    if _rectangles_intersect(
+                        position,
+                        heading,
+                        inflated_ego_length,
+                        inflated_ego_width,
+                        obj_pos,
+                        obj.heading,
+                        inflated_obj_length,
+                        inflated_obj_width,
+                    ):
+                        hard_safe = False
+                        failure_reason = "static_collision"
+                        break
+
+                    min_static_margin = min(min_static_margin, gap)
+
             if not hard_safe:
                 break
 
@@ -1840,8 +2183,10 @@ class PredictiveRecoveryFilter:
             failure_reason=failure_reason,
             min_boundary_margin=min_boundary_margin,
             min_obstacle_margin=min_obstacle_margin,
+            min_vehicle_margin=min_vehicle_margin,
+            min_static_margin=min_static_margin,
         )
-        return rollout
+        return rollout, failure_reason
 
     def _rollout_candidate(
         self,
@@ -2179,6 +2524,7 @@ class PredictiveRecoveryFilter:
         score: TrajectoryScore,
         rollout: TrajectoryRollout,
         ego_projection: FrenetProjection,
+        action_info: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if not ego_projection.frenet_valid or not rollout.hard_safe:
             return False
@@ -2191,6 +2537,12 @@ class PredictiveRecoveryFilter:
         if rollout.min_boundary_margin < self.config.boundary_comfort_margin:
             return False
         if np.isfinite(rollout.min_obstacle_margin) and rollout.min_obstacle_margin < self.config.obstacle_margin + 0.3:
+            return False
+        # 车辆 margin 不足不认证
+        if np.isfinite(rollout.min_vehicle_margin) and rollout.min_vehicle_margin < self.config.hard_vehicle_lateral_margin:
+            return False
+        # 如果 action 被大幅限幅，不认证
+        if action_info and action_info.get("action_limited_by_raw_delta", False):
             return False
         return True
 
@@ -2211,6 +2563,156 @@ class PredictiveRecoveryFilter:
         radius_a = 0.5 * math.sqrt(length_a ** 2 + width_a ** 2)
         radius_b = 0.5 * math.sqrt(length_b ** 2 + width_b ** 2)
         return center_dist - radius_a - radius_b
+
+    def _evaluate_raw_action(
+        self,
+        frame: RouteFrenetFrame,
+        ego_projection: FrenetProjection,
+        ego_pos: Optional[np.ndarray],
+        ego_heading: float,
+        ego_speed: float,
+        ego_length: float,
+        ego_width: float,
+        raw_action: np.ndarray,
+        scene_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """对 raw_action 做短时对照预测。"""
+        result = {
+            "hard_safe": True,
+            "collision_risk": 0.0,
+            "boundary_risk": 0.0,
+            "deadlock_risk": 0.0,
+            "progress_score": 0.0,
+            "total_score": 0.0,
+            "rss_risk_score": 0.0,
+            "obstacle_margin_score": 0.0,
+            "boundary_margin_score": 0.0,
+        }
+        if ego_pos is None:
+            result["hard_safe"] = False
+            return result
+
+        # 构建 raw_action 对应的候选
+        raw_accel = self._action_to_accel(raw_action[1])
+        raw_target_speed = max(0.0, ego_speed + raw_accel * self.config.horizon * 0.5)
+        raw_lateral_target = ego_projection.l if ego_projection.frenet_valid else 0.0
+        raw_candidate = TrajectoryCandidate(
+            candidate_id=-1,
+            candidate_type="raw_action",
+            lateral_target=raw_lateral_target,
+            speed_target=raw_target_speed,
+            raw_action=raw_action.copy(),
+        )
+
+        # Rollout raw_action
+        rollout, reject_reason = self._rollout_candidate_with_hard_check(
+            raw_candidate,
+            frame,
+            [],  # 不检查障碍物，只检查控制和边界
+            ego_projection,
+            ego_pos,
+            ego_heading,
+            ego_speed,
+            ego_length,
+            ego_width,
+            self.config.default_max_steer_rad,
+        )
+
+        if not rollout.hard_safe:
+            result["hard_safe"] = False
+            if "boundary" in reject_reason:
+                result["boundary_risk"] = 5.0
+            else:
+                result["collision_risk"] = 5.0
+
+        # 检查边界
+        if ego_projection.frenet_valid:
+            boundary = frame.boundary_at(ego_projection.s, ego_projection.l, ego_width, self.config.safety_margin)
+            if not boundary.valid:
+                result["boundary_risk"] = max(result["boundary_risk"], 3.0)
+            elif boundary.boundary_margin < self.config.boundary_hard_margin:
+                result["boundary_risk"] = max(result["boundary_risk"], 2.0)
+            elif boundary.boundary_margin < self.config.comfort_boundary_margin:
+                result["boundary_risk"] = max(result["boundary_risk"], 1.0)
+
+        # 检查死锁风险
+        blocking_distance = _safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))
+        if np.isfinite(blocking_distance):
+            if ego_speed < 1.5:
+                result["deadlock_risk"] = 3.0
+            if raw_target_speed < 2.0 and ego_speed < 2.0:
+                result["deadlock_risk"] = max(result["deadlock_risk"], 4.0)
+
+        # 简单评分
+        result["progress_score"] = raw_target_speed * self.config.horizon
+        result["total_score"] = (
+            -self.config.w_progress * result["progress_score"]
+            + self.config.w_boundary * result["boundary_risk"]
+            + self.config.w_deadlock * result["deadlock_risk"]
+        )
+
+        return result
+
+    def _clip_action_to_raw_delta(
+        self,
+        candidate_action: np.ndarray,
+        raw_action: np.ndarray,
+        prev_steer: Optional[float],
+        prev_acc: Optional[float],
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """限幅 candidate_action，使其与 raw_action 和上一时刻动作的差值不超过限制。"""
+        delta_steer = candidate_action[0] - raw_action[0]
+        delta_acc = candidate_action[1] - raw_action[1]
+
+        # 限幅与 raw_action 的差值
+        clipped_steer = _clip(delta_steer, -self.config.max_steer_delta_from_raw, self.config.max_steer_delta_from_raw)
+        clipped_acc = _clip(delta_acc, -self.config.max_acc_delta_from_raw, self.config.max_acc_delta_from_raw)
+
+        # 限幅与上一时刻动作的差值
+        if prev_steer is not None:
+            steer_diff = (raw_action[0] + clipped_steer) - prev_steer
+            if abs(steer_diff) > self.config.max_steer_delta_from_prev:
+                clipped_steer = _clip(clipped_steer, -self.config.max_steer_delta_from_prev - (raw_action[0] - prev_steer),
+                                       self.config.max_steer_delta_from_prev - (raw_action[0] - prev_steer))
+
+        if prev_acc is not None:
+            acc_diff = (raw_action[1] + clipped_acc) - prev_acc
+            if abs(acc_diff) > self.config.max_acc_delta_from_prev:
+                clipped_acc = _clip(clipped_acc, -self.config.max_acc_delta_from_prev - (raw_action[1] - prev_acc),
+                                    self.config.max_acc_delta_from_prev - (raw_action[1] - prev_acc))
+
+        safe_action = np.array([raw_action[0] + clipped_steer, raw_action[1] + clipped_acc], dtype=np.float32)
+        action_info = {
+            "action_limited_by_raw_delta": (abs(clipped_steer - delta_steer) > 1e-4 or abs(clipped_acc - delta_acc) > 1e-4),
+            "safe_raw_steer_delta": clipped_steer,
+            "safe_raw_acc_delta": clipped_acc,
+            "safe_prev_steer_delta": prev_steer - raw_action[0] if prev_steer is not None else 0.0,
+            "safe_prev_acc_delta": prev_acc - raw_action[1] if prev_acc is not None else 0.0,
+        }
+        return safe_action, action_info
+
+    def _is_action_safe_after_clip(
+        self,
+        safe_action: np.ndarray,
+        raw_action: np.ndarray,
+        score: Optional[TrajectoryScore],
+        rollout: Optional[TrajectoryRollout],
+    ) -> bool:
+        """检查限幅后的动作是否仍然满足最低安全要求。"""
+        # 如果与 raw_action 差值过大，说明被限幅太多，可能失去安全性
+        if abs(safe_action[0] - raw_action[0]) > self.config.max_steer_delta_from_raw * 0.8:
+            return False
+        if abs(safe_action[1] - raw_action[1]) > self.config.max_acc_delta_from_raw * 0.8:
+            return False
+        # 如果限幅后候选不再安全，不接管
+        if rollout is not None and not rollout.hard_safe:
+            return False
+        return True
+
+    def _reset_prev_safe(self) -> None:
+        """重置上一时刻的 safe action。"""
+        self._prev_safe_steer = None
+        self._prev_safe_acc = None
 
     def _minimum_risk_stop(self, vehicle: Any) -> np.ndarray:
         current_steer = _safe_float(getattr(vehicle, "steering", 0.0), 0.0)

@@ -111,6 +111,42 @@ def summarize_recovery_episode(step_infos):
     summary["recovery_certified_rate"] = float(np.mean([bool(item.get("recovery_certified", False)) for item in step_infos]))
     summary["recovery_min_hard_safe_candidates"] = int(min(item.get("num_hard_safe_candidates", 0) for item in step_infos))
     summary["recovery_max_filter_time_ms"] = float(max(item.get("filter_time_ms", 0.0) for item in step_infos))
+
+    # 统计接管相关
+    filter_intervened_count = sum(1 for item in step_infos if item.get("filter_intervened", False))
+    summary["intervention_count"] = filter_intervened_count
+    summary["intervention_rate"] = filter_intervened_count / max(1, len(step_infos))
+
+    # 接管原因统计
+    intervention_reasons = [item.get("intervention_reason", "none") for item in step_infos if item.get("filter_intervened", False)]
+    summary["intervention_reasons"] = ";".join(intervention_reasons) if intervention_reasons else ""
+
+    # 平均分数差值
+    delta_steer_values = [item.get("safe_raw_steer_delta", 0.0) for item in step_infos if isinstance(item.get("safe_raw_steer_delta"), (int, float))]
+    delta_acc_values = [item.get("safe_raw_acc_delta", 0.0) for item in step_infos if isinstance(item.get("safe_raw_acc_delta"), (int, float))]
+    summary["mean_safe_raw_steer_delta"] = float(np.mean(delta_steer_values)) if delta_steer_values else 0.0
+    summary["mean_safe_raw_acc_delta"] = float(np.mean(delta_acc_values)) if delta_acc_values else 0.0
+
+    # 最小 margin 统计
+    vehicle_margin_values = [item.get("vehicle_margin_min", float("inf")) for item in step_infos if item.get("vehicle_margin_min", float("inf")) < float("inf")]
+    static_margin_values = [item.get("static_margin_min", float("inf")) for item in step_infos if item.get("static_margin_min", float("inf")) < float("inf")]
+    boundary_margin_values = [item.get("boundary_margin_min", float("inf")) for item in step_infos if item.get("boundary_margin_min", float("inf")) < float("inf")]
+    summary["min_vehicle_margin"] = float(np.min(vehicle_margin_values)) if vehicle_margin_values else float("inf")
+    summary["min_static_margin"] = float(np.min(static_margin_values)) if static_margin_values else float("inf")
+    summary["min_boundary_margin"] = float(np.min(boundary_margin_values)) if boundary_margin_values else float("inf")
+
+    # 拒绝原因统计
+    all_reject_reasons = []
+    for item in step_infos:
+        reasons_str = item.get("early_reject_reasons", "")
+        if reasons_str:
+            all_reject_reasons.append(reasons_str)
+    summary["all_early_reject_reasons"] = ";".join(all_reject_reasons) if all_reject_reasons else ""
+
+    # Raw action 对照
+    raw_safe_count = sum(1 for item in step_infos if item.get("raw_hard_safe", True))
+    summary["raw_safe_rate"] = raw_safe_count / max(1, len(step_infos))
+
     return summary
 
 
@@ -406,60 +442,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable_predictive_recovery",
         action="store_true",
-        help="Enable RSS-risk-guided predictive runtime recovery.",
+        help="Enable runtime assurance filter for predictive collision/departure prevention.",
     )
+    # 运行时保障可选参数
     parser.add_argument(
-        "--recovery_horizon",
+        "--recovery_intervention_score_margin",
         type=float,
-        default=PredictiveRecoveryConfig.horizon,
-        help="Predictive recovery horizon in seconds.",
+        default=PredictiveRecoveryConfig.intervention_score_margin,
+        help="Minimum score improvement required for filter to intervene (default: 1.5).",
     )
     parser.add_argument(
-        "--recovery_dt",
+        "--recovery_max_steer_delta_from_raw",
         type=float,
-        default=PredictiveRecoveryConfig.dt,
-        help="Predictive recovery rollout time step in seconds.",
+        default=PredictiveRecoveryConfig.max_steer_delta_from_raw,
+        help="Maximum steering delta from raw action (default: 0.25).",
     )
     parser.add_argument(
-        "--recovery_num_lateral_targets",
-        type=int,
-        default=PredictiveRecoveryConfig.num_lateral_targets,
-        help="Number of lateral target offsets used to generate candidates.",
-    )
-    parser.add_argument(
-        "--recovery_num_speed_targets",
-        type=int,
-        default=PredictiveRecoveryConfig.num_speed_targets,
-        help="Number of speed targets used to generate candidates.",
-    )
-    parser.add_argument(
-        "--recovery_max_objects",
-        type=int,
-        default=PredictiveRecoveryConfig.max_objects,
-        help="Maximum number of nearby scene objects considered per step.",
-    )
-    parser.add_argument(
-        "--recovery_max_candidates",
-        type=int,
-        default=PredictiveRecoveryConfig.max_candidates,
-        help="Maximum number of trajectory candidates evaluated per step.",
-    )
-    parser.add_argument(
-        "--recovery_max_rollout_steps",
-        type=int,
-        default=PredictiveRecoveryConfig.max_rollout_steps,
-        help="Maximum sampled rollout points per candidate.",
-    )
-    parser.add_argument(
-        "--recovery_object_scan_limit",
-        type=int,
-        default=PredictiveRecoveryConfig.object_scan_limit,
-        help="Maximum raw environment objects scanned before nearest-object filtering.",
-    )
-    parser.add_argument(
-        "--recovery_debug",
-        action="store_true",
-        help="Enable verbose recovery fallback diagnostics.",
+        "--recovery_max_acc_delta_from_raw",
+        type=float,
+        default=PredictiveRecoveryConfig.max_acc_delta_from_raw,
+        help="Maximum acceleration delta from raw action (default: 0.35).",
     )
     parser.add_argument(
         "--recovery_log_csv",
@@ -472,26 +474,30 @@ if __name__ == "__main__":
         "--recovery_episode_log_csv",
         type=str,
         default="",
-        help=(
-            "Optional episode-level recovery diagnostic CSV path. "
-            "Defaults to <ret_save_folder>/<checkpoint>_recovery_episode.csv when recovery is enabled."
-        ),
+        help="Optional episode-level recovery diagnostic CSV path.",
+    )
+    # --- Debug / Developer options ---
+    parser.add_argument(
+        "--recovery_debug_shadow",
+        action="store_true",
+        help="[Dev] Run filter but execute raw_action, record what filter would do.",
+    )
+    parser.add_argument(
+        "--recovery_debug",
+        action="store_true",
+        help="[Dev] Enable verbose recovery fallback diagnostics.",
     )
 
     args = parser.parse_args()
 
     deterministic = not args.stochastic
     recovery_config = PredictiveRecoveryConfig(
-        horizon=args.recovery_horizon,
-        dt=args.recovery_dt,
-        num_lateral_targets=args.recovery_num_lateral_targets,
-        num_speed_targets=args.recovery_num_speed_targets,
-        max_objects=args.recovery_max_objects,
-        max_candidates=args.recovery_max_candidates,
-        max_rollout_steps=args.recovery_max_rollout_steps,
-        object_scan_limit=args.recovery_object_scan_limit,
+        intervention_score_margin=args.recovery_intervention_score_margin,
+        max_steer_delta_from_raw=args.recovery_max_steer_delta_from_raw,
+        max_acc_delta_from_raw=args.recovery_max_acc_delta_from_raw,
         debug=args.recovery_debug,
         log_csv_path=args.recovery_log_csv or "",
+        _debug_shadow_record=args.recovery_debug_shadow,
     )
 
     # --- Decide evaluation mode ---
