@@ -394,6 +394,49 @@ def summarize_recovery_episode(step_infos):
     all_reject_reasons = [item.get("early_reject_reasons", "") for item in step_infos if item.get("early_reject_reasons", "")]
     summary["all_early_reject_reasons"] = ";".join(all_reject_reasons) if all_reject_reasons else ""
 
+    first_cost_step = -1
+    first_hard_risk_step = -1
+    first_intervention_step = -1
+    low_risk_false_negative_count = 0
+    cooldown_false_negative_count = 0
+    for idx, item in enumerate(step_infos):
+        step_num = int(item.get("step", idx + 1))
+        step_cost = float(item.get("step_cost", item.get("cost", 0.0)) or 0.0)
+        if first_cost_step < 0 and step_cost > 0:
+            first_cost_step = step_num
+        if first_hard_risk_step < 0 and bool(item.get("hard_risk", False)):
+            first_hard_risk_step = step_num
+        if first_intervention_step < 0 and bool(item.get("filter_intervened", False)):
+            first_intervention_step = step_num
+        if step_cost > 0 and bool(item.get("low_risk_gate_passed", False)):
+            low_risk_false_negative_count += 1
+        if step_cost > 0 and (
+            item.get("fallback_reason", "") == "cooldown_or_passthrough"
+            or item.get("intervention_reason", "") == "cooldown"
+        ):
+            cooldown_false_negative_count += 1
+
+    pre_count = 0
+    post_count = 0
+    for item in step_infos:
+        if not bool(item.get("filter_intervened", False)):
+            continue
+        step_num = int(item.get("step", 0) or 0)
+        if first_cost_step > 0 and step_num >= first_cost_step:
+            post_count += 1
+        else:
+            pre_count += 1
+
+    summary["pre_first_cost_intervention_count"] = pre_count
+    summary["post_first_cost_intervention_count"] = post_count
+    summary["first_hard_risk_step"] = first_hard_risk_step
+    summary["first_intervention_step"] = first_intervention_step
+    summary["first_cost_step"] = first_cost_step
+    summary["missed_first_cost"] = bool(first_cost_step > 0 and (first_intervention_step < 0 or first_intervention_step >= first_cost_step))
+    summary["late_intervention"] = bool(first_cost_step > 0 and first_intervention_step > 0 and first_cost_step - first_intervention_step <= 2)
+    summary["low_risk_false_negative_count"] = low_risk_false_negative_count
+    summary["cooldown_false_negative_count"] = cooldown_false_negative_count
+
     return summary
 
 
@@ -415,6 +458,122 @@ def compact_episode_result_for_terminal(result):
         "episode_length",
     ]
     return {key: result.get(key) for key in preferred_keys if key in result}
+
+
+def contact_results_nonempty(value):
+    text = str(value).strip().lower()
+    return text not in ("", "none", "nan", "[]", "{}", "set()")
+
+
+def contact_results_dangerous(value):
+    if not contact_results_nonempty(value):
+        return False
+    text = str(value).lower()
+    benign_markers = ("road_line_broken", "broken_single", "broken")
+    if any(marker in text for marker in benign_markers):
+        return False
+    dangerous_markers = (
+        "vehicle",
+        "traffic_object",
+        "traffic_cone",
+        "traffic_barrier",
+        "road_line_solid",
+        "solid_single_white",
+        "road_edge",
+        "sidewalk",
+        "object",
+        "crash",
+    )
+    return any(marker in text for marker in dangerous_markers)
+
+
+def print_runtime_assurance_validation_stats(step_rows):
+    """Print checkpoint-level pre-first-cost runtime assurance diagnostics."""
+    if not step_rows:
+        print("[Runtime Assurance Validation] No step diagnostics collected.")
+        return
+
+    episodes = defaultdict(list)
+    for row in step_rows:
+        episodes[(row.get("env_id"), row.get("episode"))].append(row)
+
+    first_cost_events = []
+    inactive_first_cost = 0
+    recall_before_20 = 0
+    pre_cost_interventions = 0
+    post_cost_interventions = 0
+    cooldown_hard_risk_violations = 0
+    low_risk_unsafe_violations = 0
+    crash_attribution_counts = defaultdict(int)
+
+    for rows in episodes.values():
+        rows = sorted(rows, key=lambda item: int(item.get("step", 0) or 0))
+        first_cost_idx = -1
+        for idx, row in enumerate(rows):
+            if float(row.get("step_cost", row.get("cost", 0.0)) or 0.0) > 0.0:
+                first_cost_idx = idx
+                break
+        if first_cost_idx >= 0:
+            first_cost_events.append(rows[first_cost_idx])
+            first_row = rows[first_cost_idx]
+            if first_row.get("recovery_mode") == "inactive_raw_action" or str(first_row.get("selected_candidate_type", "")).startswith("raw_action"):
+                inactive_first_cost += 1
+            lookback = rows[max(0, first_cost_idx - 20):first_cost_idx + 1]
+            if any(bool(item.get("hard_risk", False)) or float(item.get("raw_predicted_cost_risk", 0.0) or 0.0) > 0.0 for item in lookback):
+                recall_before_20 += 1
+            pre_cost_interventions += sum(1 for item in rows[:first_cost_idx] if bool(item.get("filter_intervened", False)))
+            post_cost_interventions += sum(1 for item in rows[first_cost_idx:] if bool(item.get("filter_intervened", False)))
+
+            detected = any(
+                bool(item.get("hard_risk", False))
+                or bool(item.get("raw_predicted_collision", False))
+                or bool(item.get("raw_predicted_out_of_road", False))
+                or float(item.get("raw_predicted_cost_risk", 0.0) or 0.0) > 0.0
+                for item in lookback
+            )
+            no_candidate = any(item.get("intervention_reason", "") == "no_safe_candidate" for item in lookback)
+            action_limited = any(bool(item.get("action_limited_by_raw_delta", False)) for item in lookback)
+            first_intervention_idx = next((i for i, item in enumerate(rows[:first_cost_idx + 1]) if bool(item.get("filter_intervened", False))), -1)
+            post_contact = any(bool(item.get("post_contact_intervention", False)) for item in lookback)
+            if not detected:
+                crash_attribution_counts["risk_not_detected"] += 1
+            elif no_candidate:
+                crash_attribution_counts["detected_but_no_candidate"] += 1
+            elif action_limited:
+                crash_attribution_counts["detected_but_action_limited"] += 1
+            elif first_intervention_idx >= 0 and first_cost_idx - first_intervention_idx <= 2:
+                crash_attribution_counts["detected_but_too_late"] += 1
+            elif post_contact:
+                crash_attribution_counts["post_contact_stuck"] += 1
+
+        for row in rows:
+            if bool(row.get("hard_risk", False)) and (
+                row.get("fallback_reason") == "cooldown_or_passthrough"
+                or row.get("intervention_reason") == "cooldown"
+            ):
+                cooldown_hard_risk_violations += 1
+            if bool(row.get("low_risk_gate_passed", False)):
+                unsafe_low_risk = (
+                    contact_results_dangerous(row.get("contact_results"))
+                    or float(row.get("min_boundary_margin", float("inf")) or float("inf")) < PredictiveRecoveryConfig.hard_boundary_margin_for_intervention
+                    or float(row.get("nearest_static_object_distance", float("inf")) or float("inf")) < PredictiveRecoveryConfig.hard_static_distance_threshold
+                    or float(row.get("ttc_vehicle_min", float("inf")) or float("inf")) < PredictiveRecoveryConfig.hard_vehicle_ttc_threshold
+                    or float(row.get("ttc_static_min", float("inf")) or float("inf")) < PredictiveRecoveryConfig.hard_static_ttc_threshold
+                )
+                if unsafe_low_risk:
+                    low_risk_unsafe_violations += 1
+
+    total_first_cost = max(1, len(first_cost_events))
+    print("\n===== Runtime Assurance Validation =====")
+    print("first_cost_events={}".format(len(first_cost_events)))
+    print("first_cost_inactive_raw_action_rate={:.3f}".format(inactive_first_cost / total_first_cost))
+    print("first_cost_prev20_risk_recall={:.3f}".format(recall_before_20 / total_first_cost))
+    print("pre_first_cost_intervention_count={}".format(pre_cost_interventions))
+    print("post_first_cost_intervention_count={}".format(post_cost_interventions))
+    print("cooldown_hard_risk_violations={}".format(cooldown_hard_risk_violations))
+    print("low_risk_unsafe_violations={}".format(low_risk_unsafe_violations))
+    if crash_attribution_counts:
+        print("crash_attribution={}".format(";".join("{}:{}".format(k, crash_attribution_counts[k]) for k in sorted(crash_attribution_counts))))
 
 
 def append_recovery_episode_log(path, recovery_summary, episode_meta):
@@ -440,6 +599,7 @@ def evaluate_ppl_once(
     use_render=False,
     num_ep_in_one_env=5,
     total_env_num=50,
+    start_env_index=0,
     deterministic=True,
     enable_predictive_recovery=False,
     recovery_config=None,
@@ -460,6 +620,7 @@ def evaluate_ppl_once(
         use_render: Whether to render the environment
         num_ep_in_one_env: Episodes per environment seed
         total_env_num: Number of different environment seeds
+        start_env_index: Offset added to EVAL_ENV_START for the first evaluated seed
         deterministic: Whether the policy acts deterministically
         enable_predictive_recovery: Enable runtime assurance filter
         recovery_config: Configuration for the filter
@@ -515,6 +676,7 @@ def evaluate_ppl_once(
 
     # Step diagnostics for current episode
     current_ep_step_diagnostics = []
+    all_step_diagnostics = []
 
     try:
         start = time.time()
@@ -524,7 +686,8 @@ def evaluate_ppl_once(
         global_step_count = 0
         ep_times = []
 
-        env_index = 0
+        env_index = int(start_env_index)
+        end_env_index = env_index + int(total_env_num)
         num_ep_in = 0
         o = reset_eval_env(env, EVAL_ENV_START + env_index)
 
@@ -625,17 +788,41 @@ def evaluate_ppl_once(
                 "rss_lateral_margin": safety_info.get("rss_lateral_margin", float("inf")),
                 "rss_risk_score": safety_info.get("rss_risk_score", 0.0),
                 "contact_results": collision_info.get("contact_results", ""),
+                "actual_action_modified": safety_info.get("actual_action_modified", False),
+                "hard_risk": safety_info.get("hard_risk", False),
+                "hard_risk_reason": safety_info.get("hard_risk_reason", ""),
+                "low_risk_gate_passed": safety_info.get("low_risk_gate_passed", False),
+                "low_risk_gate_rejected_reason": safety_info.get("low_risk_gate_rejected_reason", ""),
+                "safety_hold_active": safety_info.get("safety_hold_active", False),
+                "safety_hold_remaining": safety_info.get("safety_hold_remaining", 0),
+                "recent_contact_steps": safety_info.get("recent_contact_steps", 0),
+                "nearest_static_object_type": safety_info.get("nearest_static_object_type", ""),
+                "nearest_static_object_distance": safety_info.get("nearest_static_object_distance", float("inf")),
+                "nearest_static_forward_distance": safety_info.get("nearest_static_forward_distance", float("inf")),
+                "nearest_static_lateral_gap": safety_info.get("nearest_static_lateral_gap", float("inf")),
+                "front_static_blocking_distance": safety_info.get("front_static_blocking_distance", float("inf")),
+                "static_distance_immediate_risk": safety_info.get("static_distance_immediate_risk", False),
+                "deadlock_escape_candidate": safety_info.get("deadlock_escape_candidate", False),
+                "ttc_vehicle_min": safety_info.get("ttc_vehicle_min", float("inf")),
+                "ttc_static_min": safety_info.get("ttc_static_min", float("inf")),
+                "boundary_closing_rate": safety_info.get("boundary_closing_rate", 0.0),
+                "pre_contact_intervention": safety_info.get("pre_contact_intervention", False),
+                "post_contact_intervention": safety_info.get("post_contact_intervention", False),
+                "first_risk_detected_step": safety_info.get("first_risk_detected_step", -1),
+                "risk_to_intervention_delay": safety_info.get("risk_to_intervention_delay", -1),
+                "intervention_to_first_cost_delay": safety_info.get("intervention_to_first_cost_delay", ""),
             }
 
             # Add safety_info fields
             if safety_info:
                 for key in ["raw_predicted_collision", "raw_predicted_out_of_road", "raw_predicted_cost_risk",
-                            "raw_min_vehicle_margin", "raw_min_boundary_margin", "raw_deadlock_risk",
+                            "raw_min_vehicle_margin", "raw_min_static_margin", "raw_min_boundary_margin", "raw_deadlock_risk",
+                            "raw_failure_reason",
                             "allow_intervention", "intervention_reason", "intervention_rejected_reason",
                             "candidate_predicted_collision", "candidate_predicted_out_of_road",
                             "candidate_predicted_cost_risk", "candidate_min_vehicle_margin",
-                            "candidate_min_boundary_margin", "vehicle_margin_worse",
-                            "intervention_score_gain"]:
+                            "candidate_min_static_margin", "candidate_min_boundary_margin", "vehicle_margin_worse",
+                            "intervention_score_gain", "exception_type", "exception_message", "exception_traceback"]:
                     if key in safety_info:
                         step_diagnostic[key] = safety_info.get(key)
 
@@ -645,11 +832,15 @@ def evaluate_ppl_once(
 
             # Store for episode analysis
             if safety_info:
+                safety_info["step"] = step_count
+                safety_info["cost"] = step_cost
                 safety_info["step_cost"] = step_cost
                 safety_info["episode_cost_so_far"] = episode_cost_so_far
+                safety_info["contact_results"] = collision_info.get("contact_results", "")
                 recovery_step_infos.append(safety_info)
 
             current_ep_step_diagnostics.append(step_diagnostic)
+            all_step_diagnostics.append(step_diagnostic)
 
             if use_render:
                 env.render()
@@ -736,7 +927,7 @@ def evaluate_ppl_once(
                 if num_ep_in >= num_ep_in_one_env:
                     env_index += 1
                     num_ep_in = 0
-                    if env_index >= total_env_num:
+                    if env_index >= end_env_index:
                         break
 
                 o = reset_eval_env(env, EVAL_ENV_START + env_index)
@@ -780,6 +971,7 @@ def evaluate_ppl_once(
     final_path = osp.join(folder_name, "{}.csv".format(ckpt_name))
     df.to_csv(final_path)
     print("Final results saved to: {}".format(final_path))
+    print_runtime_assurance_validation_stats(all_step_diagnostics)
 
     df["model_name"] = ckpt_name
     return df
@@ -828,6 +1020,15 @@ def analyze_episode_events(step_diagnostics, safety_info, cost_threshold):
         "first_cost_contact_type": "",
         "first_cost_raw_predicted_safe": False,
         "first_cost_emergency_check_missed": False,
+        "pre_first_cost_intervention_count": 0,
+        "post_first_cost_intervention_count": 0,
+        "first_hard_risk_step": -1,
+        "first_intervention_step": -1,
+        "missed_first_cost": False,
+        "late_intervention": False,
+        "low_risk_false_negative_count": 0,
+        "cooldown_false_negative_count": 0,
+        "crash_attribution": "",
     }
 
     if not step_diagnostics:
@@ -848,12 +1049,21 @@ def analyze_episode_events(step_diagnostics, safety_info, cost_threshold):
 
     for i, step in enumerate(step_diagnostics):
         step_num = i + 1
+        if result["first_hard_risk_step"] < 0 and bool(step.get("hard_risk", False)):
+            result["first_hard_risk_step"] = step_num
 
         # Cost analysis
         if step.get("cost", 0.0) > 0 or step.get("step_cost", 0.0) > 0:
             result["cost_steps_total"] += 1
             cost_streak += 1
             result["cost_streak_current"] = cost_streak
+            if bool(step.get("low_risk_gate_passed", False)):
+                result["low_risk_false_negative_count"] += 1
+            if (
+                step.get("fallback_reason", "") == "cooldown_or_passthrough"
+                or step.get("intervention_reason", "") == "cooldown"
+            ):
+                result["cooldown_false_negative_count"] += 1
 
             if not result["cost_started"]:
                 result["cost_started"] = True
@@ -947,7 +1157,7 @@ def analyze_episode_events(step_diagnostics, safety_info, cost_threshold):
                 result["crash_human_steps"] += 1
 
         # Contact analysis
-        if step.get("contact_results"):
+        if contact_results_nonempty(step.get("contact_results")):
             if result["first_contact_step"] < 0:
                 result["first_contact_step"] = step_num
             result["contact_steps_total"] += 1
@@ -966,10 +1176,15 @@ def analyze_episode_events(step_diagnostics, safety_info, cost_threshold):
         if step.get("filter_intervened", False):
             result["filter_intervention_count"] += 1
             last_intervention_step = step_num
+            if result["first_intervention_step"] < 0:
+                result["first_intervention_step"] = step_num
 
             # Check if this intervention is before first cost
             if result["first_cost_step"] < 0 or step_num < result["first_cost_step"]:
                 last_intervention_before_cost = step_num
+                result["pre_first_cost_intervention_count"] += 1
+            else:
+                result["post_first_cost_intervention_count"] += 1
 
             # Check if this intervention is before first crash
             if result["first_crash_step"] < 0 or step_num < result["first_crash_step"]:
@@ -1010,6 +1225,45 @@ def analyze_episode_events(step_diagnostics, safety_info, cost_threshold):
     if last_intervention_before_crash > 0 and result["first_crash_step"] > 0:
         if last_intervention_before_crash < result["first_crash_step"]:
             result["first_crash_after_intervention_step"] = result["first_crash_step"]
+
+    result["missed_first_cost"] = bool(
+        result["first_cost_step"] > 0
+        and (result["first_intervention_step"] < 0 or result["first_intervention_step"] >= result["first_cost_step"])
+    )
+    result["late_intervention"] = bool(
+        result["first_cost_step"] > 0
+        and result["first_intervention_step"] > 0
+        and result["first_cost_step"] - result["first_intervention_step"] <= 2
+    )
+
+    if result["first_crash_step"] > 0 or result["first_cost_step"] > 0:
+        event_step = result["first_crash_step"] if result["first_crash_step"] > 0 else result["first_cost_step"]
+        lookback = step_diagnostics[max(0, event_step - 21):event_step]
+        detected = any(
+            bool(item.get("hard_risk", False))
+            or bool(item.get("raw_predicted_collision", False))
+            or bool(item.get("raw_predicted_out_of_road", False))
+            or float(item.get("raw_predicted_cost_risk", 0.0) or 0.0) > 0.0
+            for item in lookback
+        )
+        intervened = any(bool(item.get("filter_intervened", False)) for item in lookback)
+        no_candidate = any(item.get("intervention_reason", "") == "no_safe_candidate" for item in lookback)
+        action_limited = any(bool(item.get("action_limited_by_raw_delta", False)) for item in lookback)
+        post_contact = any(bool(item.get("post_contact_intervention", False)) for item in lookback)
+        if not detected:
+            result["crash_attribution"] = "risk_not_detected"
+        elif no_candidate:
+            result["crash_attribution"] = "detected_but_no_candidate"
+        elif action_limited:
+            result["crash_attribution"] = "detected_but_action_limited"
+        elif result["late_intervention"]:
+            result["crash_attribution"] = "detected_but_too_late"
+        elif post_contact and not intervened:
+            result["crash_attribution"] = "post_contact_stuck"
+        elif post_contact:
+            result["crash_attribution"] = "post_contact_stuck"
+        else:
+            result["crash_attribution"] = "detected_but_not_prevented"
 
     # Determine high cost reason
     if result["high_cost_episode"]:
@@ -1092,6 +1346,15 @@ def build_high_cost_episode_row(res, episode_analysis, recovery_summary, ep_num,
         "filter_intervention_count": episode_analysis.get("filter_intervention_count", 0),
         "last_intervention_before_first_cost": episode_analysis.get("last_intervention_before_first_cost", -1),
         "last_intervention_before_first_crash": episode_analysis.get("last_intervention_before_first_crash", -1),
+        "pre_first_cost_intervention_count": episode_analysis.get("pre_first_cost_intervention_count", 0),
+        "post_first_cost_intervention_count": episode_analysis.get("post_first_cost_intervention_count", 0),
+        "first_hard_risk_step": episode_analysis.get("first_hard_risk_step", -1),
+        "first_intervention_step": episode_analysis.get("first_intervention_step", -1),
+        "missed_first_cost": episode_analysis.get("missed_first_cost", False),
+        "late_intervention": episode_analysis.get("late_intervention", False),
+        "low_risk_false_negative_count": episode_analysis.get("low_risk_false_negative_count", 0),
+        "cooldown_false_negative_count": episode_analysis.get("cooldown_false_negative_count", 0),
+        "crash_attribution": episode_analysis.get("crash_attribution", ""),
         "high_cost_reason_guess": episode_analysis.get("high_cost_reason_guess", ""),
     }
     return row
@@ -1116,6 +1379,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_render", action="store_true", help="Enable rendering.")
     parser.add_argument("--num_ep_in_one_env", type=int, default=1, help="Episodes per environment seed.")
     parser.add_argument("--total_env_num", type=int, default=50, help="Number of environment seeds.")
+    parser.add_argument("--start_env_index", type=int, default=0, help="Start offset from EVAL_ENV_START.")
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic policy during evaluation.")
     parser.add_argument("--progress_interval", type=int, default=0, help="Print progress every N steps. 0 disables.")
 
@@ -1155,7 +1419,7 @@ if __name__ == "__main__":
         ret = evaluate_ppl_once(
             ckpt_path=args.path, ckpt_index=0, folder_name=args.ret_save_folder,
             use_render=args.use_render, num_ep_in_one_env=args.num_ep_in_one_env,
-            total_env_num=args.total_env_num, deterministic=deterministic,
+            total_env_num=args.total_env_num, start_env_index=args.start_env_index, deterministic=deterministic,
             enable_predictive_recovery=args.enable_predictive_recovery,
             recovery_config=recovery_config, progress_interval=args.progress_interval,
             recovery_episode_log_csv=args.recovery_episode_log_csv,
@@ -1172,7 +1436,7 @@ if __name__ == "__main__":
         ret = evaluate_ppl_once(
             ckpt_path=args.path, ckpt_index=args.ckpt_index, folder_name=args.ret_save_folder,
             use_render=args.use_render, num_ep_in_one_env=args.num_ep_in_one_env,
-            total_env_num=args.total_env_num, deterministic=deterministic,
+            total_env_num=args.total_env_num, start_env_index=args.start_env_index, deterministic=deterministic,
             enable_predictive_recovery=args.enable_predictive_recovery,
             recovery_config=recovery_config, progress_interval=args.progress_interval,
             recovery_episode_log_csv=args.recovery_episode_log_csv,
@@ -1193,7 +1457,7 @@ if __name__ == "__main__":
             ret = evaluate_ppl_once(
                 ckpt_path=args.path, ckpt_index=ckpt_index, folder_name=args.ret_save_folder,
                 use_render=args.use_render, num_ep_in_one_env=args.num_ep_in_one_env,
-                total_env_num=args.total_env_num, deterministic=deterministic,
+                total_env_num=args.total_env_num, start_env_index=args.start_env_index, deterministic=deterministic,
                 enable_predictive_recovery=args.enable_predictive_recovery,
                 recovery_config=recovery_config, progress_interval=args.progress_interval,
                 recovery_episode_log_csv=args.recovery_episode_log_csv,

@@ -2,6 +2,7 @@ import csv
 import math
 import os
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -71,6 +72,7 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "raw_min_boundary_margin",
     "raw_deadlock_risk",
     "raw_total_score",
+    "raw_failure_reason",
     # 接管判断（核心）
     "allow_intervention",
     "intervention_reason",
@@ -120,6 +122,31 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "nearest_static_object_distance",
     "contact_state_detected",
     "front_blocking_distance",
+    # Hard-risk and safety-hold diagnostics
+    "hard_risk",
+    "hard_risk_reason",
+    "low_risk_gate_passed",
+    "low_risk_gate_rejected_reason",
+    "safety_hold_active",
+    "safety_hold_remaining",
+    "recent_contact_steps",
+    "nearest_static_object_type",
+    "nearest_static_forward_distance",
+    "nearest_static_lateral_gap",
+    "front_static_blocking_distance",
+    "static_distance_immediate_risk",
+    "deadlock_escape_candidate",
+    "ttc_vehicle_min",
+    "ttc_static_min",
+    "boundary_closing_rate",
+    "pre_contact_intervention",
+    "post_contact_intervention",
+    "first_risk_detected_step",
+    "risk_to_intervention_delay",
+    "intervention_to_first_cost_delay",
+    "exception_type",
+    "exception_message",
+    "exception_traceback",
 ]
 
 
@@ -182,7 +209,7 @@ class PredictiveRecoveryConfig:
     ultra_low_progress_steps: int = 5
     ultra_front_block_distance: float = 25.0
     ultra_front_lateral_window: float = 2.8
-    max_lateral_without_blocker: float = 0.35
+    max_lateral_without_blocker: float = 1.00
     max_lateral_when_frenet_unstable: float = 0.5
 
     # === 接管限制 ===
@@ -194,6 +221,9 @@ class PredictiveRecoveryConfig:
     max_interventions_per_episode: int = 10
     min_steps_between_interventions: int = 10
     intervention_cooldown_steps: int = 10
+    safety_hold_steps: int = 8
+    safety_release_clean_steps: int = 5
+    disable_cooldown_passthrough_on_hard_risk: bool = True
 
     # === 车辆碰撞硬约束 ===
     hard_vehicle_lateral_margin: float = 0.80
@@ -206,6 +236,29 @@ class PredictiveRecoveryConfig:
     min_boundary_margin_for_bypass: float = 0.60  # 提高阈值
     min_vehicle_margin_for_intervention: float = 0.60  # 新增：接管最低车辆 margin
     comfort_boundary_margin: float = 1.00
+    low_risk_min_boundary_margin: float = 1.20
+    low_risk_min_vehicle_margin: float = 4.00
+    low_risk_min_static_distance: float = 6.00
+    hard_boundary_margin_for_intervention: float = 0.80
+    hard_static_distance_threshold: float = 6.00
+    hard_vehicle_ttc_threshold: float = 2.00
+    hard_static_ttc_threshold: float = 2.00
+    soft_static_cost_weight: float = 0.08
+    recent_contact_window: int = 5
+    pre_contact_ttc_threshold: float = 1.50
+    pre_contact_static_min_distance: float = 4.00
+    pre_contact_static_time_headway: float = 0.60
+    static_distance_front_blocking_threshold: float = 6.00
+    static_distance_ttc_risk_threshold: float = 3.00
+    deadlock_escape_low_progress_steps: int = 25
+    deadlock_escape_min_boundary_margin: float = 1.50
+    deadlock_escape_min_vehicle_margin: float = 0.75
+    deadlock_escape_min_static_margin: float = 0.25
+    deadlock_release_low_progress_steps: int = 30
+    deadlock_release_min_boundary_margin: float = 1.20
+    deadlock_release_persist_steps: int = 20
+    stop_candidate_low_progress_penalty: float = 18.0
+    low_risk_high_throttle_threshold: float = 0.35
 
     # === 调试 ===
     _debug_shadow_record: bool = False
@@ -295,6 +348,8 @@ class TrajectoryRollout:
     predicted_collision: bool = False
     predicted_out_of_road: bool = False
     predicted_cost_risk: float = 0.0
+    first_collision_time: float = float("inf")
+    first_out_of_road_time: float = float("inf")
 
 
 @dataclass
@@ -1016,23 +1071,39 @@ class PredictiveRecoveryFilter:
         # 前一时刻的 safe action（用于限幅）
         self._prev_safe_steer: Optional[float] = None
         self._prev_safe_acc: Optional[float] = None
+        self._last_safe_action: Optional[np.ndarray] = None
 
         # 记录状态
         self._last_vehicle_margin_min: float = float("inf")
         self._last_static_margin_min: float = float("inf")
         self._last_rss_lateral_margin: float = float("inf")
+        self._step_index_this_ep: int = 0
+        self._recent_contact_step_indices: List[int] = []
+        self._safety_hold_remaining: int = 0
+        self._safety_release_clean_count: int = 0
+        self._first_risk_detected_step: int = -1
+        self._first_intervention_step: int = -1
+        self._route_deviation_history: List[float] = []
+        self._boundary_contact_escape_steps: int = 0
+        self._boundary_contact_escape_steer: float = 0.0
+        self._ultra_short_vehicle_deadlock_steps: int = 0
+        self._deadlock_release_remaining: int = 0
 
     def filter(self, env: Any, obs: Any, raw_action: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
         del obs
         start = time.time()
         raw_action_np = self._coerce_action(raw_action)
         info = self._empty_info()
+        self._step_index_this_ep += 1
 
         # 调试标记
         info["debug_shadow_record"] = self.config._debug_shadow_record
         info["intervention_count_this_ep"] = self._intervention_count_this_ep
         info["cooldown_remaining"] = self._cooldown_remaining
         info["temporary_passthrough"] = self._temporary_passthrough
+        info["safety_hold_active"] = self._safety_hold_remaining > 0
+        info["safety_hold_remaining"] = self._safety_hold_remaining
+        info["first_risk_detected_step"] = self._first_risk_detected_step
 
         try:
             vehicle = _get_ego_vehicle(env)
@@ -1041,6 +1112,11 @@ class PredictiveRecoveryFilter:
             ego_speed = _get_speed(vehicle, 0.0)
             ego_length, ego_width = _get_size(vehicle)
             max_steer_rad = self._max_steer_rad(vehicle)
+            contact_state, contact_info = self._contact_state(vehicle)
+            any_contact_state = self._any_contact_results(vehicle)
+            self._update_recent_contact_steps(contact_state)
+            info["contact_state_detected"] = any_contact_state
+            info["recent_contact_steps"] = len(self._recent_contact_step_indices)
 
             # ===== cost streak 熔断检查 =====
             # 获取当前 step 的 cost
@@ -1086,6 +1162,97 @@ class PredictiveRecoveryFilter:
             info["ultra_light_gate_reason"] = gate_reason
             info["ultra_light_gate_passed"] = True
 
+            emergency_check_result = self._ultra_short_horizon_emergency_check(
+                env, vehicle, ego_pos, ego_heading, ego_speed, raw_action_np
+            )
+            for key in ["emergency_detected", "emergency_reason", "nearest_vehicle_distance",
+                        "nearest_static_object_distance", "contact_state_detected", "front_blocking_distance"]:
+                if key in emergency_check_result:
+                    info[key] = emergency_check_result[key]
+            if emergency_check_result.get("emergency_detected", False):
+                reason = emergency_check_result.get("emergency_reason", "ultra_short_horizon_emergency")
+                self._enter_safety_hold(reason)
+                return_hard_risk_reason = reason
+                if self._is_traffic_object_contact_reason(reason):
+                    self._ultra_short_vehicle_deadlock_steps = 0
+                    self._reset_boundary_contact_escape()
+                    safe_action = self._traffic_object_contact_escape_action(vehicle, raw_action_np)
+                    selected_candidate_type = "traffic_object_contact_escape"
+                    post_contact_intervention = True
+                    pre_contact_intervention = False
+                    recovery_mode = "contact_escape"
+                elif self._is_boundary_contact_reason(reason):
+                    self._ultra_short_vehicle_deadlock_steps = 0
+                    boundary_frame = None
+                    boundary_projection = None
+                    try:
+                        boundary_frame = self._get_route_frame(env, vehicle, ego_pos)
+                        boundary_projection = (
+                            boundary_frame.project_point(ego_pos, ego_heading)
+                            if ego_pos is not None
+                            else FrenetProjection(False, reason="missing_ego_position")
+                        )
+                    except Exception:
+                        boundary_frame = None
+                        boundary_projection = None
+                    safe_action = self._boundary_contact_recovery_action(
+                        vehicle,
+                        raw_action_np,
+                        boundary_frame,
+                        boundary_projection,
+                        ego_width,
+                    )
+                    selected_candidate_type = "ultra_short_boundary_recovery"
+                    post_contact_intervention = False
+                    pre_contact_intervention = True
+                    recovery_mode = "ultra_short_horizon_emergency"
+                elif self._ultra_short_vehicle_progress_release_ready(reason, ego_speed, any_contact_state, raw_action_np):
+                    self._reset_boundary_contact_escape()
+                    if self._deadlock_release_remaining <= 0:
+                        self._deadlock_release_remaining = int(self.config.deadlock_release_persist_steps)
+                    else:
+                        self._deadlock_release_remaining -= 1
+                    self._safety_hold_remaining = 0
+                    self._safety_release_clean_count = 0
+                    safe_action = self._deadlock_progress_release_action(vehicle, raw_action_np)
+                    selected_candidate_type = "deadlock_progress_release"
+                    post_contact_intervention = False
+                    pre_contact_intervention = True
+                    recovery_mode = "deadlock_progress_release"
+                    return_hard_risk_reason = ""
+                elif self._ultra_short_vehicle_deadlock_escape_ready(reason, ego_speed, any_contact_state):
+                    self._reset_boundary_contact_escape()
+                    safe_action = self._vehicle_deadlock_escape_action(vehicle, raw_action_np)
+                    selected_candidate_type = "vehicle_deadlock_escape"
+                    post_contact_intervention = False
+                    pre_contact_intervention = True
+                    recovery_mode = "vehicle_deadlock_escape"
+                    info["deadlock_escape_candidate"] = True
+                else:
+                    if not str(reason).startswith("vehicle_collision_step"):
+                        self._ultra_short_vehicle_deadlock_steps = 0
+                    self._reset_boundary_contact_escape()
+                    safe_action = np.array([0.0, -0.8], dtype=np.float32)
+                    selected_candidate_type = "ultra_short_horizon_emergency_stop"
+                    post_contact_intervention = False
+                    pre_contact_intervention = True
+                    recovery_mode = "ultra_short_horizon_emergency"
+                return self._return_recovery_action(
+                    safe_action,
+                    raw_action_np,
+                    info,
+                    start,
+                    recovery_mode=recovery_mode,
+                    selected_candidate_type=selected_candidate_type,
+                    fallback_reason=reason,
+                    intervention_reason=reason,
+                    hard_risk_reason=return_hard_risk_reason,
+                    pre_contact=pre_contact_intervention,
+                    post_contact=post_contact_intervention,
+                )
+            self._reset_boundary_contact_escape()
+            self._ultra_short_vehicle_deadlock_steps = 0
+
             # 车辆风险标志 - 立即最小风险停车
             if gate_reason == "vehicle_risk_flag":
                 # 检查是否已经 contact/crash
@@ -1129,117 +1296,37 @@ class PredictiveRecoveryFilter:
                     "fallback_reason": fallback_reason,
                     "route_cache_hit": False,
                     "ultra_light_gate_passed": False,
+                    "allow_intervention": True,
                     "intervention_reason": "vehicle_risk_flag",
                     "filter_intervened": action_modified,
                     "actual_action_modified": action_modified,
                     "contact_state_detected": contact_state,
+                    "hard_risk": True,
+                    "hard_risk_reason": fallback_reason,
+                    "post_contact_intervention": contact_state,
+                    "pre_contact_intervention": not contact_state,
                 })
+                self._record_hard_risk(fallback_reason)
                 self._last_recovery_active = True
                 self._intervention_count_this_ep += 1
-                self._last_intervention_step = self._intervention_count_this_ep
+                self._last_intervention_step = self._step_index_this_ep
+                if self._first_intervention_step < 0:
+                    self._first_intervention_step = self._step_index_this_ep
                 self._cooldown_remaining = self.config.intervention_cooldown_steps
+                self._enter_safety_hold(fallback_reason)
+                self._last_safe_action = safe_action.copy()
                 elapsed_ms = (time.time() - start) * 1000.0
                 info["filter_time_ms"] = elapsed_ms
                 if elapsed_ms > self.config.filter_time_warn_ms:
                     info["filter_time_warning"] = True
                 return safe_action, info
 
-            # 低风险场景 - 直接返回 raw_action，不构建道路、不解析场景、不生成候选
-            # 但在此之前，先做 ultra-short-horizon emergency check（必须在 low_risk_passthrough 之前）
-            if gate_reason == "low_risk_passthrough":
-                emergency_check_result = self._ultra_short_horizon_emergency_check(
-                    env, vehicle, ego_pos, ego_heading, ego_speed, raw_action_np
-                )
-                if emergency_check_result["emergency_detected"]:
-                    # 紧急检查发现问题，返回 emergency_stop
-                    safe_action = np.array([0.0, -0.8], dtype=np.float32)  # 紧急刹车
-                    action_modified = (
-                        abs(safe_action[0] - raw_action_np[0]) > 1e-3
-                        or abs(safe_action[1] - raw_action_np[1]) > 1e-3
-                    )
-                    info.update({
-                        "recovery_mode": "ultra_short_horizon_emergency",
-                        "recovery_certified": False,
-                        "accepted_by_filter": True,
-                        "model_predicted_safe": False,
-                        "selected_candidate_type": "ultra_short_horizon_emergency_stop",
-                        "collision_free": True,
-                        "boundary_safe": True,
-                        "control_feasible": True,
-                        "fallback_reason": emergency_check_result["emergency_reason"],
-                        "route_cache_hit": False,
-                        "ultra_light_gate_passed": True,
-                        "allow_intervention": False,
-                        "intervention_reason": emergency_check_result["emergency_reason"],
-                        "filter_intervened": action_modified,
-                        "actual_action_modified": action_modified,
-                    })
-                    # 记录 emergency check 详情
-                    for key in ["emergency_detected", "emergency_reason", "nearest_vehicle_distance",
-                                "nearest_static_object_distance", "contact_state_detected", "front_blocking_distance"]:
-                        if key in emergency_check_result:
-                            info[key] = emergency_check_result[key]
-                    self._last_recovery_active = True
-                    self._intervention_count_this_ep += 1
-                    self._last_intervention_step = self._intervention_count_this_ep
-                    self._cooldown_remaining = self.config.intervention_cooldown_steps
-                    elapsed_ms = (time.time() - start) * 1000.0
-                    info["filter_time_ms"] = elapsed_ms
-                    return safe_action, info
-
-                safe_action = raw_action_np.astype(np.float32)
-                info.update({
-                    "recovery_mode": "inactive_raw_action",
-                    "recovery_certified": False,
-                    "accepted_by_filter": False,
-                    "model_predicted_safe": False,
-                    "selected_candidate_type": "raw_action",
-                    "collision_free": True,
-                    "boundary_safe": True,
-                    "control_feasible": True,
-                    "fallback_reason": "low_risk_passthrough",
-                    "route_cache_hit": False,
-                    "ultra_light_gate_passed": True,
-                    "allow_intervention": False,
-                    "intervention_reason": "none",
-                    "filter_intervened": False,
-                    "actual_action_modified": False,
-                })
-                self._last_recovery_active = False
-                self._reset_prev_safe()
-                elapsed_ms = (time.time() - start) * 1000.0
-                info["filter_time_ms"] = elapsed_ms
-                return safe_action, info
-
             # ===== 更新 cooldown ===
             if self._cooldown_remaining > 0:
                 self._cooldown_remaining -= 1
 
-            # ===== 检查是否在 cooldown 或 temporary passthrough ===
-            if self._cooldown_remaining > 0 or self._temporary_passthrough:
-                safe_action = raw_action_np.astype(np.float32)
-                info.update({
-                    "recovery_mode": "inactive_raw_action",
-                    "recovery_certified": False,
-                    "accepted_by_filter": False,
-                    "model_predicted_safe": False,
-                    "selected_candidate_type": "raw_action",
-                    "collision_free": True,
-                    "boundary_safe": True,
-                    "control_feasible": True,
-                    "fallback_reason": "cooldown_or_passthrough",
-                    "route_cache_hit": False,
-                    "ultra_light_gate_passed": True,
-                    "allow_intervention": False,
-                    "intervention_reason": "cooldown" if self._cooldown_remaining > 0 else "temporary_passthrough",
-                    "filter_intervened": False,
-                    "actual_action_modified": False,
-                })
-                self._last_recovery_active = False
-                self._reset_prev_safe()
-                elapsed_ms = (time.time() - start) * 1000.0
-                info["filter_time_ms"] = elapsed_ms
-                return safe_action, info
+            # Cooldown is diagnostic/backoff only. It must not bypass hard-risk checks.
+            info["cooldown_remaining"] = self._cooldown_remaining
 
             # ===== 步骤1：构建道路坐标（仅当需要时） =====
             frame = self._get_route_frame(env, vehicle, ego_pos)
@@ -1253,34 +1340,6 @@ class PredictiveRecoveryFilter:
             info.update(scene_info)
             blocking_distance = _safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))
             has_front_blocker = np.isfinite(blocking_distance)
-
-            # 无前方阻塞物时 - 返回 raw_action（除非有明确风险信号）
-            if not has_front_blocker:
-                if gate_reason == "raw_action_brake" or gate_reason == "low_speed_low_progress":
-                    # 明确的减速/卡死风险，允许候选替换
-                    pass
-                else:
-                    safe_action = raw_action_np.astype(np.float32)
-                    info.update({
-                        "recovery_mode": "inactive_raw_action",
-                        "recovery_certified": False,
-                        "accepted_by_filter": False,
-                        "model_predicted_safe": False,
-                        "selected_candidate_type": "raw_action_no_front_blocker",
-                        "fallback_reason": "no_front_blocking_object",
-                        "route_cache_hit": bool(self._last_route_cache_hit),
-                        "route_build_time_ms": route_build_time_ms,
-                        "scene_parse_time_ms": scene_parse_time_ms,
-                        "allow_intervention": False,
-                        "intervention_reason": "no_front_blocker",
-                        "filter_intervened": False,
-                        "actual_action_modified": False,
-                    })
-                    self._last_recovery_active = False
-                    self._reset_prev_safe()
-                    elapsed_ms = (time.time() - start) * 1000.0
-                    info["filter_time_ms"] = elapsed_ms
-                    return np.asarray(safe_action, dtype=np.float32), info
 
             # ===== 步骤3：生成候选规范 =====
             candidate_specs = self._generate_candidate_specs(
@@ -1307,6 +1366,7 @@ class PredictiveRecoveryFilter:
                 ego_width,
                 raw_action_np,
                 scene_info,
+                objects,
             )
             info.update({
                 "raw_predicted_collision": raw_eval.get("predicted_collision", False),
@@ -1317,77 +1377,177 @@ class PredictiveRecoveryFilter:
                 "raw_min_boundary_margin": raw_eval.get("min_boundary_margin", float("inf")),
                 "raw_deadlock_risk": raw_eval.get("deadlock_risk", 0.0),
                 "raw_total_score": raw_eval.get("total_score", float("inf")),
+                "raw_failure_reason": raw_eval.get("failure_reason", ""),
             })
 
-            # 如果 raw_action 预测安全，直接返回
-            if raw_eval.get("predicted_collision", False) == False and raw_eval.get("predicted_out_of_road", False) == False:
-                if raw_eval.get("cost_risk", 0.0) < 1.0 and raw_eval.get("deadlock_risk", 0.0) < 2.0:
-                    # 在返回 raw_action_safe 之前，再次做 ultra-short-horizon emergency check
-                    emergency_check = self._ultra_short_horizon_emergency_check(
-                        env, vehicle, ego_pos, ego_heading, ego_speed, raw_action_np
-                    )
-                    if emergency_check["emergency_detected"]:
-                        # 紧急检查发现问题，返回 emergency_stop
-                        safe_action = np.array([0.0, -0.8], dtype=np.float32)
-                        action_modified = (
-                            abs(safe_action[0] - raw_action_np[0]) > 1e-3
-                            or abs(safe_action[1] - raw_action_np[1]) > 1e-3
-                        )
-                        info.update({
-                            "recovery_mode": "ultra_short_horizon_emergency",
-                            "recovery_certified": False,
-                            "accepted_by_filter": True,
-                            "model_predicted_safe": False,
-                            "selected_candidate_type": "ultra_short_horizon_emergency_stop",
-                            "collision_free": True,
-                            "boundary_safe": True,
-                            "control_feasible": True,
-                            "fallback_reason": emergency_check["emergency_reason"],
-                            "route_cache_hit": bool(self._last_route_cache_hit),
-                            "route_build_time_ms": route_build_time_ms,
-                            "scene_parse_time_ms": scene_parse_time_ms,
-                            "allow_intervention": False,
-                            "intervention_reason": emergency_check["emergency_reason"],
-                            "filter_intervened": action_modified,
-                            "actual_action_modified": action_modified,
-                        })
-                        # 记录 emergency check 详情
-                        for key in ["emergency_detected", "emergency_reason", "nearest_vehicle_distance",
-                                    "nearest_static_object_distance", "contact_state_detected", "front_blocking_distance"]:
-                            if key in emergency_check:
-                                info[key] = emergency_check[key]
-                        self._last_recovery_active = True
-                        self._intervention_count_this_ep += 1
-                        self._last_intervention_step = self._intervention_count_this_ep
-                        self._cooldown_remaining = self.config.intervention_cooldown_steps
-                        elapsed_ms = (time.time() - start) * 1000.0
-                        info["filter_time_ms"] = elapsed_ms
-                        return safe_action, info
+            risk_metrics = self._risk_metrics(
+                objects,
+                frame,
+                ego_projection,
+                ego_pos,
+                ego_heading,
+                ego_speed,
+                ego_length,
+                ego_width,
+                raw_action_np,
+            )
+            info.update(risk_metrics)
+            risk_metrics["any_contact_results"] = any_contact_state
+            static_distance_immediate_risk = self._static_distance_is_immediate_risk(
+                raw_eval,
+                risk_metrics,
+                ego_speed,
+                self.config.hard_static_distance_threshold,
+            )
+            info["static_distance_immediate_risk"] = static_distance_immediate_risk
+            info["deadlock_escape_candidate"] = self._raw_collision_deadlock_escape_candidate(raw_eval, risk_metrics)
+            self._update_route_deviation_history(ego_projection)
 
-                    safe_action = raw_action_np.astype(np.float32)
-                    info.update({
-                        "recovery_mode": "inactive_raw_action",
-                        "recovery_certified": False,
-                        "accepted_by_filter": False,
-                        "model_predicted_safe": True,
-                        "selected_candidate_type": "raw_action_safe",
-                        "collision_free": True,
-                        "boundary_safe": True,
-                        "control_feasible": True,
-                        "fallback_reason": "raw_action_predicted_safe",
-                        "route_cache_hit": bool(self._last_route_cache_hit),
-                        "route_build_time_ms": route_build_time_ms,
-                        "scene_parse_time_ms": scene_parse_time_ms,
-                        "allow_intervention": False,
-                        "intervention_reason": "raw_action_safe",
-                        "filter_intervened": False,
-                        "actual_action_modified": False,
-                    })
-                    self._last_recovery_active = False
-                    self._reset_prev_safe()
-                    elapsed_ms = (time.time() - start) * 1000.0
-                    info["filter_time_ms"] = elapsed_ms
-                    return safe_action, info
+            hard_risk, hard_risk_reason = self._hard_risk_detected(
+                raw_eval,
+                risk_metrics,
+                contact_state,
+                self._safety_hold_remaining > 0,
+                ego_speed,
+            )
+            info["hard_risk"] = hard_risk
+            info["hard_risk_reason"] = hard_risk_reason
+            if hard_risk:
+                self._record_hard_risk(hard_risk_reason)
+
+            pre_contact = self._pre_contact_risk_detector(raw_eval, risk_metrics, ego_speed)
+            if pre_contact.get("emergency_detected", False):
+                reason = pre_contact.get("emergency_reason", "pre_contact_emergency")
+                selected_type = (
+                    "pre_contact_boundary_recovery"
+                    if self._is_boundary_contact_reason(reason) or "boundary" in reason or "route" in reason
+                    else "pre_contact_emergency_stop"
+                )
+                hold_reason = "" if selected_type == "pre_contact_boundary_recovery" else reason
+                if selected_type == "pre_contact_boundary_recovery":
+                    self._safety_hold_remaining = 0
+                    self._safety_release_clean_count = 0
+                safe_action = self._pre_contact_recovery_action(
+                    vehicle, raw_action_np, selected_type, ego_projection, frame, ego_width
+                )
+                return self._return_recovery_action(
+                    safe_action,
+                    raw_action_np,
+                    info,
+                    start,
+                    recovery_mode="pre_contact_emergency",
+                    selected_candidate_type=selected_type,
+                    fallback_reason=reason,
+                    intervention_reason=reason,
+                    hard_risk_reason=hold_reason,
+                    pre_contact=True,
+                )
+
+            if self._deadlock_release_remaining > 0:
+                if self._deadlock_progress_release_allowed(
+                    raw_eval,
+                    risk_metrics,
+                    contact_state,
+                    current_cost,
+                    require_low_progress=False,
+                ):
+                    self._deadlock_release_remaining -= 1
+                    self._safety_hold_remaining = 0
+                    self._safety_release_clean_count = 0
+                    safe_action = self._deadlock_progress_release_action(vehicle, raw_action_np)
+                    return self._return_recovery_action(
+                        safe_action,
+                        raw_action_np,
+                        info,
+                        start,
+                        recovery_mode="deadlock_progress_release",
+                        selected_candidate_type="deadlock_progress_release",
+                        fallback_reason="low_progress_release_persist",
+                        intervention_reason="low_progress_release",
+                        pre_contact=True,
+                    )
+                self._deadlock_release_remaining = 0
+
+            if self._deadlock_progress_release_allowed(raw_eval, risk_metrics, contact_state, current_cost):
+                self._deadlock_release_remaining = int(self.config.deadlock_release_persist_steps)
+                self._safety_hold_remaining = 0
+                self._safety_release_clean_count = 0
+                safe_action = self._deadlock_progress_release_action(vehicle, raw_action_np)
+                return self._return_recovery_action(
+                    safe_action,
+                    raw_action_np,
+                    info,
+                    start,
+                    recovery_mode="deadlock_progress_release",
+                    selected_candidate_type="deadlock_progress_release",
+                    fallback_reason="low_progress_release",
+                    intervention_reason="low_progress_release",
+                    pre_contact=True,
+                )
+
+            if self._safety_hold_remaining > 0 and not hard_risk:
+                if self._safety_hold_release_clean(raw_eval, risk_metrics, contact_state):
+                    self._safety_release_clean_count += 1
+                else:
+                    self._safety_release_clean_count = 0
+                if self._safety_release_clean_count < self.config.safety_release_clean_steps:
+                    self._safety_hold_remaining = max(0, self._safety_hold_remaining - 1)
+                    if self._safety_hold_remaining > 0:
+                        safe_action = self._safety_hold_action(vehicle, raw_action_np)
+                        return self._return_recovery_action(
+                            safe_action,
+                            raw_action_np,
+                            info,
+                            start,
+                            recovery_mode="safety_hold",
+                            selected_candidate_type="safety_hold_recovery",
+                            fallback_reason="recent_emergency_safety_hold",
+                            intervention_reason="safety_hold",
+                            hard_risk_reason="recent_emergency_safety_hold",
+                            pre_contact=not contact_state,
+                            post_contact=contact_state,
+                            keep_existing_hold=True,
+                        )
+                    self._safety_release_clean_count = 0
+                else:
+                    self._safety_hold_remaining = 0
+                    self._safety_release_clean_count = 0
+            elif self._safety_hold_remaining > 0 and hard_risk:
+                self._safety_hold_remaining = max(0, self._safety_hold_remaining - 1)
+
+            low_risk_passed, low_risk_reject_reason = self._low_risk_fast_path(
+                raw_eval,
+                risk_metrics,
+                contact_state,
+                gate_reason,
+            )
+            info["low_risk_gate_passed"] = low_risk_passed
+            info["low_risk_gate_rejected_reason"] = low_risk_reject_reason
+            if low_risk_passed:
+                safe_action = raw_action_np.astype(np.float32)
+                info.update({
+                    "recovery_mode": "inactive_raw_action",
+                    "recovery_certified": False,
+                    "accepted_by_filter": False,
+                    "model_predicted_safe": True,
+                    "selected_candidate_type": "raw_action_safe",
+                    "collision_free": True,
+                    "boundary_safe": True,
+                    "control_feasible": True,
+                    "fallback_reason": "low_risk_verified_passthrough",
+                    "route_cache_hit": bool(self._last_route_cache_hit),
+                    "route_build_time_ms": route_build_time_ms,
+                    "scene_parse_time_ms": scene_parse_time_ms,
+                    "allow_intervention": False,
+                    "intervention_reason": "low_risk_verified",
+                    "filter_intervened": False,
+                    "actual_action_modified": False,
+                })
+                self._last_recovery_active = False
+                self._reset_prev_safe()
+                elapsed_ms = (time.time() - start) * 1000.0
+                info["filter_time_ms"] = elapsed_ms
+                return safe_action, info
 
             # ===== 步骤5：Rollout 候选并边展开边淘汰 =====
             safe_rollouts: List[Tuple[TrajectoryScore, TrajectoryRollout]] = []
@@ -1466,8 +1626,13 @@ class PredictiveRecoveryFilter:
                 best_score, best_rollout = min(safe_rollouts, key=lambda item: item[0].total_score)
 
                 # 检查接管条件
+                raw_collision_hard_for_intervention = (
+                    bool(raw_eval.get("predicted_collision", False))
+                    and _safe_float(raw_eval.get("collision_time"), float("inf")) <= 1.0
+                )
                 raw_has_clear_risk = (
-                    raw_eval.get("predicted_collision", False) == True
+                    hard_risk
+                    or raw_collision_hard_for_intervention
                     or raw_eval.get("predicted_out_of_road", False) == True
                     or raw_eval.get("cost_risk", 0.0) > 2.0
                     or (gate_reason == "low_speed_low_progress" and raw_eval.get("deadlock_risk", 0.0) > 3.0)
@@ -1475,24 +1640,52 @@ class PredictiveRecoveryFilter:
                 )
 
                 # 检查 candidate 是否真的比 raw_action 更好
-                candidate_better = (
-                    best_score.hard_safe
-                    and (not raw_eval.get("predicted_collision", False) or best_rollout.predicted_collision == False)
-                    and (not raw_eval.get("predicted_out_of_road", False) or best_rollout.predicted_out_of_road == False)
-                    and (best_rollout.predicted_cost_risk <= raw_eval.get("cost_risk", 0.0) + 0.5)
-                    and (best_rollout.min_vehicle_margin >= raw_eval.get("min_vehicle_margin", float("inf")) - 0.20)
-                    and (best_rollout.min_boundary_margin >= 0.60)
-                    and (best_rollout.min_boundary_margin >= raw_eval.get("min_boundary_margin", float("inf")) - 0.10)
-                )
+                if hard_risk:
+                    raw_boundary_margin = _safe_float(raw_eval.get("min_boundary_margin"), float("inf"))
+                    raw_static_margin = _safe_float(raw_eval.get("min_static_margin"), float("inf"))
+                    boundary_not_worse = best_rollout.min_boundary_margin >= self.config.min_boundary_margin_for_bypass
+                    if np.isfinite(raw_boundary_margin):
+                        boundary_not_worse = boundary_not_worse and best_rollout.min_boundary_margin >= raw_boundary_margin - 0.25
+                    static_not_worse = True
+                    if np.isfinite(raw_static_margin):
+                        static_not_worse = best_rollout.min_static_margin >= raw_static_margin - 0.30
+                    high_speed_lateral_bypass = (
+                        ego_speed > 8.0
+                        and ("left_" in best_rollout.candidate.candidate_type or "right_" in best_rollout.candidate.candidate_type)
+                        and ("vehicle_ttc" in hard_risk_reason or "predicted_collision" in hard_risk_reason)
+                        and raw_boundary_margin < 2.0
+                    )
+                    candidate_better = (
+                        best_rollout.hard_safe
+                        and not best_rollout.predicted_collision
+                        and not best_rollout.predicted_out_of_road
+                        and boundary_not_worse
+                        and static_not_worse
+                        and not high_speed_lateral_bypass
+                    )
+                else:
+                    candidate_better = (
+                        best_rollout.hard_safe
+                        and (not raw_eval.get("predicted_collision", False) or best_rollout.predicted_collision == False)
+                        and (not raw_eval.get("predicted_out_of_road", False) or best_rollout.predicted_out_of_road == False)
+                        and (best_rollout.predicted_cost_risk <= raw_eval.get("cost_risk", 0.0) + 0.5)
+                        and (best_rollout.min_vehicle_margin >= raw_eval.get("min_vehicle_margin", float("inf")) - 0.20)
+                        and (best_rollout.min_boundary_margin >= 0.60)
+                        and (best_rollout.min_boundary_margin >= raw_eval.get("min_boundary_margin", float("inf")) - 0.10)
+                    )
 
                 # 检查接管次数限制
-                if self._intervention_count_this_ep >= self.config.max_interventions_per_episode:
+                if not hard_risk and self._intervention_count_this_ep >= self.config.max_interventions_per_episode:
                     candidate_better = False
                     intervention_rejected_reason = "max_interventions_reached"
 
                 score_gain = raw_eval.get("total_score", float("inf")) - best_score.total_score
 
-                if raw_has_clear_risk and candidate_better:
+                if hard_risk and candidate_better:
+                    allow_intervention = True
+                    intervention_reason = hard_risk_reason or "hard_risk"
+                    intervention_rejected_reason = ""
+                elif raw_has_clear_risk and candidate_better:
                     if score_gain >= self.config.intervention_score_margin:
                         # cost streak 熔断检查：如果已触发熔断，禁止真实接管
                         if self._disable_real_intervention_for_episode:
@@ -1501,7 +1694,7 @@ class PredictiveRecoveryFilter:
                             intervention_reason = "cost_streak_guard"
                         else:
                             allow_intervention = True
-                            if raw_eval.get("predicted_collision", False):
+                            if raw_collision_hard_for_intervention:
                                 intervention_reason = "raw_collision_risk"
                             elif raw_eval.get("predicted_out_of_road", False):
                                 intervention_reason = "raw_boundary_risk"
@@ -1547,6 +1740,61 @@ class PredictiveRecoveryFilter:
                 info["intervention_reason"] = "no_safe_candidate"
                 info["intervention_rejected_reason"] = "no_hard_safe_candidate"
                 info["intervention_score_gain"] = 0.0
+                if hard_risk:
+                    phase = "no_safe_candidate_after_cost" if current_cost > 0.0 or contact_state else "no_safe_candidate_before_cost"
+                    if self._deadlock_progress_release_allowed(raw_eval, risk_metrics, contact_state, current_cost):
+                        self._deadlock_release_remaining = int(self.config.deadlock_release_persist_steps)
+                        self._safety_hold_remaining = 0
+                        self._safety_release_clean_count = 0
+                        safe_action = self._deadlock_progress_release_action(vehicle, raw_action_np)
+                        return self._return_recovery_action(
+                            safe_action,
+                            raw_action_np,
+                            info,
+                            start,
+                            recovery_mode="deadlock_progress_release",
+                            selected_candidate_type="deadlock_progress_release",
+                            fallback_reason=phase + "_release",
+                            intervention_reason="low_progress_release",
+                            pre_contact=True,
+                        )
+                    boundary_risk = bool(
+                        risk_metrics.get("raw_boundary_margin", float("inf"))
+                        < self.config.hard_boundary_margin_for_intervention
+                    )
+                    if boundary_risk and ego_projection.frenet_valid:
+                        safe_action = self._pre_contact_recovery_action(
+                            vehicle,
+                            raw_action_np,
+                            "pre_contact_boundary_recovery",
+                            ego_projection,
+                            frame,
+                            ego_width,
+                        )
+                        recovery_mode = "boundary_escape"
+                        selected_candidate_type = "boundary_escape_recovery"
+                    else:
+                        safe_action = self._minimum_risk_stop(
+                            vehicle,
+                            contact_state=contact_state,
+                            contact_info=contact_info,
+                            boundary_risk=boundary_risk,
+                        )
+                        recovery_mode = "contact_escape" if contact_state else "minimum_risk_stop"
+                        selected_candidate_type = "post_contact_handler" if contact_state else "pre_contact_minimum_risk"
+                    return self._return_recovery_action(
+                        safe_action,
+                        raw_action_np,
+                        info,
+                        start,
+                        recovery_mode=recovery_mode,
+                        selected_candidate_type=selected_candidate_type,
+                        fallback_reason=phase,
+                        intervention_reason=phase,
+                        hard_risk_reason=hard_risk_reason or phase,
+                        pre_contact=not contact_state,
+                        post_contact=contact_state,
+                    )
 
             # ===== 步骤7：调试影子模式 =====
             if self.config._debug_shadow_record:
@@ -1565,29 +1813,56 @@ class PredictiveRecoveryFilter:
             elif allow_intervention and best_rollout is not None:
                 # 实际接管
                 self._intervention_count_this_ep += 1
-                self._last_intervention_step = self._intervention_count_this_ep
+                self._last_intervention_step = self._step_index_this_ep
+                if self._first_intervention_step < 0:
+                    self._first_intervention_step = self._step_index_this_ep
                 self._cooldown_remaining = self.config.intervention_cooldown_steps
+                hold_after_hard_intervention = False
+                if hard_risk:
+                    hard_reason_l = str(hard_risk_reason).lower()
+                    hold_after_hard_intervention = (
+                        contact_state
+                        or "contact" in hard_reason_l
+                        or "boundary" in hard_reason_l
+                        or "out_of_road" in hard_reason_l
+                        or "traffic" in hard_reason_l
+                        or "static_object_distance" in hard_reason_l
+                    )
+                if hold_after_hard_intervention:
+                    self._enter_safety_hold(hard_risk_reason or "hard_risk")
 
                 candidate_action = np.array(
                     [best_rollout.steer_actions[0], best_rollout.throttle_actions[0]],
                     dtype=np.float32,
                 )
-                # 限幅：safe_action 不能与 raw_action 差太多
-                safe_action, action_info = self._clip_action_to_raw_delta(
-                    candidate_action, raw_action_np, self._prev_safe_steer, self._prev_safe_acc
-                )
-                info.update(action_info)
-
-                # 限幅后再次检查
-                if not self._is_action_safe_after_clip(safe_action, raw_action_np, best_score, best_rollout, raw_eval):
-                    safe_action = raw_action_np.astype(np.float32)
-                    info["intervention_reason"] = "action_clipped_unsafe"
-                    allow_intervention = False
-                    self._intervention_count_this_ep -= 1
-                    self._cooldown_remaining = 0
+                if hard_risk and "vehicle_ttc" in hard_risk_reason and ego_speed > 8.0:
+                    throttle_cap = 0.0 if ego_speed > 15.0 else 0.25
+                    candidate_action[1] = min(float(candidate_action[1]), float(raw_action_np[1]), throttle_cap)
+                if hard_risk:
+                    safe_action = np.clip(candidate_action, -1.0, 1.0).astype(np.float32)
+                    action_info = {
+                        "action_limited_by_raw_delta": False,
+                        "safe_raw_steer_delta": float(safe_action[0] - raw_action_np[0]),
+                        "safe_raw_acc_delta": float(safe_action[1] - raw_action_np[1]),
+                    }
+                    info.update(action_info)
                 else:
-                    self._prev_safe_steer = safe_action[0]
-                    self._prev_safe_acc = safe_action[1]
+                    # Soft-risk interventions still use the nominal smoothness limiter.
+                    safe_action, action_info = self._clip_action_to_raw_delta(
+                        candidate_action, raw_action_np, self._prev_safe_steer, self._prev_safe_acc
+                    )
+                    info.update(action_info)
+
+                    # 限幅后再次检查
+                    if not self._is_action_safe_after_clip(safe_action, raw_action_np, best_score, best_rollout, raw_eval):
+                        safe_action = raw_action_np.astype(np.float32)
+                        info["intervention_reason"] = "action_clipped_unsafe"
+                        allow_intervention = False
+                        self._intervention_count_this_ep -= 1
+                        self._cooldown_remaining = 0
+                    else:
+                        self._prev_safe_steer = safe_action[0]
+                        self._prev_safe_acc = safe_action[1]
 
                 info.update(self._score_to_info(best_score))
                 info.update({
@@ -1608,7 +1883,11 @@ class PredictiveRecoveryFilter:
                 info["filter_intervened"] = allow_intervention
                 # actual_action_modified 与 filter_intervened 保持一致（接管时 action 被修改）
                 info["actual_action_modified"] = allow_intervention
+                info["pre_contact_intervention"] = bool(not contact_state and allow_intervention)
+                info["post_contact_intervention"] = bool(contact_state and allow_intervention)
                 self._last_recovery_active = allow_intervention
+                if allow_intervention:
+                    self._last_safe_action = safe_action.copy()
             else:
                 # 不接管，返回 raw_action
                 safe_action = raw_action_np.astype(np.float32)
@@ -1631,6 +1910,10 @@ class PredictiveRecoveryFilter:
             info["would_selected_candidate_type"] = info.get("selected_candidate_type", "raw_action")
             info["would_safe_steer"] = float(safe_action[0])
             info["would_safe_acc"] = float(safe_action[1])
+            info["first_risk_detected_step"] = self._first_risk_detected_step
+            info["risk_to_intervention_delay"] = self._risk_to_intervention_delay()
+            info["safety_hold_active"] = self._safety_hold_remaining > 0
+            info["safety_hold_remaining"] = self._safety_hold_remaining
 
             # 记录状态
             self._last_vehicle_margin_min = vehicle_margin_min
@@ -1649,29 +1932,41 @@ class PredictiveRecoveryFilter:
                         contact_state = True
                         break
 
-            safe_action = self._minimum_risk_stop(vehicle, contact_state=contact_state)
+            safe_action = np.array([0.0, -0.9], dtype=np.float32)
             # 判断 actual_action_modified
             action_modified = (
                 abs(safe_action[0] - raw_action_np[0]) > 1e-3
                 or abs(safe_action[1] - raw_action_np[1]) > 1e-3
             )
+            exception_trace = traceback.format_exc()
             info.update({
                 "recovery_mode": "exception_fallback",
                 "recovery_certified": False,
                 "accepted_by_filter": True,
                 "model_predicted_safe": False,
-                "selected_candidate_type": "exception_fallback",
-                "fallback_reason": "exception:{}".format(type(exc).__name__),
+                "selected_candidate_type": "exception_emergency_brake",
+                "fallback_reason": "exception_fallback:{}".format(type(exc).__name__),
                 "control_feasible": True,
-                "allow_intervention": False,
+                "allow_intervention": True,
                 "intervention_reason": "exception",
                 "filter_intervened": True,
                 "actual_action_modified": action_modified,
                 "contact_state_detected": contact_state,
+                "hard_risk": True,
+                "hard_risk_reason": "exception_fallback",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+                "exception_traceback": exception_trace,
             })
+            self._record_hard_risk("exception_fallback")
             self._last_recovery_active = True
             self._intervention_count_this_ep += 1
+            self._last_intervention_step = self._step_index_this_ep
+            if self._first_intervention_step < 0:
+                self._first_intervention_step = self._step_index_this_ep
             self._cooldown_remaining = self.config.intervention_cooldown_steps
+            self._enter_safety_hold("exception_fallback")
+            self._last_safe_action = safe_action.copy()
             if self.config.debug:
                 info["debug_exception"] = str(exc)
 
@@ -1679,6 +1974,10 @@ class PredictiveRecoveryFilter:
         info["filter_time_ms"] = elapsed_ms
         if elapsed_ms > self.config.filter_time_warn_ms:
             info["filter_time_warning"] = True
+        info["first_risk_detected_step"] = self._first_risk_detected_step
+        info["risk_to_intervention_delay"] = self._risk_to_intervention_delay()
+        info["safety_hold_active"] = self._safety_hold_remaining > 0
+        info["safety_hold_remaining"] = self._safety_hold_remaining
         return np.asarray(safe_action, dtype=np.float32), info
 
     def _empty_info(self) -> Dict[str, Any]:
@@ -1760,6 +2059,26 @@ class PredictiveRecoveryFilter:
             "nearest_static_object_distance": float("inf"),
             "contact_state_detected": False,
             "front_blocking_distance": float("inf"),
+            # Hard-risk and safety-hold diagnostics
+            "hard_risk": False,
+            "hard_risk_reason": "",
+            "low_risk_gate_passed": False,
+            "low_risk_gate_rejected_reason": "",
+            "safety_hold_active": False,
+            "safety_hold_remaining": 0,
+            "recent_contact_steps": 0,
+            "nearest_static_object_type": "",
+            "ttc_vehicle_min": float("inf"),
+            "ttc_static_min": float("inf"),
+            "boundary_closing_rate": 0.0,
+            "pre_contact_intervention": False,
+            "post_contact_intervention": False,
+            "first_risk_detected_step": -1,
+            "risk_to_intervention_delay": -1,
+            "intervention_to_first_cost_delay": "",
+            "exception_type": "",
+            "exception_message": "",
+            "exception_traceback": "",
             # 调试选项
             "debug_shadow_record": False,
             "would_selected_candidate_type": "raw_action",
@@ -1767,6 +2086,730 @@ class PredictiveRecoveryFilter:
             "would_safe_acc": 0.0,
         })
         return info
+
+    def _return_recovery_action(
+        self,
+        safe_action: np.ndarray,
+        raw_action: np.ndarray,
+        info: Dict[str, Any],
+        start_time: float,
+        recovery_mode: str,
+        selected_candidate_type: str,
+        fallback_reason: str,
+        intervention_reason: str,
+        hard_risk_reason: str = "",
+        pre_contact: bool = False,
+        post_contact: bool = False,
+        keep_existing_hold: bool = False,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        safe_action = np.asarray(safe_action, dtype=np.float32)
+        action_modified = bool(
+            abs(float(safe_action[0]) - float(raw_action[0])) > 1e-3
+            or abs(float(safe_action[1]) - float(raw_action[1])) > 1e-3
+        )
+        if hard_risk_reason and not keep_existing_hold:
+            self._enter_safety_hold(hard_risk_reason)
+        if hard_risk_reason:
+            self._record_hard_risk(hard_risk_reason)
+        self._intervention_count_this_ep += 1
+        self._last_intervention_step = self._step_index_this_ep
+        if self._first_intervention_step < 0:
+            self._first_intervention_step = self._step_index_this_ep
+        self._cooldown_remaining = self.config.intervention_cooldown_steps
+        self._last_recovery_active = True
+        self._last_safe_action = safe_action.copy()
+        self._prev_safe_steer = float(safe_action[0])
+        self._prev_safe_acc = float(safe_action[1])
+        info.update({
+            "recovery_mode": recovery_mode,
+            "recovery_certified": False,
+            "accepted_by_filter": True,
+            "model_predicted_safe": False,
+            "selected_candidate_type": selected_candidate_type,
+            "collision_free": not bool(info.get("raw_predicted_collision", False)),
+            "boundary_safe": not bool(info.get("raw_predicted_out_of_road", False)),
+            "control_feasible": True,
+            "fallback_reason": fallback_reason,
+            "allow_intervention": True,
+            "intervention_reason": intervention_reason,
+            "filter_intervened": action_modified,
+            "actual_action_modified": action_modified,
+            "hard_risk": bool(hard_risk_reason) or bool(info.get("hard_risk", False)),
+            "hard_risk_reason": hard_risk_reason or info.get("hard_risk_reason", ""),
+            "pre_contact_intervention": bool(pre_contact),
+            "post_contact_intervention": bool(post_contact),
+            "safety_hold_active": self._safety_hold_remaining > 0,
+            "safety_hold_remaining": self._safety_hold_remaining,
+            "first_risk_detected_step": self._first_risk_detected_step,
+            "risk_to_intervention_delay": self._risk_to_intervention_delay(),
+            "would_selected_candidate_type": selected_candidate_type,
+            "would_safe_steer": float(safe_action[0]),
+            "would_safe_acc": float(safe_action[1]),
+        })
+        elapsed_ms = (time.time() - start_time) * 1000.0
+        info["filter_time_ms"] = elapsed_ms
+        if elapsed_ms > self.config.filter_time_warn_ms:
+            info["filter_time_warning"] = True
+        return safe_action, info
+
+    def _record_hard_risk(self, reason: str) -> None:
+        if reason and self._first_risk_detected_step < 0:
+            self._first_risk_detected_step = self._step_index_this_ep
+
+    def _risk_to_intervention_delay(self) -> int:
+        if self._first_risk_detected_step < 0 or self._first_intervention_step < 0:
+            return -1
+        return int(self._first_intervention_step - self._first_risk_detected_step)
+
+    def _enter_safety_hold(self, reason: str = "") -> None:
+        del reason
+        self._safety_hold_remaining = max(self._safety_hold_remaining, int(self.config.safety_hold_steps))
+        self._safety_release_clean_count = 0
+
+    def _is_boundary_contact_reason(self, reason: str) -> bool:
+        reason_l = str(reason).lower()
+        return any(marker in reason_l for marker in ("road_line", "solid", "sidewalk", "boundary", "out_of_road"))
+
+    def _is_traffic_object_contact_reason(self, reason: str) -> bool:
+        reason_l = str(reason).lower()
+        return any(marker in reason_l for marker in ("traffic_cone", "traffic_barrier", "traffic_object"))
+
+    def _ultra_short_vehicle_deadlock_escape_ready(
+        self,
+        reason: str,
+        ego_speed: float,
+        any_contact_state: bool,
+    ) -> bool:
+        if (
+            str(reason).startswith("vehicle_collision_step")
+            and ego_speed < 1.0
+            and not any_contact_state
+            and not self._recent_contact_step_indices
+        ):
+            self._ultra_short_vehicle_deadlock_steps += 1
+            return self._ultra_short_vehicle_deadlock_steps >= 12
+        self._ultra_short_vehicle_deadlock_steps = 0
+        return False
+
+    def _ultra_short_vehicle_progress_release_ready(
+        self,
+        reason: str,
+        ego_speed: float,
+        any_contact_state: bool,
+        raw_action: np.ndarray,
+    ) -> bool:
+        if not str(reason).startswith("vehicle_collision_step"):
+            return False
+        if ego_speed > 2.0:
+            return False
+        if any_contact_state or self._recent_contact_step_indices:
+            return False
+        raw_throttle = _safe_float(raw_action[1] if raw_action is not None and len(raw_action) > 1 else 0.0, 0.0)
+        if raw_throttle < self.config.low_risk_high_throttle_threshold:
+            return False
+        return bool(
+            self._deadlock_release_remaining > 0
+            or self._low_progress_count >= self.config.deadlock_release_low_progress_steps
+        )
+
+    def _vehicle_deadlock_escape_action(self, vehicle: Any, raw_action: np.ndarray) -> np.ndarray:
+        speed = _get_speed(vehicle, 0.0)
+        raw_steer = _safe_float(raw_action[0] if raw_action is not None and len(raw_action) > 0 else 0.0, 0.0)
+        current_steer = _safe_float(getattr(vehicle, "steering", raw_steer), raw_steer)
+        steer = raw_steer if abs(raw_steer) > 0.08 else current_steer
+        if abs(steer) < 0.08:
+            steer = 0.35
+        throttle = 0.22 if speed < 1.5 else -0.10
+        return np.array([_clip(steer, -0.55, 0.55), throttle], dtype=np.float32)
+
+    def _reset_boundary_contact_escape(self) -> None:
+        self._boundary_contact_escape_steps = 0
+        self._boundary_contact_escape_steer = 0.0
+
+    def _boundary_contact_recovery_action(
+        self,
+        vehicle: Any,
+        raw_action: np.ndarray,
+        frame: Optional[RouteFrenetFrame] = None,
+        ego_projection: Optional[FrenetProjection] = None,
+        ego_width: float = 2.0,
+    ) -> np.ndarray:
+        self._boundary_contact_escape_steps += 1
+        speed = _get_speed(vehicle, 0.0)
+        raw_steer = _safe_float(raw_action[0] if raw_action is not None and len(raw_action) > 0 else 0.0, 0.0)
+        current_steer = _safe_float(getattr(vehicle, "steering", raw_steer), raw_steer)
+        steer = 0.0
+        if (
+            frame is not None
+            and frame.valid
+            and ego_projection is not None
+            and ego_projection.frenet_valid
+        ):
+            boundary = frame.boundary_at(
+                ego_projection.s,
+                ego_projection.l,
+                ego_width,
+                self.config.safety_margin,
+            )
+            if boundary.valid:
+                steer = -0.45 if boundary.left_margin <= boundary.right_margin else 0.45
+        if abs(steer) < 0.05:
+            steer = -raw_steer if abs(raw_steer) > 0.05 else -current_steer
+        if abs(steer) < 0.05:
+            steer = self._boundary_contact_escape_steer or 0.35
+        steer = _clip(steer, -0.45, 0.45)
+        self._boundary_contact_escape_steer = steer
+
+        if speed > 2.0:
+            throttle = -0.35
+        elif self._boundary_contact_escape_steps <= 8:
+            throttle = -0.25
+        else:
+            throttle = 0.18 if speed < 1.5 else -0.10
+        return np.array([steer, _clip(throttle, -0.35, 0.25)], dtype=np.float32)
+
+    def _traffic_object_contact_escape_action(self, vehicle: Any, raw_action: np.ndarray) -> np.ndarray:
+        speed = _get_speed(vehicle, 0.0)
+        raw_steer = _safe_float(raw_action[0] if raw_action is not None and len(raw_action) > 0 else 0.0, 0.0)
+        raw_throttle = _safe_float(raw_action[1] if raw_action is not None and len(raw_action) > 1 else 0.0, 0.0)
+        current_steer = _safe_float(getattr(vehicle, "steering", raw_steer), raw_steer)
+        steer = raw_steer if abs(raw_steer) > 0.05 else current_steer
+        if abs(steer) < 0.05:
+            steer = 0.25
+        if speed > 8.0:
+            throttle = min(raw_throttle, -0.15)
+        elif speed > 3.0:
+            throttle = min(max(raw_throttle, -0.05), 0.20)
+        else:
+            throttle = max(0.25, min(raw_throttle, 0.45))
+        return np.array([_clip(steer, -0.50, 0.50), _clip(throttle, -0.30, 0.45)], dtype=np.float32)
+
+    def _contact_text_only_benign_road_marking(self, contact_text: str) -> bool:
+        text = str(contact_text).lower()
+        if text.strip() in ("", "none", "[]", "{}", "set()"):
+            return False
+        dangerous_markers = (
+            "vehicle",
+            "traffic_object",
+            "traffic_cone",
+            "traffic_barrier",
+            "road_line_solid",
+            "solid_single",
+            "sidewalk",
+            "crash",
+            "out_of_road",
+        )
+        if any(marker in text for marker in dangerous_markers):
+            return False
+        return "broken" in text and ("road_line" in text or "lane_line" in text)
+
+    def _is_benign_road_marking_object(self, obj: Any, obj_id: str) -> bool:
+        text = " ".join([
+            obj.__class__.__name__.lower(),
+            str(obj_id).lower(),
+            str(getattr(obj, "type", "")).lower(),
+            str(getattr(obj, "object_type", "")).lower(),
+        ])
+        if "sidewalk" in text or "solid" in text:
+            return False
+        return "road_line" in text or "lane_line" in text
+
+    def _contact_state(self, vehicle: Any) -> Tuple[bool, Dict[str, Any]]:
+        info: Dict[str, Any] = {}
+        if vehicle is None:
+            return False, info
+        contact_results = getattr(vehicle, "contact_results", None)
+        if contact_results is not None:
+            contact_str = str(contact_results).lower()
+            dangerous_types = [
+                "vehicle",
+                "traffic_object",
+                "traffic_cone",
+                "traffic_barrier",
+                "road_line_solid",
+                "solid_single_white",
+                "sidewalk",
+                "traffic",
+                "object",
+                "crash",
+            ]
+            for dtype in dangerous_types:
+                if dtype in contact_str:
+                    info["contact_state"] = True
+                    info["contact_type"] = dtype
+                    return True, info
+        for attr in ("crash", "crash_vehicle", "crash_object", "crash_sidewalk", "crash_building", "out_of_road"):
+            try:
+                if bool(getattr(vehicle, attr, False)):
+                    info["contact_state"] = True
+                    info["contact_type"] = attr
+                    return True, info
+            except Exception:
+                pass
+        return False, info
+
+    def _any_contact_results(self, vehicle: Any) -> bool:
+        if vehicle is None:
+            return False
+        contact_results = getattr(vehicle, "contact_results", None)
+        if contact_results is None:
+            return False
+        contact_str = str(contact_results).strip().lower()
+        if contact_str in ("", "none", "[]", "{}", "set()"):
+            return False
+        return not self._contact_text_only_benign_road_marking(contact_str)
+
+    def _update_recent_contact_steps(self, contact_state: bool) -> None:
+        if contact_state:
+            self._recent_contact_step_indices.append(self._step_index_this_ep)
+        window = max(1, int(self.config.recent_contact_window))
+        self._recent_contact_step_indices = [
+            step for step in self._recent_contact_step_indices
+            if self._step_index_this_ep - step < window
+        ]
+
+    def _risk_metrics(
+        self,
+        objects: Sequence[SceneObject],
+        frame: RouteFrenetFrame,
+        ego_projection: FrenetProjection,
+        ego_pos: Optional[np.ndarray],
+        ego_heading: float,
+        ego_speed: float,
+        ego_length: float,
+        ego_width: float,
+        raw_action: np.ndarray,
+    ) -> Dict[str, Any]:
+        metrics = {
+            "nearest_vehicle_distance": float("inf"),
+            "nearest_static_object_distance": float("inf"),
+            "nearest_static_object_type": "",
+            "nearest_static_forward_distance": float("inf"),
+            "nearest_static_lateral_gap": float("inf"),
+            "front_static_blocking_distance": float("inf"),
+            "ttc_vehicle_min": float("inf"),
+            "ttc_static_min": float("inf"),
+            "boundary_closing_rate": 0.0,
+            "raw_boundary_margin": float("inf"),
+            "raw_throttle": float(raw_action[1]),
+            "ego_speed": float(ego_speed),
+            "vehicle_object_count": 0,
+            "static_object_count": 0,
+            "soft_static_object_count": 0,
+            "scene_object_count": len(objects),
+        }
+        if ego_pos is None:
+            return metrics
+
+        forward = _unit_from_heading(ego_heading)
+        left_normal = _left_normal_from_heading(ego_heading)
+        if ego_projection.frenet_valid:
+            boundary = frame.boundary_at(ego_projection.s, ego_projection.l, ego_width, self.config.safety_margin)
+            metrics["raw_boundary_margin"] = boundary.boundary_margin
+            if boundary.left_margin <= boundary.right_margin:
+                metrics["boundary_closing_rate"] = max(0.0, float(raw_action[0])) * max(ego_speed, 0.0)
+            else:
+                metrics["boundary_closing_rate"] = max(0.0, -float(raw_action[0])) * max(ego_speed, 0.0)
+
+        for obj in objects:
+            if obj is None:
+                continue
+            obj_pos = obj.position_xy
+            delta = obj_pos - ego_pos
+            center_distance = float(np.linalg.norm(delta))
+            gap = self._center_gap(ego_pos, ego_length, ego_width, obj_pos, obj.length, obj.width)
+            forward_distance = float(np.dot(delta, forward))
+            lateral_distance = abs(float(np.dot(delta, left_normal)))
+            lateral_gap = max(0.0, lateral_distance - ego_width * 0.5 - obj.width * 0.5)
+            closing_speed = max(0.0, ego_speed - (obj.speed if obj.is_vehicle else 0.0))
+            ttc = forward_distance / closing_speed if forward_distance > 0.0 and closing_speed > 1e-3 else float("inf")
+            safe_distance = max(0.0, gap if np.isfinite(gap) else center_distance)
+            if obj.is_vehicle:
+                metrics["vehicle_object_count"] += 1
+                if safe_distance < metrics["nearest_vehicle_distance"]:
+                    metrics["nearest_vehicle_distance"] = safe_distance
+                metrics["ttc_vehicle_min"] = min(metrics["ttc_vehicle_min"], ttc)
+            else:
+                if self._is_soft_static_object_type(obj.object_type):
+                    metrics["soft_static_object_count"] += 1
+                    continue
+                metrics["static_object_count"] += 1
+                if safe_distance < metrics["nearest_static_object_distance"]:
+                    metrics["nearest_static_object_distance"] = safe_distance
+                    metrics["nearest_static_object_type"] = obj.object_type
+                    metrics["nearest_static_forward_distance"] = forward_distance
+                    metrics["nearest_static_lateral_gap"] = lateral_gap
+                if (
+                    forward_distance > 0.0
+                    and lateral_gap <= self.config.hard_static_lateral_margin
+                ):
+                    front_gap = max(0.0, forward_distance - ego_length * 0.5 - obj.length * 0.5)
+                    metrics["front_static_blocking_distance"] = min(
+                        metrics["front_static_blocking_distance"],
+                        front_gap,
+                    )
+                metrics["ttc_static_min"] = min(metrics["ttc_static_min"], ttc)
+        return metrics
+
+    def _hard_risk_detected(
+        self,
+        raw_eval: Dict[str, Any],
+        metrics: Dict[str, Any],
+        contact_state: bool,
+        safety_hold_active: bool,
+        ego_speed: float,
+    ) -> Tuple[bool, str]:
+        del safety_hold_active
+        reasons: List[str] = []
+        deadlock_escape_candidate = self._raw_collision_deadlock_escape_candidate(raw_eval, metrics)
+        collision_time = _safe_float(raw_eval.get("collision_time"), float("inf"))
+        out_of_road_time = _safe_float(raw_eval.get("out_of_road_time"), float("inf"))
+        if bool(raw_eval.get("predicted_collision", False)) and collision_time <= 1.0 and not deadlock_escape_candidate:
+            reasons.append("predicted_collision_within_1s")
+        if bool(raw_eval.get("predicted_out_of_road", False)) and out_of_road_time <= 2.0:
+            reasons.append("predicted_out_of_road_within_2s")
+        elif bool(raw_eval.get("predicted_out_of_road", False)):
+            reasons.append("predicted_out_of_road")
+        if self._static_distance_is_immediate_risk(
+            raw_eval,
+            metrics,
+            ego_speed,
+            self.config.hard_static_distance_threshold,
+        ):
+            reasons.append("static_object_distance")
+        boundary_margin = _safe_float(metrics.get("raw_boundary_margin"), float("inf"))
+        boundary_closing = _safe_float(metrics.get("boundary_closing_rate"), 0.0)
+        if boundary_margin < self.config.boundary_hard_margin:
+            reasons.append("boundary_margin")
+        vehicle_ttc_hard_limit = min(self.config.hard_vehicle_ttc_threshold, 1.0)
+        if _safe_float(metrics.get("ttc_vehicle_min"), float("inf")) < vehicle_ttc_hard_limit:
+            reasons.append("vehicle_ttc")
+        if (
+            _safe_float(metrics.get("ttc_static_min"), float("inf")) < self.config.hard_static_ttc_threshold
+            and self._static_object_path_aligned(metrics, ego_speed)
+        ):
+            reasons.append("static_ttc")
+        if contact_state:
+            reasons.append("contact_results")
+        if reasons:
+            return True, ";".join(reasons)
+        return False, ""
+
+    def _static_distance_is_immediate_risk(
+        self,
+        raw_eval: Dict[str, Any],
+        metrics: Dict[str, Any],
+        ego_speed: float,
+        distance_limit: float,
+    ) -> bool:
+        static_distance = _safe_float(metrics.get("nearest_static_object_distance"), float("inf"))
+        if static_distance >= distance_limit:
+            return False
+
+        path_aligned = self._static_object_path_aligned(metrics, ego_speed)
+
+        collision_time = _safe_float(raw_eval.get("collision_time"), float("inf"))
+        if path_aligned and bool(raw_eval.get("predicted_collision", False)) and collision_time <= 2.0:
+            return True
+
+        static_ttc = _safe_float(metrics.get("ttc_static_min"), float("inf"))
+        if path_aligned and static_ttc < self.config.static_distance_ttc_risk_threshold:
+            return True
+
+        raw_static_margin = _safe_float(raw_eval.get("min_static_margin"), float("inf"))
+        if path_aligned and raw_static_margin < max(1.0, self.config.hard_static_longitudinal_margin):
+            return True
+        if path_aligned:
+            return True
+
+        return False
+
+    def _static_object_path_aligned(self, metrics: Dict[str, Any], ego_speed: float) -> bool:
+        nearest_type = str(metrics.get("nearest_static_object_type", "")).upper()
+        if self._is_soft_static_object_type(nearest_type):
+            return False
+        nearest_forward = _safe_float(metrics.get("nearest_static_forward_distance"), float("inf"))
+        if "TRAFFIC_CONE" in nearest_type and nearest_forward < 0.0:
+            return False
+        front_static_distance = _safe_float(metrics.get("front_static_blocking_distance"), float("inf"))
+        front_limit = max(self.config.static_distance_front_blocking_threshold, ego_speed * 0.8)
+        if front_static_distance < front_limit:
+            return True
+        forward_distance = nearest_forward
+        lateral_gap = _safe_float(metrics.get("nearest_static_lateral_gap"), float("inf"))
+        return bool(
+            0.0 < forward_distance < max(self.config.pre_contact_static_min_distance, ego_speed * 0.6)
+            and lateral_gap <= self.config.hard_static_lateral_margin
+        )
+
+    def _raw_collision_deadlock_escape_candidate(
+        self,
+        raw_eval: Dict[str, Any],
+        metrics: Dict[str, Any],
+    ) -> bool:
+        if self._low_progress_count < self.config.deadlock_escape_low_progress_steps:
+            return False
+        if not bool(raw_eval.get("predicted_collision", False)):
+            return False
+        if bool(raw_eval.get("predicted_out_of_road", False)):
+            return False
+        failure_reason = str(raw_eval.get("failure_reason", "")).lower()
+        if failure_reason not in ("collision", "static_collision", "vehicle_lateral_margin_violation"):
+            return False
+        if _safe_float(raw_eval.get("min_boundary_margin"), float("inf")) < self.config.deadlock_escape_min_boundary_margin:
+            return False
+        if _safe_float(raw_eval.get("min_vehicle_margin"), float("inf")) < self.config.deadlock_escape_min_vehicle_margin:
+            return False
+        if _safe_float(raw_eval.get("min_static_margin"), float("inf")) < self.config.deadlock_escape_min_static_margin:
+            return False
+        if _safe_float(metrics.get("ttc_vehicle_min"), float("inf")) < self.config.hard_vehicle_ttc_threshold * 2.0:
+            return False
+        if self._static_object_path_aligned(metrics, _safe_float(metrics.get("ego_speed"), 0.0)):
+            return False
+        return True
+
+    def _deadlock_progress_release_allowed(
+        self,
+        raw_eval: Dict[str, Any],
+        metrics: Dict[str, Any],
+        contact_state: bool,
+        current_cost: float,
+        require_low_progress: bool = True,
+    ) -> bool:
+        if require_low_progress and self._low_progress_count < self.config.deadlock_release_low_progress_steps:
+            return False
+        if contact_state or bool(metrics.get("any_contact_results", False)) or self._recent_contact_step_indices:
+            return False
+        if current_cost > 0.0:
+            return False
+        raw_throttle = _safe_float(metrics.get("raw_throttle"), 0.0)
+        if raw_throttle < self.config.low_risk_high_throttle_threshold:
+            return False
+        if bool(raw_eval.get("predicted_out_of_road", False)):
+            return False
+        boundary_margin = min(
+            _safe_float(metrics.get("raw_boundary_margin"), float("inf")),
+            _safe_float(raw_eval.get("min_boundary_margin"), float("inf")),
+        )
+        if boundary_margin < self.config.deadlock_release_min_boundary_margin:
+            return False
+        if _safe_float(metrics.get("ttc_vehicle_min"), float("inf")) < self.config.hard_vehicle_ttc_threshold * 1.5:
+            return False
+        if (
+            _safe_float(metrics.get("ttc_static_min"), float("inf")) < self.config.hard_static_ttc_threshold * 1.5
+            and self._static_object_path_aligned(metrics, _safe_float(metrics.get("ego_speed"), 0.0))
+        ):
+            return False
+        if _safe_float(metrics.get("front_static_blocking_distance"), float("inf")) < self.config.static_distance_front_blocking_threshold:
+            return False
+        if self._static_distance_is_immediate_risk(
+            raw_eval,
+            metrics,
+            _safe_float(metrics.get("ego_speed"), 0.0),
+            self.config.low_risk_min_static_distance,
+        ):
+            return False
+        if bool(raw_eval.get("predicted_collision", False)):
+            failure_reason = str(raw_eval.get("failure_reason", "")).lower()
+            allowed_reasons = (
+                "severe_lateral_rss",
+                "vehicle_lateral_margin_violation",
+                "parallel_lateral_violation",
+                "collision",
+                "static_collision",
+            )
+            if failure_reason not in allowed_reasons:
+                return False
+            if (
+                "static" in failure_reason
+                and self._static_object_path_aligned(metrics, _safe_float(metrics.get("ego_speed"), 0.0))
+            ):
+                return False
+        return True
+
+    def _deadlock_progress_release_action(self, vehicle: Any, raw_action: np.ndarray) -> np.ndarray:
+        speed = _get_speed(vehicle, 0.0)
+        raw_steer = _safe_float(raw_action[0] if raw_action is not None and len(raw_action) > 0 else 0.0, 0.0)
+        raw_throttle = _safe_float(raw_action[1] if raw_action is not None and len(raw_action) > 1 else 0.0, 0.0)
+        steer = _clip(raw_steer, -0.55, 0.55)
+        if speed < 1.5:
+            throttle = max(raw_throttle, 0.35)
+        elif speed < 4.0:
+            throttle = max(raw_throttle, 0.20)
+        else:
+            throttle = max(raw_throttle, 0.05)
+        return np.array([steer, _clip(throttle, 0.10, 0.65)], dtype=np.float32)
+
+    def _pre_contact_risk_detector(
+        self,
+        raw_eval: Dict[str, Any],
+        metrics: Dict[str, Any],
+        ego_speed: float,
+    ) -> Dict[str, Any]:
+        result = {"emergency_detected": False, "emergency_reason": ""}
+        if (
+            _safe_float(metrics.get("ttc_static_min"), float("inf")) < self.config.pre_contact_ttc_threshold
+            and self._static_object_path_aligned(metrics, ego_speed)
+        ):
+            result.update({"emergency_detected": True, "emergency_reason": "static_object_ttc"})
+            return result
+        static_distance_limit = max(
+            self.config.pre_contact_static_min_distance,
+            ego_speed * self.config.pre_contact_static_time_headway,
+        )
+        if self._static_distance_is_immediate_risk(raw_eval, metrics, ego_speed, static_distance_limit):
+            result.update({"emergency_detected": True, "emergency_reason": "static_object_distance"})
+            return result
+        if (
+            _safe_float(metrics.get("raw_boundary_margin"), float("inf")) < self.config.hard_boundary_margin_for_intervention
+            and _safe_float(metrics.get("boundary_closing_rate"), 0.0) > 0.05
+        ):
+            result.update({"emergency_detected": True, "emergency_reason": "boundary_closing"})
+            return result
+        return result
+
+    def _pre_contact_recovery_action(
+        self,
+        vehicle: Any,
+        raw_action: np.ndarray,
+        selected_type: str,
+        ego_projection: FrenetProjection,
+        frame: RouteFrenetFrame,
+        ego_width: float,
+    ) -> np.ndarray:
+        if selected_type == "pre_contact_boundary_recovery" and ego_projection.frenet_valid:
+            boundary = frame.boundary_at(ego_projection.s, ego_projection.l, ego_width, self.config.safety_margin)
+            raw_steer = _safe_float(raw_action[0] if raw_action is not None and len(raw_action) > 0 else 0.0, 0.0)
+            raw_throttle = _safe_float(raw_action[1] if raw_action is not None and len(raw_action) > 1 else 0.0, 0.0)
+            away_steer = -0.22 if boundary.left_margin < boundary.right_margin else 0.22
+            raw_points_away = (
+                raw_steer < 0.0 if boundary.left_margin < boundary.right_margin else raw_steer > 0.0
+            )
+            steer = 0.70 * raw_steer + 0.30 * away_steer if raw_points_away else away_steer
+            speed = _get_speed(vehicle, 0.0)
+            if speed > 10.0:
+                throttle = _clip(raw_throttle, -0.05, 0.20)
+            elif speed > 4.0:
+                throttle = _clip(raw_throttle, -0.05, 0.30)
+            else:
+                throttle = _clip(max(raw_throttle, 0.08), -0.05, 0.30)
+            return np.array([_clip(steer, -0.35, 0.35), throttle], dtype=np.float32)
+        current_steer = _safe_float(getattr(vehicle, "steering", 0.0), 0.0)
+        return np.array([_clip(current_steer * 0.2, -0.2, 0.2), -0.9], dtype=np.float32)
+
+    def _safety_hold_action(self, vehicle: Any, raw_action: np.ndarray) -> np.ndarray:
+        del raw_action
+        if self._last_safe_action is not None:
+            action = self._last_safe_action.copy()
+            speed = _get_speed(vehicle, 0.0)
+            if speed > 2.0:
+                action[1] = min(float(action[1]), -0.20)
+            else:
+                action[1] = _clip(float(action[1]), -0.20, 0.20)
+            return np.asarray(np.clip(action, -1.0, 1.0), dtype=np.float32)
+        return self._minimum_risk_stop(vehicle, contact_state=False)
+
+    def _safety_hold_release_clean(
+        self,
+        raw_eval: Dict[str, Any],
+        metrics: Dict[str, Any],
+        contact_state: bool,
+    ) -> bool:
+        if contact_state or self._recent_contact_step_indices:
+            return False
+        if bool(raw_eval.get("predicted_collision", False)) or bool(raw_eval.get("predicted_out_of_road", False)):
+            return False
+        if not self._finite_gt(raw_eval.get("min_boundary_margin"), self.config.low_risk_min_boundary_margin):
+            return False
+        static_count = int(metrics.get("static_object_count", 0))
+        if static_count > 0 and self._static_distance_is_immediate_risk(
+            raw_eval,
+            metrics,
+            _safe_float(metrics.get("ego_speed"), 0.0),
+            self.config.low_risk_min_static_distance,
+        ):
+            return False
+        vehicle_count = int(metrics.get("vehicle_object_count", 0))
+        if vehicle_count > 0 and not self._finite_gt(raw_eval.get("min_vehicle_margin"), self.config.low_risk_min_vehicle_margin):
+            return False
+        return True
+
+    def _low_risk_fast_path(
+        self,
+        raw_eval: Dict[str, Any],
+        metrics: Dict[str, Any],
+        contact_state: bool,
+        gate_reason: str,
+    ) -> Tuple[bool, str]:
+        del gate_reason
+        if contact_state or bool(metrics.get("any_contact_results", False)) or self._recent_contact_step_indices:
+            return False, "recent_contact"
+        deadlock_escape_candidate = self._raw_collision_deadlock_escape_candidate(raw_eval, metrics)
+        if bool(raw_eval.get("predicted_collision", False)) and not deadlock_escape_candidate:
+            return False, "raw_predicted_collision"
+        if bool(raw_eval.get("predicted_out_of_road", False)):
+            return False, "raw_predicted_out_of_road"
+        if not self._finite_gt(raw_eval.get("min_boundary_margin"), self.config.low_risk_min_boundary_margin):
+            return False, "boundary_margin_uncertain_or_low"
+        vehicle_count = int(metrics.get("vehicle_object_count", 0))
+        if (
+            vehicle_count > 0
+            and not deadlock_escape_candidate
+            and not self._finite_gt(raw_eval.get("min_vehicle_margin"), self.config.low_risk_min_vehicle_margin)
+        ):
+            return False, "vehicle_margin_uncertain_or_low"
+        if int(metrics.get("scene_object_count", 0)) <= 0:
+            return False, "object_list_uncertain"
+        static_count = int(metrics.get("static_object_count", 0))
+        static_distance_risk = self._static_distance_is_immediate_risk(
+            raw_eval,
+            metrics,
+            _safe_float(metrics.get("ego_speed"), 0.0),
+            self.config.low_risk_min_static_distance,
+        )
+        if static_count > 0 and static_distance_risk:
+            return False, "static_object_distance_low"
+        if (
+            static_count > 0
+            and _safe_float(metrics.get("front_static_blocking_distance"), float("inf")) < 10.0
+            and _safe_float(metrics.get("raw_throttle"), 0.0) > self.config.low_risk_high_throttle_threshold
+        ):
+            return False, "high_throttle_toward_static_object"
+        if _safe_float(metrics.get("ttc_vehicle_min"), float("inf")) < self.config.hard_vehicle_ttc_threshold:
+            return False, "vehicle_ttc_low"
+        if (
+            _safe_float(metrics.get("ttc_static_min"), float("inf")) < self.config.hard_static_ttc_threshold
+            and self._static_object_path_aligned(metrics, _safe_float(metrics.get("ego_speed"), 0.0))
+        ):
+            return False, "static_ttc_low"
+        if _safe_float(metrics.get("boundary_closing_rate"), 0.0) > 0.05 and _safe_float(metrics.get("raw_boundary_margin"), float("inf")) < self.config.low_risk_min_boundary_margin + 0.5:
+            return False, "boundary_closing"
+        if self._route_deviation_rising():
+            return False, "route_deviation_rising"
+        return True, ""
+
+    def _finite_gt(self, value: Any, threshold: float) -> bool:
+        try:
+            value = float(value)
+        except Exception:
+            return False
+        return bool(np.isfinite(value) and value > threshold)
+
+    def _update_route_deviation_history(self, ego_projection: FrenetProjection) -> None:
+        if ego_projection.frenet_valid:
+            self._route_deviation_history.append(abs(float(ego_projection.l)))
+        else:
+            self._route_deviation_history.append(float("inf"))
+        if len(self._route_deviation_history) > 5:
+            self._route_deviation_history.pop(0)
+
+    def _route_deviation_rising(self) -> bool:
+        if len(self._route_deviation_history) < 4:
+            return False
+        values = self._route_deviation_history[-4:]
+        if not all(np.isfinite(v) for v in values):
+            return True
+        return values[-1] > values[0] + 0.5 and values[-1] >= values[-2] >= values[-3]
 
     def _coerce_action(self, action: Any) -> np.ndarray:
         try:
@@ -1915,6 +2958,7 @@ class PredictiveRecoveryFilter:
         forward = _unit_from_heading(ego_heading)
         left = _left_normal_from_heading(ego_heading)
         ego_speed = _get_speed(vehicle, 0.0)
+        _, ego_width = _get_size(vehicle)
         scanned = 0
         for obj in self._iter_environment_objects(env):
             if obj is None or obj is vehicle:
@@ -1925,6 +2969,8 @@ class PredictiveRecoveryFilter:
             pos = _get_position(obj)
             if pos is None:
                 continue
+            if self._is_benign_road_marking_object(obj, self._object_id(obj)):
+                continue
             delta = pos - ego_pos
             long = float(np.dot(delta, forward))
             if long <= 0.0 or long > self.config.ultra_front_block_distance:
@@ -1932,16 +2978,24 @@ class PredictiveRecoveryFilter:
             lat = abs(float(np.dot(delta, left)))
             obj_length, obj_width = _get_size(obj)
 
-            class_name = obj.__class__.__name__.lower()
-            is_vehicle_obj = "vehicle" in class_name or hasattr(obj, "throttle_brake") or hasattr(obj, "speed")
-            is_traffic_object = any(t in class_name for t in ["cone", "barrier", "traffic", "sign", "light"])
             speed = _get_speed(obj, 0.0)
+            object_type, is_vehicle_obj, _ = self._classify_scene_object(obj, self._object_id(obj), speed)
+            if object_type == "static_obstacle" and not is_vehicle_obj:
+                continue
+            is_traffic_object = object_type in (
+                "TRAFFIC_CONE",
+                "TRAFFIC_BARRIER",
+                "TRAFFIC_OBJECT",
+                "ROAD_EDGE_SIDEWALK",
+                "ROAD_LINE_SOLID_SINGLE_WHITE",
+            )
 
             # 静态物体或交通物体
             if not is_vehicle_obj and (is_traffic_object or speed < 0.5):
                 # 静态物体：即使不在正前方车道，也在考虑范围内
                 # 如果在前方近距离（< 15m）且横向重叠较大
-                if long < 15.0 and lat < ego_width + obj_width:
+                lateral_clearance = lat - ego_width * 0.5 - obj_width * 0.5
+                if long < 15.0 and lateral_clearance <= self.config.hard_static_lateral_margin:
                     return True
             else:
                 # 车辆：检查低速阻塞
@@ -1988,7 +3042,10 @@ class PredictiveRecoveryFilter:
         contact_results = getattr(vehicle, "contact_results", None)
         if contact_results is not None:
             contact_str = str(contact_results).lower()
-            dangerous_types = ["vehicle", "traffic_object", "traffic_cone", "traffic_barrier", "crash"]
+            contact_nonempty = contact_str.strip() not in ("", "none", "[]", "{}", "set()")
+            if contact_nonempty and not self._contact_text_only_benign_road_marking(contact_str):
+                result["contact_state_detected"] = True
+            dangerous_types = ["vehicle", "traffic_object", "traffic_cone", "traffic_barrier", "road_line_solid", "solid_single_white", "sidewalk", "crash"]
             for dtype in dangerous_types:
                 if dtype in contact_str:
                     result["contact_state_detected"] = True
@@ -2026,22 +3083,39 @@ class PredictiveRecoveryFilter:
             pos = _get_position(obj)
             if pos is None:
                 continue
+            if self._is_benign_road_marking_object(obj, self._object_id(obj)):
+                continue
 
             delta = pos - ego_pos
             long = float(np.dot(delta, forward))  # 纵向距离
             lat = abs(float(np.dot(delta, left_normal)))  # 横向距离
 
             obj_length, obj_width = _get_size(obj)
-            class_name = obj.__class__.__name__.lower()
-            is_vehicle_obj = "vehicle" in class_name or hasattr(obj, "throttle_brake") or hasattr(obj, "speed")
             speed = _get_speed(obj, 0.0)
+            object_type, is_vehicle_obj, _ = self._classify_scene_object(obj, self._object_id(obj), speed)
+            if object_type == "static_obstacle" and not is_vehicle_obj:
+                continue
 
             # 膨胀后的 ego footprint
             inflated_ego_length = ego_length + 1.0
             inflated_ego_width = ego_width + 1.0
 
             # 检查物体类型
-            is_traffic_object = any(t in class_name for t in ["cone", "barrier", "traffic", "object", "cone", "sign"])
+            is_traffic_object = object_type in (
+                "TRAFFIC_CONE",
+                "TRAFFIC_BARRIER",
+                "TRAFFIC_OBJECT",
+                "ROAD_EDGE_SIDEWALK",
+                "ROAD_LINE_SOLID_SINGLE_WHITE",
+            )
+            static_lateral_clearance = lat - ego_width * 0.5 - obj_width * 0.5
+            static_relevant_to_path = (
+                is_vehicle_obj
+                or (
+                    -2.0 < long < max(8.0, ego_speed * 1.5)
+                    and static_lateral_clearance <= self.config.hard_static_lateral_margin
+                )
+            )
 
             # 计算距离
             obj_dist = float(np.linalg.norm(delta))
@@ -2052,7 +3126,12 @@ class PredictiveRecoveryFilter:
                 nearest_static_dist = min(nearest_static_dist, obj_dist)
 
             # 前方近距离阻塞物检查
-            if 0 < long < 20.0 and lat < (ego_width + obj_width) * 0.8:
+            front_lateral_limit = (
+                self.config.hard_vehicle_lateral_margin
+                if is_vehicle_obj
+                else self.config.hard_static_lateral_margin
+            )
+            if 0 < long < 20.0 and static_lateral_clearance <= front_lateral_limit:
                 if long < front_blocking_dist:
                     front_blocking_dist = long
 
@@ -2087,6 +3166,30 @@ class PredictiveRecoveryFilter:
                     future_center, ego_heading, inflated_ego_length, inflated_ego_width,
                     future_obj_pos, _get_heading(obj, 0.0), inflated_obj_length, inflated_obj_width
                 ):
+                    future_gap = self._center_gap(
+                        future_center,
+                        ego_length,
+                        ego_width,
+                        future_obj_pos,
+                        obj_length,
+                        obj_width,
+                    )
+                    if is_vehicle_obj:
+                        closing_speed = max(0.0, ego_speed - speed)
+                        lateral_overlap = lat < ego_width * 0.5 + obj_width * 0.5 + self.config.hard_vehicle_lateral_margin
+                        imminent_front_closure = (
+                            -1.0 < long < max(6.0, ego_speed * 0.8)
+                            and lateral_overlap
+                            and closing_speed > 0.5
+                        )
+                        if future_gap > self.config.hard_vehicle_lateral_margin:
+                            continue
+                        if future_gap > 0.0 and not imminent_front_closure:
+                            continue
+                    if not is_vehicle_obj and (
+                        not static_relevant_to_path or future_gap > self.config.hard_static_lateral_margin
+                    ):
+                        continue
                     result["emergency_detected"] = True
                     if is_vehicle_obj:
                         result["emergency_reason"] = f"vehicle_collision_step_{step_ahead}"
@@ -2095,7 +3198,12 @@ class PredictiveRecoveryFilter:
                     return result
 
                 # 额外检查：如果物体非常近且 ego 速度较高，不允许 raw_action
-                if long > 0 and long < 8.0 and lat < ego_width * 0.5 + obj_width * 0.5 + 0.5:
+                approach_lateral_limit = (
+                    self.config.hard_vehicle_lateral_margin
+                    if is_vehicle_obj
+                    else self.config.hard_static_lateral_margin
+                )
+                if long > 0 and long < 8.0 and static_lateral_clearance <= approach_lateral_limit:
                     if ego_speed > 3.0:
                         # 高速接近前方近距离物体
                         result["emergency_detected"] = True
@@ -2160,10 +3268,11 @@ class PredictiveRecoveryFilter:
             speed = _get_speed(obj, 0.0)
             length, width = _get_size(obj)
             obj_id = self._object_id(obj)
-            class_name = obj.__class__.__name__.lower()
-            is_vehicle = "vehicle" in class_name or hasattr(obj, "throttle_brake") or hasattr(obj, "speed")
-            is_static = speed < 0.5 and not is_vehicle
-            object_type = "vehicle" if is_vehicle else "static_obstacle"
+            if self._is_benign_road_marking_object(obj, obj_id):
+                continue
+            object_type, is_vehicle, is_static = self._classify_scene_object(obj, obj_id, speed)
+            if object_type == "static_obstacle":
+                continue
             projection = frame.project_point(pos, heading, validate_heading=False)
             rel_s = projection.s - ego_projection.s
             rel_l = projection.l - ego_projection.l
@@ -2189,7 +3298,7 @@ class PredictiveRecoveryFilter:
                 speed=speed,
                 length=length,
                 width=width,
-                is_static=is_static or speed < 0.5,
+                is_static=is_static or (speed < 0.5 and not is_vehicle),
                 is_vehicle=is_vehicle,
                 is_blocking=is_blocking,
                 frenet_valid=projection.frenet_valid,
@@ -2226,6 +3335,9 @@ class PredictiveRecoveryFilter:
             "front_blocking_object_s": front.s if front is not None else float("inf"),
             "front_blocking_object_l": front.l if front is not None else float("inf"),
             "front_blocking_object_width": front.width if front is not None else 0.0,
+            "scene_object_count": len(objects),
+            "scene_static_object_count": sum(1 for obj in objects if obj.is_static and not obj.is_vehicle),
+            "scene_vehicle_object_count": sum(1 for obj in objects if obj.is_vehicle),
             "left_space_available": left_space,
             "right_space_available": right_space,
             "blocker_left_gap": blocker_left_gap,
@@ -2240,13 +3352,34 @@ class PredictiveRecoveryFilter:
         if engine is not None:
             traffic_manager = getattr(engine, "traffic_manager", None)
             if traffic_manager is not None:
-                for attr in ("vehicles", "traffic_vehicles", "_traffic_vehicles"):
+                for attr in ("vehicles", "traffic_vehicles", "_traffic_vehicles", "traffic_objects", "objects", "_objects"):
                     if hasattr(traffic_manager, attr):
                         sources.append(getattr(traffic_manager, attr))
 
             agent_manager = getattr(engine, "agent_manager", None)
             if agent_manager is not None and hasattr(agent_manager, "active_agents"):
                 sources.append(getattr(agent_manager, "active_agents"))
+
+            object_manager = getattr(engine, "object_manager", None)
+            if object_manager is not None:
+                for attr in (
+                    "objects",
+                    "_objects",
+                    "static_objects",
+                    "traffic_objects",
+                    "road_objects",
+                    "spawned_objects",
+                    "dynamic_objects",
+                ):
+                    if hasattr(object_manager, attr):
+                        sources.append(getattr(object_manager, attr))
+                for method_name in ("get_objects", "get_all_objects"):
+                    method = getattr(object_manager, method_name, None)
+                    if callable(method):
+                        try:
+                            sources.append(method())
+                        except Exception:
+                            pass
 
             if self.config.debug and hasattr(engine, "get_objects"):
                 try:
@@ -2257,7 +3390,7 @@ class PredictiveRecoveryFilter:
         for holder in (root,):
             if holder is None:
                 continue
-            for attr in ("vehicles", "agents", "objects"):
+            for attr in ("vehicles", "agents", "objects", "static_objects", "traffic_objects", "road_objects"):
                 if hasattr(holder, attr):
                     sources.append(getattr(holder, attr))
 
@@ -2270,6 +3403,10 @@ class PredictiveRecoveryFilter:
                     sources.append(lidar.get_surrounding_vehicles(detected))
                 except Exception:
                     pass
+        if lidar is not None:
+            for attr in ("detected_objects", "nearby_objects", "objects"):
+                if hasattr(lidar, attr):
+                    sources.append(getattr(lidar, attr))
         for source in sources:
             for obj in self._iter_source(source):
                 yield obj
@@ -2306,6 +3443,44 @@ class PredictiveRecoveryFilter:
                 except Exception:
                     pass
         return str(id(obj))
+
+    def _classify_scene_object(self, obj: Any, obj_id: str, speed: float) -> Tuple[str, bool, bool]:
+        class_name = obj.__class__.__name__.lower()
+        type_text = " ".join([
+            class_name,
+            str(obj_id).lower(),
+            str(getattr(obj, "type", "")).lower(),
+            str(getattr(obj, "object_type", "")).lower(),
+        ])
+        static_markers = [
+            "traffic_cone",
+            "cone",
+            "traffic_barrier",
+            "barrier",
+            "traffic_object",
+            "road_edge_sidewalk",
+            "sidewalk",
+            "road_line_solid_single_white",
+            "solid_single_white",
+            "object",
+            "sign",
+            "light",
+        ]
+        for marker in static_markers:
+            if marker in type_text:
+                if "cone" in marker or "cone" in type_text:
+                    return "TRAFFIC_CONE", False, True
+                if "barrier" in marker or "barrier" in type_text:
+                    return "TRAFFIC_BARRIER", False, True
+                if "sidewalk" in marker or "road_edge" in type_text:
+                    return "ROAD_EDGE_SIDEWALK", False, True
+                if "line" in marker or "solid" in type_text:
+                    return "ROAD_LINE_SOLID_SINGLE_WHITE", False, True
+                return "TRAFFIC_OBJECT", False, True
+        is_vehicle = "vehicle" in type_text or hasattr(obj, "throttle_brake") or hasattr(obj, "navigation")
+        if is_vehicle:
+            return "vehicle", True, False
+        return "static_obstacle", False, speed < 0.5
 
     def _estimate_side_space(
         self,
@@ -2401,7 +3576,8 @@ class PredictiveRecoveryFilter:
             0.0,
         ]
         if not np.isfinite(blocking_distance):
-            speed_values = [raw_target_speed, ego_speed, min(10.0, self.config.max_speed), 3.0, 0.0]
+            creep_speed = _clip(max(1.0, min(2.0, raw_target_speed * 0.35)), 0.0, self.config.max_speed)
+            speed_values = [raw_target_speed, 3.0, creep_speed, ego_speed, 0.0]
         speed_targets = []
         for value in speed_values:
             value = _clip(value, 0.0, self.config.max_speed)
@@ -2438,7 +3614,7 @@ class PredictiveRecoveryFilter:
         if has_blocking and lateral_shift > 0.5 and speed_target > 1.0:
             priority -= 1.0
         if speed_target < 0.5:
-            priority -= 0.2
+            priority += 0.2 if has_blocking else 1.2
         return priority
 
     def _candidate_type(self, current_l: float, lateral_target: float, ego_speed: float, speed_target: float) -> str:
@@ -2466,6 +3642,7 @@ class PredictiveRecoveryFilter:
         ego_width: float,
         raw_action: np.ndarray,
         scene_info: Dict[str, Any],
+        objects: Sequence[SceneObject],
     ) -> Dict[str, Any]:
         """对 raw_action 做短时对照预测。"""
         result = {
@@ -2477,6 +3654,9 @@ class PredictiveRecoveryFilter:
             "min_boundary_margin": float("inf"),
             "deadlock_risk": 0.0,
             "total_score": 0.0,
+            "collision_time": float("inf"),
+            "out_of_road_time": float("inf"),
+            "failure_reason": "",
         }
         if ego_pos is None:
             result["predicted_collision"] = True
@@ -2494,11 +3674,11 @@ class PredictiveRecoveryFilter:
             raw_action=raw_action.copy(),
         )
 
-        # Rollout raw_action（只检查控制和边界，不检查障碍物）
+        # Rollout raw_action with the same obstacle/boundary hard checks as candidates.
         rollout, reject_reason = self._rollout_candidate_with_hard_check(
             raw_candidate,
             frame,
-            [],  # 空障碍物列表
+            objects,
             ego_projection,
             ego_pos,
             ego_heading,
@@ -2510,12 +3690,18 @@ class PredictiveRecoveryFilter:
         )
 
         result["min_boundary_margin"] = rollout.min_boundary_margin
+        result["min_vehicle_margin"] = rollout.min_vehicle_margin
+        result["min_static_margin"] = rollout.min_static_margin
         result["cost_risk"] = rollout.predicted_cost_risk
+        result["collision_time"] = rollout.first_collision_time
+        result["out_of_road_time"] = rollout.first_out_of_road_time
+        result["failure_reason"] = reject_reason or rollout.failure_reason
 
         if not rollout.hard_safe:
-            result["predicted_collision"] = True
             if "boundary" in reject_reason:
                 result["predicted_out_of_road"] = True
+            else:
+                result["predicted_collision"] = True
 
         # 检查边界
         if ego_projection.frenet_valid:
@@ -2591,6 +3777,8 @@ class PredictiveRecoveryFilter:
         predicted_collision = False
         predicted_out_of_road = False
         predicted_cost_risk = 0.0
+        first_collision_time = float("inf")
+        first_out_of_road_time = float("inf")
 
         # 无阻塞物时，禁止大幅侧向候选
         has_blocking = any(obj.is_blocking for obj in objects)
@@ -2665,11 +3853,13 @@ class PredictiveRecoveryFilter:
                 hard_safe = False
                 failure_reason = "boundary_invalid"
                 predicted_out_of_road = True
+                first_out_of_road_time = min(first_out_of_road_time, t)
                 break
             if boundary.boundary_margin < self.config.boundary_hard_margin:
                 hard_safe = False
                 failure_reason = "boundary_margin"
                 predicted_out_of_road = True
+                first_out_of_road_time = min(first_out_of_road_time, t)
                 break
             # 边界余量不足时禁止绕行
             if boundary.boundary_margin < self.config.min_boundary_margin_for_bypass:
@@ -2694,18 +3884,25 @@ class PredictiveRecoveryFilter:
                 if obj.is_vehicle:
                     inflated_obj_length = obj.length + 2.0 * self.config.hard_collision_margin
                     inflated_obj_width = obj.width + 2.0 * self.config.hard_collision_margin
+                    vehicle_relevant_to_path = True
 
                     if obj.frenet_valid:
                         rel_s = obj.s - s_value
                         rel_l = obj.l - l_value
-                        lateral_gap = abs(rel_l) - inflated_ego_width * 0.5 - inflated_obj_width * 0.5
+                        lateral_gap = abs(rel_l) - ego_width * 0.5 - obj.width * 0.5
+                        vehicle_relevant_to_path = (
+                            -4.0 < rel_s < max(8.0, ego_speed * 1.5)
+                            and lateral_gap <= self.config.hard_vehicle_lateral_margin
+                        )
 
                         # 严重横向 RSS 检查
                         if obj.speed < 1.0:
-                            if lateral_gap < self.config.severe_lateral_rss_margin:
+                            longitudinal_overlap = abs(rel_s) < self.config.hard_vehicle_longitudinal_margin
+                            if longitudinal_overlap and lateral_gap < self.config.severe_lateral_rss_margin:
                                 hard_safe = False
                                 failure_reason = "severe_lateral_rss"
                                 predicted_collision = True
+                                first_collision_time = min(first_collision_time, t)
                                 break
 
                         # 切入风险
@@ -2713,6 +3910,7 @@ class PredictiveRecoveryFilter:
                             hard_safe = False
                             failure_reason = "cut_in_danger"
                             predicted_collision = True
+                            first_collision_time = min(first_collision_time, t)
                             break
 
                         # 车辆侧向硬距离
@@ -2721,6 +3919,7 @@ class PredictiveRecoveryFilter:
                                 hard_safe = False
                                 failure_reason = "vehicle_lateral_margin_violation"
                                 predicted_collision = True
+                                first_collision_time = min(first_collision_time, t)
                                 break
 
                         # 并排行驶时横向距离不足
@@ -2728,10 +3927,11 @@ class PredictiveRecoveryFilter:
                             hard_safe = False
                             failure_reason = "parallel_lateral_violation"
                             predicted_collision = True
+                            first_collision_time = min(first_collision_time, t)
                             break
 
                     # 碰撞检查
-                    if _rectangles_intersect(
+                    if vehicle_relevant_to_path and _rectangles_intersect(
                         position,
                         heading,
                         inflated_ego_length,
@@ -2741,31 +3941,42 @@ class PredictiveRecoveryFilter:
                         inflated_obj_length,
                         inflated_obj_width,
                     ):
-                        hard_safe = False
-                        failure_reason = "collision"
-                        predicted_collision = True
-                        break
+                        if gap <= self.config.hard_vehicle_lateral_margin:
+                            hard_safe = False
+                            failure_reason = "collision"
+                            predicted_collision = True
+                            first_collision_time = min(first_collision_time, t)
+                            break
 
                     min_vehicle_margin = min(min_vehicle_margin, gap)
                     # cost 风险
                     if gap < self.config.obstacle_margin:
                         predicted_cost_risk += (self.config.obstacle_margin - gap) * 0.3
                 else:
-                    inflated_obj_length = obj.length + 2.0 * self.config.hard_collision_margin
-                    inflated_obj_width = obj.width + 2.0 * self.config.hard_collision_margin
+                    static_inflation = self.config.hard_collision_margin + 0.5
+                    inflated_ego_length = ego_length + 2.0 * static_inflation
+                    inflated_ego_width = ego_width + 2.0 * static_inflation
+                    inflated_obj_length = obj.length + 2.0 * static_inflation
+                    inflated_obj_width = obj.width + 2.0 * static_inflation
+                    static_relevant_to_path = True
 
                     if obj.frenet_valid:
                         rel_s = obj.s - s_value
                         rel_l = obj.l - l_value
+                        lateral_clearance = abs(rel_l) - ego_width * 0.5 - obj.width * 0.5
+                        static_relevant_to_path = (
+                            -2.0 < rel_s < max(8.0, ego_speed * 1.5)
+                            and lateral_clearance <= self.config.hard_static_lateral_margin
+                        )
                         if abs(rel_s) < self.config.hard_static_longitudinal_margin:
-                            lateral_gap = abs(rel_l) - inflated_ego_width * 0.5 - inflated_obj_width * 0.5
-                            if lateral_gap < self.config.hard_static_lateral_margin:
+                            if lateral_clearance < self.config.hard_static_lateral_margin:
                                 hard_safe = False
                                 failure_reason = "static_margin_violation"
                                 predicted_collision = True
+                                first_collision_time = min(first_collision_time, t)
                                 break
 
-                    if _rectangles_intersect(
+                    if static_relevant_to_path and _rectangles_intersect(
                         position,
                         heading,
                         inflated_ego_length,
@@ -2778,6 +3989,7 @@ class PredictiveRecoveryFilter:
                         hard_safe = False
                         failure_reason = "static_collision"
                         predicted_collision = True
+                        first_collision_time = min(first_collision_time, t)
                         break
 
                     min_static_margin = min(min_static_margin, gap)
@@ -2810,6 +4022,8 @@ class PredictiveRecoveryFilter:
             predicted_collision=predicted_collision,
             predicted_out_of_road=predicted_out_of_road,
             predicted_cost_risk=predicted_cost_risk,
+            first_collision_time=first_collision_time,
+            first_out_of_road_time=first_out_of_road_time,
         )
         return rollout, failure_reason
 
@@ -2841,6 +4055,18 @@ class PredictiveRecoveryFilter:
             target_progress = min(blocking_distance + 6.0, max(8.0, self.config.horizon * 5.0))
             if progress < target_progress:
                 deadlock_penalty += max(0.0, target_progress - progress) * (0.9 if side_channel_available else 0.35)
+
+        stop_candidate = rollout.candidate.speed_target < 0.5 or rollout.candidate.candidate_type.endswith("_stop")
+        raw_throttle = _safe_float(raw_action[1] if raw_action is not None and len(raw_action) > 1 else 0.0, 0.0)
+        if (
+            stop_candidate
+            and raw_throttle > self.config.low_risk_high_throttle_threshold
+            and self._low_progress_count >= self.config.ultra_low_progress_steps
+        ):
+            stop_penalty = self.config.stop_candidate_low_progress_penalty
+            if has_blocking and not side_channel_available:
+                stop_penalty *= 0.35
+            deadlock_penalty += stop_penalty
 
         rss_long_score, rss_long_margin = self._longitudinal_rss_score(rollout, frame, objects, ego_length, ego_width)
         rss_lat_score, rss_lat_margin = self._lateral_rss_score(rollout, objects, ego_length, ego_width)
@@ -3099,7 +4325,13 @@ class PredictiveRecoveryFilter:
         self._prev_safe_steer = None
         self._prev_safe_acc = None
 
-    def _minimum_risk_stop(self, vehicle: Any, contact_state: bool = False, contact_info: Optional[Dict[str, Any]] = None) -> np.ndarray:
+    def _minimum_risk_stop(
+        self,
+        vehicle: Any,
+        contact_state: bool = False,
+        contact_info: Optional[Dict[str, Any]] = None,
+        boundary_risk: bool = False,
+    ) -> np.ndarray:
         """
         最小风险停车。
         如果 contact_state=True（已经 contact/crash），则进入 contact_state_handler：
@@ -3129,8 +4361,10 @@ class PredictiveRecoveryFilter:
             return np.array([_clip(current_steer * 0.2, -0.2, 0.2), brake], dtype=np.float32)
         else:
             # 普通最小风险停车
-            brake = -0.8 if speed > 1.0 else -0.3
-            return np.array([_clip(current_steer * 0.4, -0.25, 0.25), brake], dtype=np.float32)
+            brake = -0.85 if speed > 1.0 else -0.4
+            if boundary_risk:
+                return np.array([_clip(-current_steer * 0.6, -0.35, 0.35), brake], dtype=np.float32)
+            return np.array([_clip(current_steer * 0.25, -0.20, 0.20), brake], dtype=np.float32)
 
     def _write_csv(self, info: Dict[str, Any]) -> None:
         path = self.config.log_csv_path
@@ -3173,6 +4407,17 @@ class PredictiveRecoveryFilter:
         self._disable_real_intervention_for_episode = False
         self._cost_streak_guard_triggered = False
         self._cost_streak_guard_reason = ""
+        self._last_safe_action = None
+        self._step_index_this_ep = 0
+        self._recent_contact_step_indices = []
+        self._safety_hold_remaining = 0
+        self._safety_release_clean_count = 0
+        self._first_risk_detected_step = -1
+        self._first_intervention_step = -1
+        self._route_deviation_history = []
+        self._reset_boundary_contact_escape()
+        self._ultra_short_vehicle_deadlock_steps = 0
+        self._deadlock_release_remaining = 0
 
 
 def _rectangle_corners(center: np.ndarray, heading: float, length: float, width: float) -> np.ndarray:
