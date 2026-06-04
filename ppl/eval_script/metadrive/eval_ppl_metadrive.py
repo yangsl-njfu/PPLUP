@@ -22,6 +22,7 @@ import argparse
 import os
 import os.path as osp
 import time
+import traceback
 from collections import defaultdict
 
 import numpy as np
@@ -701,7 +702,20 @@ def evaluate_ppl_once(
 
             # Runtime assurance filter
             if predictive_filter is not None:
-                safe_action, safety_info = predictive_filter.filter(env, o, raw_action)
+                try:
+                    safe_action, safety_info = predictive_filter.filter(env, o, raw_action)
+                except Exception:
+                    print("[Runtime Assurance] PredictiveRecoveryFilter.filter() failed.")
+                    print(
+                        "episode={} step={} global_step={}".format(
+                            ep_count + 1,
+                            step_count + 1,
+                            global_step_count + 1,
+                        )
+                    )
+                    print("raw_action={}".format(np.asarray(raw_action).tolist()))
+                    traceback.print_exc()
+                    raise
             else:
                 safe_action, safety_info = raw_action, {}
 
@@ -934,8 +948,8 @@ def evaluate_ppl_once(
                 if predictive_filter is not None:
                     predictive_filter.reset_episode()
 
-    except Exception as e:
-        raise e
+    except Exception:
+        raise
     finally:
         env.close()
 

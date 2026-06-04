@@ -1,12 +1,15 @@
 import csv
+import logging
 import math
 import os
 import time
-import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+
+logger = logging.getLogger(__name__)
 
 
 RECOVERY_DIAGNOSTIC_FIELDS = [
@@ -1319,6 +1322,7 @@ class PredictiveRecoveryFilter:
                 info["filter_time_ms"] = elapsed_ms
                 if elapsed_ms > self.config.filter_time_warn_ms:
                     info["filter_time_warning"] = True
+                self._assert_no_exception_recovery(info)
                 return safe_action, info
 
             # ===== 更新 cooldown ===
@@ -1423,25 +1427,42 @@ class PredictiveRecoveryFilter:
                     if self._is_boundary_contact_reason(reason) or "boundary" in reason or "route" in reason
                     else "pre_contact_emergency_stop"
                 )
-                hold_reason = "" if selected_type == "pre_contact_boundary_recovery" else reason
                 if selected_type == "pre_contact_boundary_recovery":
                     self._safety_hold_remaining = 0
                     self._safety_release_clean_count = 0
-                safe_action = self._pre_contact_recovery_action(
-                    vehicle, raw_action_np, selected_type, ego_projection, frame, ego_width
-                )
-                return self._return_recovery_action(
-                    safe_action,
-                    raw_action_np,
-                    info,
-                    start,
-                    recovery_mode="pre_contact_emergency",
-                    selected_candidate_type=selected_type,
-                    fallback_reason=reason,
-                    intervention_reason=reason,
-                    hard_risk_reason=hold_reason,
-                    pre_contact=True,
-                )
+                    safe_action = self._pre_contact_recovery_action(
+                        vehicle, raw_action_np, selected_type, ego_projection, frame, ego_width
+                    )
+                    return self._return_recovery_action(
+                        safe_action,
+                        raw_action_np,
+                        info,
+                        start,
+                        recovery_mode="pre_contact_emergency",
+                        selected_candidate_type=selected_type,
+                        fallback_reason=reason,
+                        intervention_reason=reason,
+                        hard_risk_reason="",
+                        pre_contact=True,
+                    )
+                hard_risk = True
+                hard_risk_reason = self._combine_reasons(hard_risk_reason, reason)
+                info["hard_risk"] = True
+                info["hard_risk_reason"] = hard_risk_reason
+                info["fallback_reason"] = reason
+                self._record_hard_risk(reason)
+
+            raw_hard_unsafe, raw_hard_reason = self._raw_action_hard_unsafe(
+                raw_eval,
+                risk_metrics,
+                ego_speed,
+            )
+            if raw_hard_unsafe:
+                hard_risk = True
+                hard_risk_reason = self._combine_reasons(hard_risk_reason, raw_hard_reason)
+                info["hard_risk"] = True
+                info["hard_risk_reason"] = hard_risk_reason
+                self._record_hard_risk(raw_hard_reason)
 
             if self._deadlock_release_remaining > 0:
                 if self._deadlock_progress_release_allowed(
@@ -1547,6 +1568,7 @@ class PredictiveRecoveryFilter:
                 self._reset_prev_safe()
                 elapsed_ms = (time.time() - start) * 1000.0
                 info["filter_time_ms"] = elapsed_ms
+                self._assert_no_exception_recovery(info)
                 return safe_action, info
 
             # ===== 步骤5：Rollout 候选并边展开边淘汰 =====
@@ -1623,7 +1645,10 @@ class PredictiveRecoveryFilter:
             best_rollout: Optional[TrajectoryRollout] = None
 
             if safe_rollouts:
-                best_score, best_rollout = min(safe_rollouts, key=lambda item: item[0].total_score)
+                if hard_risk:
+                    best_score, best_rollout = self._select_hard_recovery_rollout(safe_rollouts)
+                else:
+                    best_score, best_rollout = min(safe_rollouts, key=lambda item: item[0].total_score)
 
                 # 检查接管条件
                 raw_collision_hard_for_intervention = (
@@ -1632,6 +1657,7 @@ class PredictiveRecoveryFilter:
                 )
                 raw_has_clear_risk = (
                     hard_risk
+                    or raw_hard_unsafe
                     or raw_collision_hard_for_intervention
                     or raw_eval.get("predicted_out_of_road", False) == True
                     or raw_eval.get("cost_risk", 0.0) > 2.0
@@ -1641,28 +1667,7 @@ class PredictiveRecoveryFilter:
 
                 # 检查 candidate 是否真的比 raw_action 更好
                 if hard_risk:
-                    raw_boundary_margin = _safe_float(raw_eval.get("min_boundary_margin"), float("inf"))
-                    raw_static_margin = _safe_float(raw_eval.get("min_static_margin"), float("inf"))
-                    boundary_not_worse = best_rollout.min_boundary_margin >= self.config.min_boundary_margin_for_bypass
-                    if np.isfinite(raw_boundary_margin):
-                        boundary_not_worse = boundary_not_worse and best_rollout.min_boundary_margin >= raw_boundary_margin - 0.25
-                    static_not_worse = True
-                    if np.isfinite(raw_static_margin):
-                        static_not_worse = best_rollout.min_static_margin >= raw_static_margin - 0.30
-                    high_speed_lateral_bypass = (
-                        ego_speed > 8.0
-                        and ("left_" in best_rollout.candidate.candidate_type or "right_" in best_rollout.candidate.candidate_type)
-                        and ("vehicle_ttc" in hard_risk_reason or "predicted_collision" in hard_risk_reason)
-                        and raw_boundary_margin < 2.0
-                    )
-                    candidate_better = (
-                        best_rollout.hard_safe
-                        and not best_rollout.predicted_collision
-                        and not best_rollout.predicted_out_of_road
-                        and boundary_not_worse
-                        and static_not_worse
-                        and not high_speed_lateral_bypass
-                    )
+                    candidate_better = self._hard_recovery_candidate_acceptable(best_rollout)
                 else:
                     candidate_better = (
                         best_rollout.hard_safe
@@ -1919,56 +1924,9 @@ class PredictiveRecoveryFilter:
             self._last_vehicle_margin_min = vehicle_margin_min
             self._last_static_margin_min = static_margin_min
 
-        except Exception as exc:
-            vehicle = _get_ego_vehicle(env)
-            # 检查 contact state
-            contact_results = getattr(vehicle, "contact_results", None)
-            contact_state = False
-            if contact_results is not None:
-                contact_str = str(contact_results).lower()
-                dangerous_types = ["vehicle", "traffic_object", "traffic_cone", "traffic_barrier", "crash"]
-                for dtype in dangerous_types:
-                    if dtype in contact_str:
-                        contact_state = True
-                        break
-
-            safe_action = np.array([0.0, -0.9], dtype=np.float32)
-            # 判断 actual_action_modified
-            action_modified = (
-                abs(safe_action[0] - raw_action_np[0]) > 1e-3
-                or abs(safe_action[1] - raw_action_np[1]) > 1e-3
-            )
-            exception_trace = traceback.format_exc()
-            info.update({
-                "recovery_mode": "exception_fallback",
-                "recovery_certified": False,
-                "accepted_by_filter": True,
-                "model_predicted_safe": False,
-                "selected_candidate_type": "exception_emergency_brake",
-                "fallback_reason": "exception_fallback:{}".format(type(exc).__name__),
-                "control_feasible": True,
-                "allow_intervention": True,
-                "intervention_reason": "exception",
-                "filter_intervened": True,
-                "actual_action_modified": action_modified,
-                "contact_state_detected": contact_state,
-                "hard_risk": True,
-                "hard_risk_reason": "exception_fallback",
-                "exception_type": type(exc).__name__,
-                "exception_message": str(exc),
-                "exception_traceback": exception_trace,
-            })
-            self._record_hard_risk("exception_fallback")
-            self._last_recovery_active = True
-            self._intervention_count_this_ep += 1
-            self._last_intervention_step = self._step_index_this_ep
-            if self._first_intervention_step < 0:
-                self._first_intervention_step = self._step_index_this_ep
-            self._cooldown_remaining = self.config.intervention_cooldown_steps
-            self._enter_safety_hold("exception_fallback")
-            self._last_safe_action = safe_action.copy()
-            if self.config.debug:
-                info["debug_exception"] = str(exc)
+        except Exception:
+            logger.exception("PredictiveRecoveryFilter failed")
+            raise
 
         elapsed_ms = (time.time() - start) * 1000.0
         info["filter_time_ms"] = elapsed_ms
@@ -1978,7 +1936,12 @@ class PredictiveRecoveryFilter:
         info["risk_to_intervention_delay"] = self._risk_to_intervention_delay()
         info["safety_hold_active"] = self._safety_hold_remaining > 0
         info["safety_hold_remaining"] = self._safety_hold_remaining
+        self._assert_no_exception_recovery(info)
         return np.asarray(safe_action, dtype=np.float32), info
+
+    def _assert_no_exception_recovery(self, info: Dict[str, Any]) -> None:
+        assert info.get("selected_candidate_type") != "exception_emergency_brake"
+        assert info.get("recovery_mode") != "exception_fallback"
 
     def _empty_info(self) -> Dict[str, Any]:
         info = {field_name: 0 for field_name in RECOVERY_DIAGNOSTIC_FIELDS}
@@ -2150,6 +2113,7 @@ class PredictiveRecoveryFilter:
         info["filter_time_ms"] = elapsed_ms
         if elapsed_ms > self.config.filter_time_warn_ms:
             info["filter_time_warning"] = True
+        self._assert_no_exception_recovery(info)
         return safe_action, info
 
     def _record_hard_risk(self, reason: str) -> None:
@@ -2313,6 +2277,35 @@ class PredictiveRecoveryFilter:
         if "sidewalk" in text or "solid" in text:
             return False
         return "road_line" in text or "lane_line" in text
+
+    def _object_type_name(self, object_type):
+        if object_type is None:
+            return ""
+        try:
+            if hasattr(object_type, "name"):
+                return str(object_type.name).upper()
+            if hasattr(object_type, "__name__"):
+                return str(object_type.__name__).upper()
+            return str(object_type).upper()
+        except Exception:
+            return ""
+
+    def _is_soft_static_object_type(self, object_type):
+        name = self._object_type_name(object_type)
+        soft_keywords = (
+            "ROAD_LINE",
+            "BROKEN_SINGLE_WHITE",
+            "BROKEN_SINGLE_YELLOW",
+            "BROKEN",
+            "LANE_MARKING",
+            "LANE_LINE",
+            "NAVIGATION",
+            "ROUTE_MARKER",
+            "DEBUG",
+            "TARGET",
+            "WAYPOINT",
+        )
+        return any(k in name for k in soft_keywords)
 
     def _contact_state(self, vehicle: Any) -> Tuple[bool, Dict[str, Any]]:
         info: Dict[str, Any] = {}
@@ -2567,6 +2560,89 @@ class PredictiveRecoveryFilter:
         if self._static_object_path_aligned(metrics, _safe_float(metrics.get("ego_speed"), 0.0)):
             return False
         return True
+
+    def _combine_reasons(self, *reasons: str) -> str:
+        parts: List[str] = []
+        for reason in reasons:
+            for part in str(reason or "").split(";"):
+                part = part.strip()
+                if part and part not in parts:
+                    parts.append(part)
+        return ";".join(parts)
+
+    def _raw_action_hard_unsafe(
+        self,
+        raw_eval: Dict[str, Any],
+        metrics: Dict[str, Any],
+        ego_speed: float,
+    ) -> Tuple[bool, str]:
+        if bool(raw_eval.get("predicted_out_of_road", False)):
+            return True, "raw_predicted_out_of_road"
+        if bool(raw_eval.get("predicted_collision", False)) and not self._raw_collision_deadlock_escape_candidate(raw_eval, metrics):
+            reason = str(raw_eval.get("failure_reason", "") or "collision").lower()
+            hard_collision_reasons = (
+                "collision",
+                "static_collision",
+                "static_margin_violation",
+                "cut_in_danger",
+                "vehicle_lateral_margin_violation",
+                "parallel_lateral_violation",
+                "severe_lateral_rss",
+            )
+            if reason in hard_collision_reasons or "collision" in reason or "rss" in reason:
+                return True, "raw_collision_risk:{}".format(reason)
+        if _safe_float(metrics.get("ttc_vehicle_min"), float("inf")) < self.config.hard_vehicle_ttc_threshold:
+            return True, "vehicle_ttc"
+        if (
+            _safe_float(metrics.get("ttc_static_min"), float("inf")) < self.config.hard_static_ttc_threshold
+            and self._static_object_path_aligned(metrics, ego_speed)
+        ):
+            return True, "static_ttc"
+        if self._static_distance_is_immediate_risk(
+            raw_eval,
+            metrics,
+            ego_speed,
+            self.config.hard_static_distance_threshold,
+        ):
+            return True, "static_object_distance"
+        return False, ""
+
+    def _hard_recovery_candidate_acceptable(self, rollout: Optional[TrajectoryRollout]) -> bool:
+        return bool(
+            rollout is not None
+            and rollout.hard_safe
+            and not rollout.predicted_collision
+            and not rollout.predicted_out_of_road
+        )
+
+    def _select_hard_recovery_rollout(
+        self,
+        safe_rollouts: List[Tuple[TrajectoryScore, TrajectoryRollout]],
+    ) -> Tuple[TrajectoryScore, TrajectoryRollout]:
+        acceptable = [
+            item for item in safe_rollouts
+            if self._hard_recovery_candidate_acceptable(item[1])
+        ]
+        pool = acceptable or safe_rollouts
+
+        def priority(item: Tuple[TrajectoryScore, TrajectoryRollout]) -> Tuple[int, float, float]:
+            score, rollout = item
+            candidate_type = str(rollout.candidate.candidate_type)
+            speed_target = _safe_float(rollout.candidate.speed_target, 0.0)
+            lateral_bypass = (
+                (candidate_type.startswith("left_") or candidate_type.startswith("right_"))
+                and speed_target > 0.5
+                and "stop" not in candidate_type
+            )
+            if lateral_bypass:
+                group = 0
+            elif speed_target > 0.5 and "stop" not in candidate_type:
+                group = 1
+            else:
+                group = 2
+            return group, float(score.total_score), -_safe_float(rollout.min_obstacle_margin, 0.0)
+
+        return min(pool, key=priority)
 
     def _deadlock_progress_release_allowed(
         self,
@@ -2980,8 +3056,6 @@ class PredictiveRecoveryFilter:
 
             speed = _get_speed(obj, 0.0)
             object_type, is_vehicle_obj, _ = self._classify_scene_object(obj, self._object_id(obj), speed)
-            if object_type == "static_obstacle" and not is_vehicle_obj:
-                continue
             is_traffic_object = object_type in (
                 "TRAFFIC_CONE",
                 "TRAFFIC_BARRIER",
@@ -3093,8 +3167,6 @@ class PredictiveRecoveryFilter:
             obj_length, obj_width = _get_size(obj)
             speed = _get_speed(obj, 0.0)
             object_type, is_vehicle_obj, _ = self._classify_scene_object(obj, self._object_id(obj), speed)
-            if object_type == "static_obstacle" and not is_vehicle_obj:
-                continue
 
             # 膨胀后的 ego footprint
             inflated_ego_length = ego_length + 1.0
@@ -3231,7 +3303,7 @@ class PredictiveRecoveryFilter:
             return False
         mode = info.get("recovery_mode", "")
         return bool(
-            mode in ("predictive_recovery", "minimum_risk_stop", "exception_fallback")
+            mode in ("predictive_recovery", "minimum_risk_stop")
             or info.get("filter_time_warning", False)
             or info.get("ultra_light_gate_reason", "") == "vehicle_risk_flag"
         )
@@ -3271,8 +3343,6 @@ class PredictiveRecoveryFilter:
             if self._is_benign_road_marking_object(obj, obj_id):
                 continue
             object_type, is_vehicle, is_static = self._classify_scene_object(obj, obj_id, speed)
-            if object_type == "static_obstacle":
-                continue
             projection = frame.project_point(pos, heading, validate_heading=False)
             rel_s = projection.s - ego_projection.s
             rel_l = projection.l - ego_projection.l
