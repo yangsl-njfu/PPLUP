@@ -102,6 +102,43 @@ class PredictiveRecoveryFilterFailFastTest(unittest.TestCase):
 
         self.assertEqual(selected.candidate.candidate_type, "left_pass")
 
+    def test_static_hard_risk_moving_bypass_does_not_enter_safety_hold(self):
+        recovery_filter = PredictiveRecoveryFilter(PredictiveRecoveryConfig())
+
+        def make_rollout(candidate_type, speed_target):
+            candidate = TrajectoryCandidate(
+                candidate_id=0,
+                candidate_type=candidate_type,
+                lateral_target=1.5 if candidate_type.startswith("left_") else 0.0,
+                speed_target=speed_target,
+                raw_action=np.array([0.0, 0.0], dtype=np.float32),
+            )
+            return TrajectoryRollout(
+                candidate=candidate,
+                times=np.array([0.2], dtype=float),
+                positions=np.zeros((1, 2), dtype=float),
+                headings=np.zeros(1, dtype=float),
+                speeds=np.array([speed_target], dtype=float),
+                accelerations=np.zeros(1, dtype=float),
+                steer_actions=np.zeros(1, dtype=float),
+                throttle_actions=np.zeros(1, dtype=float),
+                frenet_s=np.zeros(1, dtype=float),
+                frenet_l=np.zeros(1, dtype=float),
+                hard_safe=True,
+                min_obstacle_margin=2.0,
+            )
+
+        reason = "static_object_distance;raw_collision_risk:static_collision"
+        bypass = make_rollout("left_pass", 4.0)
+        stop = make_rollout("keep_stop", 0.0)
+
+        self.assertFalse(
+            recovery_filter._hard_intervention_should_enter_safety_hold(reason, False, bypass)
+        )
+        self.assertTrue(
+            recovery_filter._hard_intervention_should_enter_safety_hold(reason, False, stop)
+        )
+
     def test_raw_predicted_collision_is_hard_unsafe(self):
         recovery_filter = PredictiveRecoveryFilter(PredictiveRecoveryConfig())
         raw_eval = {
@@ -120,6 +157,71 @@ class PredictiveRecoveryFilterFailFastTest(unittest.TestCase):
 
         self.assertTrue(unsafe)
         self.assertEqual(reason, "raw_collision_risk:cut_in_danger")
+
+    def test_low_boundary_margin_is_hard_unsafe(self):
+        recovery_filter = PredictiveRecoveryFilter(PredictiveRecoveryConfig())
+        raw_eval = {
+            "predicted_collision": False,
+            "predicted_out_of_road": False,
+            "min_boundary_margin": 0.45,
+        }
+        metrics = {
+            "raw_boundary_margin": 0.45,
+            "ttc_vehicle_min": float("inf"),
+            "ttc_static_min": float("inf"),
+        }
+
+        unsafe, reason = recovery_filter._raw_action_hard_unsafe(raw_eval, metrics, ego_speed=8.0)
+
+        self.assertTrue(unsafe)
+        self.assertEqual(reason, "raw_boundary_margin_low")
+
+    def test_hard_recovery_latched_side_is_preferred(self):
+        recovery_filter = PredictiveRecoveryFilter(PredictiveRecoveryConfig())
+        recovery_filter._hard_bypass_side = "right"
+        recovery_filter._hard_bypass_remaining = 3
+
+        def make_rollout(candidate_type, total_score):
+            candidate = TrajectoryCandidate(
+                candidate_id=0,
+                candidate_type=candidate_type,
+                lateral_target=-1.5 if candidate_type.startswith("right_") else 1.5,
+                speed_target=4.0,
+                raw_action=np.array([0.0, 0.0], dtype=np.float32),
+            )
+            rollout = TrajectoryRollout(
+                candidate=candidate,
+                times=np.array([0.2], dtype=float),
+                positions=np.zeros((1, 2), dtype=float),
+                headings=np.zeros(1, dtype=float),
+                speeds=np.array([4.0], dtype=float),
+                accelerations=np.zeros(1, dtype=float),
+                steer_actions=np.zeros(1, dtype=float),
+                throttle_actions=np.zeros(1, dtype=float),
+                frenet_s=np.zeros(1, dtype=float),
+                frenet_l=np.zeros(1, dtype=float),
+                hard_safe=True,
+                min_boundary_margin=2.0,
+                min_obstacle_margin=2.0,
+            )
+            return TrajectoryScore(total_score=total_score), rollout
+
+        left = make_rollout("left_pass", 1.0)
+        right = make_rollout("right_pass", 10.0)
+
+        _, selected = recovery_filter._select_hard_recovery_rollout([left, right])
+
+        self.assertEqual(selected.candidate.candidate_type, "right_pass")
+
+    def test_road_line_contact_text_is_not_hard_contact(self):
+        recovery_filter = PredictiveRecoveryFilter(PredictiveRecoveryConfig())
+
+        self.assertTrue(
+            recovery_filter._contact_text_only_benign_road_marking("{ROAD_LINE_SOLID_SINGLE_WHITE}")
+        )
+        self.assertFalse(
+            recovery_filter._contact_text_only_benign_road_marking("{ROAD_LINE_SOLID_SINGLE_WHITE, sidewalk}")
+        )
 
 
 if __name__ == "__main__":

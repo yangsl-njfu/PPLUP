@@ -128,6 +128,10 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     # Hard-risk and safety-hold diagnostics
     "hard_risk",
     "hard_risk_reason",
+    "hard_recovery_moving_bypass",
+    "hard_recovery_entered_safety_hold",
+    "hard_bypass_side",
+    "hard_bypass_remaining",
     "low_risk_gate_passed",
     "low_risk_gate_rejected_reason",
     "safety_hold_active",
@@ -227,6 +231,8 @@ class PredictiveRecoveryConfig:
     safety_hold_steps: int = 8
     safety_release_clean_steps: int = 5
     disable_cooldown_passthrough_on_hard_risk: bool = True
+    hard_bypass_latch_steps: int = 12
+    hard_bypass_throttle_floor: float = 0.18
 
     # === 车辆碰撞硬约束 ===
     hard_vehicle_lateral_margin: float = 0.80
@@ -1091,6 +1097,8 @@ class PredictiveRecoveryFilter:
         self._boundary_contact_escape_steer: float = 0.0
         self._ultra_short_vehicle_deadlock_steps: int = 0
         self._deadlock_release_remaining: int = 0
+        self._hard_bypass_side: str = ""
+        self._hard_bypass_remaining: int = 0
 
     def filter(self, env: Any, obs: Any, raw_action: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
         del obs
@@ -1545,6 +1553,8 @@ class PredictiveRecoveryFilter:
             info["low_risk_gate_passed"] = low_risk_passed
             info["low_risk_gate_rejected_reason"] = low_risk_reject_reason
             if low_risk_passed:
+                if not hard_risk:
+                    self._decay_hard_bypass_side()
                 safe_action = raw_action_np.astype(np.float32)
                 info.update({
                     "recovery_mode": "inactive_raw_action",
@@ -1823,16 +1833,21 @@ class PredictiveRecoveryFilter:
                     self._first_intervention_step = self._step_index_this_ep
                 self._cooldown_remaining = self.config.intervention_cooldown_steps
                 hold_after_hard_intervention = False
+                hard_recovery_moving_bypass = False
                 if hard_risk:
-                    hard_reason_l = str(hard_risk_reason).lower()
-                    hold_after_hard_intervention = (
-                        contact_state
-                        or "contact" in hard_reason_l
-                        or "boundary" in hard_reason_l
-                        or "out_of_road" in hard_reason_l
-                        or "traffic" in hard_reason_l
-                        or "static_object_distance" in hard_reason_l
+                    hard_recovery_moving_bypass = self._hard_recovery_rollout_is_moving_bypass(best_rollout)
+                    if hard_recovery_moving_bypass:
+                        self._safety_hold_remaining = 0
+                        self._safety_release_clean_count = 0
+                    hold_after_hard_intervention = self._hard_intervention_should_enter_safety_hold(
+                        hard_risk_reason,
+                        contact_state,
+                        best_rollout,
                     )
+                    info["hard_recovery_moving_bypass"] = hard_recovery_moving_bypass
+                    info["hard_recovery_entered_safety_hold"] = hold_after_hard_intervention
+                    info["hard_bypass_side"] = self._hard_bypass_side
+                    info["hard_bypass_remaining"] = self._hard_bypass_remaining
                 if hold_after_hard_intervention:
                     self._enter_safety_hold(hard_risk_reason or "hard_risk")
 
@@ -1840,7 +1855,24 @@ class PredictiveRecoveryFilter:
                     [best_rollout.steer_actions[0], best_rollout.throttle_actions[0]],
                     dtype=np.float32,
                 )
-                if hard_risk and "vehicle_ttc" in hard_risk_reason and ego_speed > 8.0:
+                if hard_risk and hard_recovery_moving_bypass:
+                    self._latch_hard_bypass_side(best_rollout)
+                    throttle_cap = 0.30 if ego_speed < 15.0 else 0.18
+                    if best_rollout.min_boundary_margin >= self.config.low_risk_min_boundary_margin:
+                        throttle_floor = min(
+                            float(self.config.hard_bypass_throttle_floor),
+                            max(0.0, float(raw_action_np[1])),
+                            throttle_cap,
+                        )
+                        candidate_action[1] = max(float(candidate_action[1]), throttle_floor)
+                    candidate_action[1] = min(float(candidate_action[1]), max(0.0, float(raw_action_np[1])), throttle_cap)
+                    info["hard_bypass_side"] = self._hard_bypass_side
+                    info["hard_bypass_remaining"] = self._hard_bypass_remaining
+                elif hard_risk:
+                    self._decay_hard_bypass_side()
+                    info["hard_bypass_side"] = self._hard_bypass_side
+                    info["hard_bypass_remaining"] = self._hard_bypass_remaining
+                if hard_risk and "vehicle_ttc" in hard_risk_reason and ego_speed > 8.0 and not hard_recovery_moving_bypass:
                     throttle_cap = 0.0 if ego_speed > 15.0 else 0.25
                     candidate_action[1] = min(float(candidate_action[1]), float(raw_action_np[1]), throttle_cap)
                 if hard_risk:
@@ -1896,6 +1928,8 @@ class PredictiveRecoveryFilter:
             else:
                 # 不接管，返回 raw_action
                 safe_action = raw_action_np.astype(np.float32)
+                if not hard_risk:
+                    self._decay_hard_bypass_side()
                 info.update({
                     "recovery_mode": "inactive_raw_action",
                     "recovery_certified": False,
@@ -2025,6 +2059,10 @@ class PredictiveRecoveryFilter:
             # Hard-risk and safety-hold diagnostics
             "hard_risk": False,
             "hard_risk_reason": "",
+            "hard_recovery_moving_bypass": False,
+            "hard_recovery_entered_safety_hold": False,
+            "hard_bypass_side": "",
+            "hard_bypass_remaining": 0,
             "low_risk_gate_passed": False,
             "low_risk_gate_rejected_reason": "",
             "safety_hold_active": False,
@@ -2257,15 +2295,13 @@ class PredictiveRecoveryFilter:
             "traffic_object",
             "traffic_cone",
             "traffic_barrier",
-            "road_line_solid",
-            "solid_single",
             "sidewalk",
             "crash",
             "out_of_road",
         )
         if any(marker in text for marker in dangerous_markers):
             return False
-        return "broken" in text and ("road_line" in text or "lane_line" in text)
+        return "road_line" in text or "lane_line" in text
 
     def _is_benign_road_marking_object(self, obj: Any, obj_id: str) -> bool:
         text = " ".join([
@@ -2472,7 +2508,8 @@ class PredictiveRecoveryFilter:
             reasons.append("static_object_distance")
         boundary_margin = _safe_float(metrics.get("raw_boundary_margin"), float("inf"))
         boundary_closing = _safe_float(metrics.get("boundary_closing_rate"), 0.0)
-        if boundary_margin < self.config.boundary_hard_margin:
+        raw_eval_boundary_margin = _safe_float(raw_eval.get("min_boundary_margin"), float("inf"))
+        if min(boundary_margin, raw_eval_boundary_margin) < self.config.hard_boundary_margin_for_intervention:
             reasons.append("boundary_margin")
         vehicle_ttc_hard_limit = min(self.config.hard_vehicle_ttc_threshold, 1.0)
         if _safe_float(metrics.get("ttc_vehicle_min"), float("inf")) < vehicle_ttc_hard_limit:
@@ -2578,6 +2615,12 @@ class PredictiveRecoveryFilter:
     ) -> Tuple[bool, str]:
         if bool(raw_eval.get("predicted_out_of_road", False)):
             return True, "raw_predicted_out_of_road"
+        raw_boundary_margin = min(
+            _safe_float(metrics.get("raw_boundary_margin"), float("inf")),
+            _safe_float(raw_eval.get("min_boundary_margin"), float("inf")),
+        )
+        if raw_boundary_margin < self.config.hard_boundary_margin_for_intervention:
+            return True, "raw_boundary_margin_low"
         if bool(raw_eval.get("predicted_collision", False)) and not self._raw_collision_deadlock_escape_candidate(raw_eval, metrics):
             reason = str(raw_eval.get("failure_reason", "") or "collision").lower()
             hard_collision_reasons = (
@@ -2613,7 +2656,71 @@ class PredictiveRecoveryFilter:
             and rollout.hard_safe
             and not rollout.predicted_collision
             and not rollout.predicted_out_of_road
+            and _safe_float(rollout.min_boundary_margin, float("inf")) >= self.config.min_boundary_margin_for_bypass
         )
+
+    def _hard_recovery_rollout_is_moving_bypass(self, rollout: Optional[TrajectoryRollout]) -> bool:
+        if not self._hard_recovery_candidate_acceptable(rollout):
+            return False
+        candidate_type = str(rollout.candidate.candidate_type)
+        speed_target = _safe_float(rollout.candidate.speed_target, 0.0)
+        return bool(
+            (candidate_type.startswith("left_") or candidate_type.startswith("right_"))
+            and "stop" not in candidate_type
+            and speed_target > 0.5
+        )
+
+    def _hard_bypass_side_for_rollout(self, rollout: Optional[TrajectoryRollout]) -> str:
+        if rollout is None:
+            return ""
+        candidate_type = str(rollout.candidate.candidate_type)
+        if candidate_type.startswith("left_"):
+            return "left"
+        if candidate_type.startswith("right_"):
+            return "right"
+        return ""
+
+    def _latch_hard_bypass_side(self, rollout: Optional[TrajectoryRollout]) -> None:
+        side = self._hard_bypass_side_for_rollout(rollout)
+        if side:
+            self._hard_bypass_side = side
+            self._hard_bypass_remaining = max(
+                self._hard_bypass_remaining,
+                int(self.config.hard_bypass_latch_steps),
+            )
+
+    def _decay_hard_bypass_side(self) -> None:
+        if self._hard_bypass_remaining > 0:
+            self._hard_bypass_remaining -= 1
+        if self._hard_bypass_remaining <= 0:
+            self._hard_bypass_side = ""
+            self._hard_bypass_remaining = 0
+
+    def _hard_intervention_should_enter_safety_hold(
+        self,
+        hard_risk_reason: str,
+        contact_state: bool,
+        rollout: Optional[TrajectoryRollout],
+    ) -> bool:
+        if contact_state:
+            return True
+        reason_l = str(hard_risk_reason).lower()
+        if "contact" in reason_l:
+            return True
+        if "boundary" in reason_l or "out_of_road" in reason_l:
+            return True
+        obstacle_hold_reason = any(
+            marker in reason_l
+            for marker in (
+                "static_object_distance",
+                "static_ttc",
+                "static_collision",
+                "traffic",
+            )
+        )
+        if obstacle_hold_reason:
+            return not self._hard_recovery_rollout_is_moving_bypass(rollout)
+        return False
 
     def _select_hard_recovery_rollout(
         self,
@@ -2629,13 +2736,11 @@ class PredictiveRecoveryFilter:
             score, rollout = item
             candidate_type = str(rollout.candidate.candidate_type)
             speed_target = _safe_float(rollout.candidate.speed_target, 0.0)
-            lateral_bypass = (
-                (candidate_type.startswith("left_") or candidate_type.startswith("right_"))
-                and speed_target > 0.5
-                and "stop" not in candidate_type
-            )
+            lateral_bypass = self._hard_recovery_rollout_is_moving_bypass(rollout)
             if lateral_bypass:
-                group = 0
+                latched_side = self._hard_bypass_side if self._hard_bypass_remaining > 0 else ""
+                rollout_side = self._hard_bypass_side_for_rollout(rollout)
+                group = -1 if latched_side and rollout_side == latched_side else 0
             elif speed_target > 0.5 and "stop" not in candidate_type:
                 group = 1
             else:
@@ -2742,6 +2847,13 @@ class PredictiveRecoveryFilter:
         ):
             result.update({"emergency_detected": True, "emergency_reason": "boundary_closing"})
             return result
+        raw_boundary_margin = min(
+            _safe_float(metrics.get("raw_boundary_margin"), float("inf")),
+            _safe_float(raw_eval.get("min_boundary_margin"), float("inf")),
+        )
+        if raw_boundary_margin < self.config.hard_boundary_margin_for_intervention:
+            result.update({"emergency_detected": True, "emergency_reason": "boundary_margin_low"})
+            return result
         return result
 
     def _pre_contact_recovery_action(
@@ -2771,7 +2883,7 @@ class PredictiveRecoveryFilter:
                 throttle = _clip(max(raw_throttle, 0.08), -0.05, 0.30)
             return np.array([_clip(steer, -0.35, 0.35), throttle], dtype=np.float32)
         current_steer = _safe_float(getattr(vehicle, "steering", 0.0), 0.0)
-        return np.array([_clip(current_steer * 0.2, -0.2, 0.2), -0.9], dtype=np.float32)
+        return self._minimum_risk_stop(vehicle, contact_state=False)
 
     def _safety_hold_action(self, vehicle: Any, raw_action: np.ndarray) -> np.ndarray:
         del raw_action
@@ -3119,7 +3231,7 @@ class PredictiveRecoveryFilter:
             contact_nonempty = contact_str.strip() not in ("", "none", "[]", "{}", "set()")
             if contact_nonempty and not self._contact_text_only_benign_road_marking(contact_str):
                 result["contact_state_detected"] = True
-            dangerous_types = ["vehicle", "traffic_object", "traffic_cone", "traffic_barrier", "road_line_solid", "solid_single_white", "sidewalk", "crash"]
+            dangerous_types = ["vehicle", "traffic_object", "traffic_cone", "traffic_barrier", "sidewalk", "out_of_road", "crash"]
             for dtype in dangerous_types:
                 if dtype in contact_str:
                     result["contact_state_detected"] = True
@@ -4488,6 +4600,8 @@ class PredictiveRecoveryFilter:
         self._reset_boundary_contact_escape()
         self._ultra_short_vehicle_deadlock_steps = 0
         self._deadlock_release_remaining = 0
+        self._hard_bypass_side = ""
+        self._hard_bypass_remaining = 0
 
 
 def _rectangle_corners(center: np.ndarray, heading: float, length: float, width: float) -> np.ndarray:
