@@ -300,7 +300,14 @@ class PredictiveRecoveryFilterFailFastTest(unittest.TestCase):
     def test_dynamic_blocker_overtake_selects_passing_rollout(self):
         recovery_filter = PredictiveRecoveryFilter(PredictiveRecoveryConfig())
 
-        def make_rollout(candidate_type, lateral_target, speed_target, total_score, terminal_s):
+        def make_rollout(
+            candidate_type,
+            lateral_target,
+            speed_target,
+            total_score,
+            terminal_s,
+            min_vehicle_margin=1.5,
+        ):
             candidate = TrajectoryCandidate(
                 candidate_id=0,
                 candidate_type=candidate_type,
@@ -321,7 +328,7 @@ class PredictiveRecoveryFilterFailFastTest(unittest.TestCase):
                 frenet_l=np.array([0.0, lateral_target], dtype=float),
                 hard_safe=True,
                 min_boundary_margin=2.0,
-                min_vehicle_margin=1.5,
+                min_vehicle_margin=min_vehicle_margin,
                 min_obstacle_margin=2.0,
             )
             return TrajectoryScore(
@@ -358,10 +365,15 @@ class PredictiveRecoveryFilterFailFastTest(unittest.TestCase):
 
         follow = make_rollout("keep_pass", 0.0, 5.0, 0.1, 22.0)
         shallow_pass = make_rollout("left_pass", 1.5, 5.0, 0.2, 24.0)
+        unsafe_overtake = make_rollout("left_pass", 3.0, 5.0, -10.0, 32.0, min_vehicle_margin=-1.0)
         overtake = make_rollout("left_pass", 2.8, 5.0, 5.0, 30.0)
 
+        self.assertFalse(
+            recovery_filter._dynamic_blocker_overtake_candidate_acceptable(unsafe_overtake[1])
+        )
+
         _, selected = recovery_filter._select_dynamic_blocker_overtake_rollout(
-            [follow, shallow_pass, overtake],
+            [follow, shallow_pass, unsafe_overtake, overtake],
             scene_info,
         )
 

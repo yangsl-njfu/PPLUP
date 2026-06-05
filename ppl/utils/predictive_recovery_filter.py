@@ -231,7 +231,7 @@ class PredictiveRecoveryConfig:
     dynamic_vehicle_blocker_speed_margin: float = 1.50
     dynamic_blocker_overtake_min_speed: float = 5.00
     dynamic_blocker_overtake_max_distance: float = 45.00
-    dynamic_blocker_overtake_min_lateral_shift: float = 2.20
+    dynamic_blocker_overtake_min_lateral_shift: float = 1.20
     overtake_lateral_clearance: float = 0.80
     overtake_min_lateral_shift: float = 1.20
     overtake_candidate_bonus: float = 3.00
@@ -1913,6 +1913,10 @@ class PredictiveRecoveryFilter:
                 self._cooldown_remaining = self.config.intervention_cooldown_steps
                 hold_after_hard_intervention = False
                 hard_recovery_moving_bypass = False
+                dynamic_blocker_overtake_active = bool(
+                    dynamic_blocker_overtake_required
+                    and self._dynamic_blocker_rollout_is_overtake(best_rollout)
+                )
                 if hard_risk:
                     hard_recovery_moving_bypass = self._hard_recovery_rollout_is_moving_bypass(best_rollout)
                     if hard_recovery_moving_bypass:
@@ -1932,9 +1936,18 @@ class PredictiveRecoveryFilter:
 
                 candidate_action = self._candidate_action_from_rollout(
                     best_rollout,
-                    use_bypass_lookahead=bool(hard_risk and hard_recovery_moving_bypass),
+                    use_bypass_lookahead=bool(
+                        (hard_risk and hard_recovery_moving_bypass)
+                        or dynamic_blocker_overtake_active
+                    ),
                 )
-                if hard_risk and hard_recovery_moving_bypass:
+                if dynamic_blocker_overtake_active and not hard_risk:
+                    self._latch_hard_bypass_side(best_rollout)
+                    throttle_cap = 0.32 if ego_speed < 15.0 else 0.20
+                    candidate_action[1] = _clip(float(candidate_action[1]), -0.05, throttle_cap)
+                    info["hard_bypass_side"] = self._hard_bypass_side
+                    info["hard_bypass_remaining"] = self._hard_bypass_remaining
+                elif hard_risk and hard_recovery_moving_bypass:
                     self._latch_hard_bypass_side(best_rollout)
                     throttle_cap = 0.30 if ego_speed < 15.0 else 0.18
                     if best_rollout.min_boundary_margin >= self.config.low_risk_min_boundary_margin:
@@ -1954,7 +1967,7 @@ class PredictiveRecoveryFilter:
                 if hard_risk and "vehicle_ttc" in hard_risk_reason and ego_speed > 8.0 and not hard_recovery_moving_bypass:
                     throttle_cap = 0.0 if ego_speed > 15.0 else 0.25
                     candidate_action[1] = min(float(candidate_action[1]), float(raw_action_np[1]), throttle_cap)
-                if hard_risk:
+                if hard_risk or dynamic_blocker_overtake_active:
                     safe_action = np.clip(candidate_action, -1.0, 1.0).astype(np.float32)
                     action_info = {
                         "action_limited_by_raw_delta": False,
@@ -2015,6 +2028,9 @@ class PredictiveRecoveryFilter:
                     "accepted_by_filter": False,
                     "model_predicted_safe": raw_eval.get("predicted_collision", False) == False,
                     "selected_candidate_type": "raw_action",
+                    "selected_lateral_delta": 0.0,
+                    "dynamic_blocker_overtake_selected": False,
+                    "lane_change_first_selected": False,
                     "collision_free": raw_eval.get("predicted_collision", False) == False,
                     "boundary_safe": raw_eval.get("predicted_out_of_road", False) == False,
                     "control_feasible": True,
@@ -2737,12 +2753,18 @@ class PredictiveRecoveryFilter:
         return False, ""
 
     def _hard_recovery_candidate_acceptable(self, rollout: Optional[TrajectoryRollout]) -> bool:
+        if rollout is None:
+            return False
+        vehicle_margin = _safe_float(rollout.min_vehicle_margin, float("inf"))
         return bool(
-            rollout is not None
-            and rollout.hard_safe
+            rollout.hard_safe
             and not rollout.predicted_collision
             and not rollout.predicted_out_of_road
             and _safe_float(rollout.min_boundary_margin, float("inf")) >= self.config.min_boundary_margin_for_bypass
+            and (
+                not np.isfinite(vehicle_margin)
+                or vehicle_margin >= self.config.min_vehicle_margin_for_intervention
+            )
         )
 
     def _dynamic_blocker_overtake_required(
@@ -2786,7 +2808,11 @@ class PredictiveRecoveryFilter:
             return False
         start_l = _safe_float(rollout.frenet_l[0] if rollout.frenet_l.size else 0.0, 0.0)
         lateral_shift = abs(_safe_float(rollout.candidate.lateral_target, start_l) - start_l)
-        return lateral_shift >= self.config.dynamic_blocker_overtake_min_lateral_shift
+        min_shift = min(
+            self.config.dynamic_blocker_overtake_min_lateral_shift,
+            self.config.overtake_min_lateral_shift,
+        )
+        return lateral_shift >= min_shift
 
     def _dynamic_blocker_overtake_candidate_acceptable(self, rollout: Optional[TrajectoryRollout]) -> bool:
         return bool(
@@ -2813,15 +2839,21 @@ class PredictiveRecoveryFilter:
         preferred_side = "left" if left_gap >= right_gap else "right"
         latched_side = self._hard_bypass_side if self._hard_bypass_remaining > 0 else ""
 
-        def priority(item: Tuple[TrajectoryScore, TrajectoryRollout]) -> Tuple[int, int, int, float, float]:
+        def priority(item: Tuple[TrajectoryScore, TrajectoryRollout]) -> Tuple[int, int, int, float, float, float]:
             score, rollout = item
             side = self._hard_bypass_side_for_rollout(rollout)
-            terminal_group = 0 if score.terminal_passed_blocker or score.terminal_recoverable else 1
+            if score.terminal_passed_blocker:
+                terminal_group = 0
+            elif score.terminal_recoverable:
+                terminal_group = 1
+            else:
+                terminal_group = 2
             latched_group = 0 if latched_side and side == latched_side else 1
             preferred_group = 0 if side == preferred_side else 1
             terminal_l = _safe_float(rollout.frenet_l[-1] if rollout.frenet_l.size else rollout.candidate.lateral_target, 0.0)
             lateral_clearance = abs(terminal_l - blocker_l)
-            return terminal_group, latched_group, preferred_group, float(score.total_score), -lateral_clearance
+            speed_target = _safe_float(rollout.candidate.speed_target, 0.0)
+            return terminal_group, latched_group, preferred_group, float(score.total_score), -lateral_clearance, -speed_target
 
         return min(acceptable, key=priority)
 
@@ -2930,7 +2962,12 @@ class PredictiveRecoveryFilter:
                     score, rollout = item
                     rollout_side = self._hard_bypass_side_for_rollout(rollout)
                     side_group = 0 if latched_side and rollout_side == latched_side else 1
-                    terminal_group = 0 if score.terminal_passed_blocker or score.terminal_recoverable else 1
+                    if score.terminal_passed_blocker:
+                        terminal_group = 0
+                    elif score.terminal_recoverable:
+                        terminal_group = 1
+                    else:
+                        terminal_group = 2
                     speed_target = _safe_float(rollout.candidate.speed_target, 0.0)
                     return side_group, terminal_group, float(score.total_score), -speed_target
 
