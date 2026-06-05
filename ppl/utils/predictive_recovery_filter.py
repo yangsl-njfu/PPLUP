@@ -51,6 +51,11 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "frenet_l",
     "front_blocking_object_type",
     "front_blocking_object_distance",
+    "front_blocking_object_reason",
+    "front_blocking_is_dynamic_vehicle",
+    "selected_lateral_delta",
+    "dynamic_blocker_overtake_required",
+    "dynamic_blocker_overtake_selected",
     "left_space_available",
     "right_space_available",
     "ultra_light_gate_reason",
@@ -120,6 +125,7 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "cost_streak_guard_reason",
     # Emergency check 详情
     "emergency_detected",
+    "emergency_deferred_to_candidate_search",
     "emergency_reason",
     "nearest_vehicle_distance",
     "nearest_static_object_distance",
@@ -132,6 +138,8 @@ RECOVERY_DIAGNOSTIC_FIELDS = [
     "hard_recovery_entered_safety_hold",
     "hard_bypass_side",
     "hard_bypass_remaining",
+    "lane_change_first_required",
+    "lane_change_first_selected",
     "low_risk_gate_passed",
     "low_risk_gate_rejected_reason",
     "safety_hold_active",
@@ -218,6 +226,16 @@ class PredictiveRecoveryConfig:
     ultra_front_lateral_window: float = 2.8
     max_lateral_without_blocker: float = 1.00
     max_lateral_when_frenet_unstable: float = 0.5
+    dynamic_vehicle_blocker_time_headway: float = 3.50
+    dynamic_vehicle_blocker_lateral_gap: float = 1.60
+    dynamic_vehicle_blocker_speed_margin: float = 1.50
+    dynamic_blocker_overtake_min_speed: float = 5.00
+    dynamic_blocker_overtake_max_distance: float = 45.00
+    dynamic_blocker_overtake_min_lateral_shift: float = 2.20
+    overtake_lateral_clearance: float = 0.80
+    overtake_min_lateral_shift: float = 1.20
+    overtake_candidate_bonus: float = 3.00
+    blocked_follow_penalty: float = 6.00
 
     # === 接管限制 ===
     intervention_score_margin: float = 2.5  # 提高阈值，更保守
@@ -233,6 +251,7 @@ class PredictiveRecoveryConfig:
     disable_cooldown_passthrough_on_hard_risk: bool = True
     hard_bypass_latch_steps: int = 12
     hard_bypass_throttle_floor: float = 0.18
+    hard_bypass_steer_lookahead_time: float = 0.75
 
     # === 车辆碰撞硬约束 ===
     hard_vehicle_lateral_margin: float = 0.80
@@ -242,7 +261,7 @@ class PredictiveRecoveryConfig:
     severe_lateral_rss_margin: float = -0.50
 
     # === 边界约束 ===
-    min_boundary_margin_for_bypass: float = 0.60  # 提高阈值
+    min_boundary_margin_for_bypass: float = 0.60
     min_vehicle_margin_for_intervention: float = 0.60  # 新增：接管最低车辆 margin
     comfort_boundary_margin: float = 1.00
     low_risk_min_boundary_margin: float = 1.20
@@ -324,6 +343,8 @@ class SceneObject:
     frenet_valid: bool
     s: float
     l: float
+    blocking_reason: str = ""
+    is_dynamic_vehicle_blocker: bool = False
     predicted_occupancy: List[Tuple[float, float, float, float, float]] = field(default_factory=list)
 
 
@@ -1544,12 +1565,23 @@ class PredictiveRecoveryFilter:
             elif self._safety_hold_remaining > 0 and hard_risk:
                 self._safety_hold_remaining = max(0, self._safety_hold_remaining - 1)
 
+            dynamic_blocker_overtake_required = self._dynamic_blocker_overtake_required(
+                scene_info,
+                risk_metrics,
+                raw_eval,
+                ego_speed,
+            )
+            info["dynamic_blocker_overtake_required"] = dynamic_blocker_overtake_required
+
             low_risk_passed, low_risk_reject_reason = self._low_risk_fast_path(
                 raw_eval,
                 risk_metrics,
                 contact_state,
                 gate_reason,
             )
+            if low_risk_passed and dynamic_blocker_overtake_required:
+                low_risk_passed = False
+                low_risk_reject_reason = "dynamic_blocker_overtake_required"
             info["low_risk_gate_passed"] = low_risk_passed
             info["low_risk_gate_rejected_reason"] = low_risk_reject_reason
             if low_risk_passed:
@@ -1653,12 +1685,46 @@ class PredictiveRecoveryFilter:
             intervention_rejected_reason = ""
             best_score: Optional[TrajectoryScore] = None
             best_rollout: Optional[TrajectoryRollout] = None
+            lane_change_first_required = bool(
+                (hard_risk and self._lane_change_first_required(hard_risk_reason, scene_info))
+                or dynamic_blocker_overtake_required
+            )
+            info["lane_change_first_required"] = lane_change_first_required
 
             if safe_rollouts:
-                if hard_risk:
-                    best_score, best_rollout = self._select_hard_recovery_rollout(safe_rollouts)
+                if dynamic_blocker_overtake_required:
+                    dynamic_choice = self._select_dynamic_blocker_overtake_rollout(safe_rollouts, scene_info)
+                    if dynamic_choice is not None:
+                        best_score, best_rollout = dynamic_choice
+                    elif hard_risk:
+                        best_score, best_rollout = self._select_hard_recovery_rollout(
+                            safe_rollouts,
+                            hard_risk_reason=hard_risk_reason,
+                            scene_info=scene_info,
+                        )
+                    else:
+                        best_score, best_rollout = min(safe_rollouts, key=lambda item: item[0].total_score)
+                elif hard_risk:
+                    best_score, best_rollout = self._select_hard_recovery_rollout(
+                        safe_rollouts,
+                        hard_risk_reason=hard_risk_reason,
+                        scene_info=scene_info,
+                    )
                 else:
                     best_score, best_rollout = min(safe_rollouts, key=lambda item: item[0].total_score)
+                selected_lateral_delta = float(
+                    _safe_float(best_rollout.candidate.lateral_target, ego_projection.l) - ego_projection.l
+                )
+                info["selected_lateral_delta"] = selected_lateral_delta
+                dynamic_blocker_overtake_selected = bool(
+                    dynamic_blocker_overtake_required
+                    and self._dynamic_blocker_rollout_is_overtake(best_rollout)
+                )
+                info["dynamic_blocker_overtake_selected"] = dynamic_blocker_overtake_selected
+                info["lane_change_first_selected"] = bool(
+                    lane_change_first_required
+                    and self._hard_recovery_rollout_is_lane_change_pass(best_rollout)
+                )
 
                 # 检查接管条件
                 raw_collision_hard_for_intervention = (
@@ -1676,7 +1742,9 @@ class PredictiveRecoveryFilter:
                 )
 
                 # 检查 candidate 是否真的比 raw_action 更好
-                if hard_risk:
+                if dynamic_blocker_overtake_required:
+                    candidate_better = self._dynamic_blocker_overtake_candidate_acceptable(best_rollout)
+                elif hard_risk:
                     candidate_better = self._hard_recovery_candidate_acceptable(best_rollout)
                 else:
                     candidate_better = (
@@ -1696,7 +1764,16 @@ class PredictiveRecoveryFilter:
 
                 score_gain = raw_eval.get("total_score", float("inf")) - best_score.total_score
 
-                if hard_risk and candidate_better:
+                if dynamic_blocker_overtake_required and candidate_better:
+                    if self._disable_real_intervention_for_episode:
+                        allow_intervention = False
+                        intervention_rejected_reason = "cost_streak_guard_disabled"
+                        intervention_reason = "cost_streak_guard"
+                    else:
+                        allow_intervention = True
+                        intervention_reason = "dynamic_blocker_overtake"
+                        intervention_rejected_reason = ""
+                elif hard_risk and candidate_better:
                     allow_intervention = True
                     intervention_reason = hard_risk_reason or "hard_risk"
                     intervention_rejected_reason = ""
@@ -1724,7 +1801,9 @@ class PredictiveRecoveryFilter:
                         intervention_rejected_reason = "insufficient_score_gain"
                 else:
                     if not candidate_better:
-                        if best_rollout.min_vehicle_margin < raw_eval.get("min_vehicle_margin", float("inf")) - 0.20:
+                        if dynamic_blocker_overtake_required and not self._dynamic_blocker_rollout_is_overtake(best_rollout):
+                            intervention_rejected_reason = "no_dynamic_overtake_candidate"
+                        elif best_rollout.min_vehicle_margin < raw_eval.get("min_vehicle_margin", float("inf")) - 0.20:
                             intervention_rejected_reason = "vehicle_margin_worse"
                         elif best_rollout.min_boundary_margin < 0.60:
                             intervention_rejected_reason = "boundary_margin_insufficient"
@@ -1851,9 +1930,9 @@ class PredictiveRecoveryFilter:
                 if hold_after_hard_intervention:
                     self._enter_safety_hold(hard_risk_reason or "hard_risk")
 
-                candidate_action = np.array(
-                    [best_rollout.steer_actions[0], best_rollout.throttle_actions[0]],
-                    dtype=np.float32,
+                candidate_action = self._candidate_action_from_rollout(
+                    best_rollout,
+                    use_bypass_lookahead=bool(hard_risk and hard_recovery_moving_bypass),
                 )
                 if hard_risk and hard_recovery_moving_bypass:
                     self._latch_hard_bypass_side(best_rollout)
@@ -1990,6 +2069,11 @@ class PredictiveRecoveryFilter:
             "fallback_reason": "",
             "front_blocking_object_type": "",
             "front_blocking_object_distance": float("inf"),
+            "front_blocking_object_reason": "",
+            "front_blocking_is_dynamic_vehicle": False,
+            "selected_lateral_delta": 0.0,
+            "dynamic_blocker_overtake_required": False,
+            "dynamic_blocker_overtake_selected": False,
             "rss_longitudinal_margin": float("inf"),
             "rss_lateral_margin": float("inf"),
             "rss_risk_score": 0.0,
@@ -2063,6 +2147,8 @@ class PredictiveRecoveryFilter:
             "hard_recovery_entered_safety_hold": False,
             "hard_bypass_side": "",
             "hard_bypass_remaining": 0,
+            "lane_change_first_required": False,
+            "lane_change_first_selected": False,
             "low_risk_gate_passed": False,
             "low_risk_gate_rejected_reason": "",
             "safety_hold_active": False,
@@ -2659,6 +2745,86 @@ class PredictiveRecoveryFilter:
             and _safe_float(rollout.min_boundary_margin, float("inf")) >= self.config.min_boundary_margin_for_bypass
         )
 
+    def _dynamic_blocker_overtake_required(
+        self,
+        scene_info: Dict[str, Any],
+        metrics: Dict[str, Any],
+        raw_eval: Dict[str, Any],
+        ego_speed: float,
+    ) -> bool:
+        if str(scene_info.get("front_blocking_object_type", "")).lower() != "vehicle":
+            return False
+        if not bool(scene_info.get("front_blocking_is_dynamic_vehicle", False)):
+            return False
+        blocking_distance = _safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))
+        if not np.isfinite(blocking_distance):
+            return False
+        if blocking_distance > self.config.dynamic_blocker_overtake_max_distance:
+            return False
+        if ego_speed < self.config.dynamic_blocker_overtake_min_speed:
+            return False
+        min_side_gap = max(0.35, self.config.min_boundary_margin_for_bypass)
+        side_gap = max(
+            _safe_float(scene_info.get("blocker_left_gap"), 0.0),
+            _safe_float(scene_info.get("blocker_right_gap"), 0.0),
+        )
+        if side_gap <= min_side_gap:
+            return False
+        if bool(raw_eval.get("predicted_out_of_road", False)):
+            return False
+        if _safe_float(metrics.get("raw_boundary_margin"), float("inf")) < self.config.hard_boundary_margin_for_intervention:
+            return False
+        if (
+            _safe_float(metrics.get("ttc_vehicle_min"), float("inf")) < self.config.hard_vehicle_ttc_threshold
+            and not bool(raw_eval.get("predicted_collision", False))
+        ):
+            return False
+        return True
+
+    def _dynamic_blocker_rollout_is_overtake(self, rollout: Optional[TrajectoryRollout]) -> bool:
+        if not self._hard_recovery_rollout_is_lane_change_pass(rollout):
+            return False
+        start_l = _safe_float(rollout.frenet_l[0] if rollout.frenet_l.size else 0.0, 0.0)
+        lateral_shift = abs(_safe_float(rollout.candidate.lateral_target, start_l) - start_l)
+        return lateral_shift >= self.config.dynamic_blocker_overtake_min_lateral_shift
+
+    def _dynamic_blocker_overtake_candidate_acceptable(self, rollout: Optional[TrajectoryRollout]) -> bool:
+        return bool(
+            self._hard_recovery_candidate_acceptable(rollout)
+            and self._dynamic_blocker_rollout_is_overtake(rollout)
+            and _safe_float(rollout.min_vehicle_margin, float("inf")) >= self.config.min_vehicle_margin_for_intervention
+        )
+
+    def _select_dynamic_blocker_overtake_rollout(
+        self,
+        safe_rollouts: List[Tuple[TrajectoryScore, TrajectoryRollout]],
+        scene_info: Dict[str, Any],
+    ) -> Optional[Tuple[TrajectoryScore, TrajectoryRollout]]:
+        acceptable = [
+            item for item in safe_rollouts
+            if self._dynamic_blocker_overtake_candidate_acceptable(item[1])
+        ]
+        if not acceptable:
+            return None
+
+        blocker_l = _safe_float(scene_info.get("front_blocking_object_l"), 0.0)
+        left_gap = _safe_float(scene_info.get("blocker_left_gap"), 0.0)
+        right_gap = _safe_float(scene_info.get("blocker_right_gap"), 0.0)
+        preferred_side = "left" if left_gap >= right_gap else "right"
+        latched_side = self._hard_bypass_side if self._hard_bypass_remaining > 0 else ""
+
+        def priority(item: Tuple[TrajectoryScore, TrajectoryRollout]) -> Tuple[int, int, int, float, float]:
+            score, rollout = item
+            side = self._hard_bypass_side_for_rollout(rollout)
+            terminal_group = 0 if score.terminal_passed_blocker or score.terminal_recoverable else 1
+            latched_group = 0 if latched_side and side == latched_side else 1
+            preferred_group = 0 if side == preferred_side else 1
+            terminal_l = _safe_float(rollout.frenet_l[-1] if rollout.frenet_l.size else rollout.candidate.lateral_target, 0.0)
+            lateral_clearance = abs(terminal_l - blocker_l)
+            return terminal_group, latched_group, preferred_group, float(score.total_score), -lateral_clearance
+
+        return min(acceptable, key=priority)
+
     def _hard_recovery_rollout_is_moving_bypass(self, rollout: Optional[TrajectoryRollout]) -> bool:
         if not self._hard_recovery_candidate_acceptable(rollout):
             return False
@@ -2669,6 +2835,23 @@ class PredictiveRecoveryFilter:
             and "stop" not in candidate_type
             and speed_target > 0.5
         )
+
+    def _hard_recovery_rollout_is_lane_change_pass(self, rollout: Optional[TrajectoryRollout]) -> bool:
+        if not self._hard_recovery_candidate_acceptable(rollout):
+            return False
+        candidate_type = str(rollout.candidate.candidate_type)
+        speed_target = _safe_float(rollout.candidate.speed_target, 0.0)
+        if not (
+            (candidate_type.startswith("left_") or candidate_type.startswith("right_"))
+            and "stop" not in candidate_type
+            and speed_target > 0.5
+        ):
+            return False
+        if "pass" in candidate_type:
+            return True
+        start_l = _safe_float(rollout.frenet_l[0] if rollout.frenet_l.size else 0.0, 0.0)
+        lateral_shift = abs(_safe_float(rollout.candidate.lateral_target, start_l) - start_l)
+        return lateral_shift >= self.config.overtake_min_lateral_shift
 
     def _hard_bypass_side_for_rollout(self, rollout: Optional[TrajectoryRollout]) -> str:
         if rollout is None:
@@ -2725,12 +2908,33 @@ class PredictiveRecoveryFilter:
     def _select_hard_recovery_rollout(
         self,
         safe_rollouts: List[Tuple[TrajectoryScore, TrajectoryRollout]],
+        hard_risk_reason: str = "",
+        scene_info: Optional[Dict[str, Any]] = None,
     ) -> Tuple[TrajectoryScore, TrajectoryRollout]:
         acceptable = [
             item for item in safe_rollouts
             if self._hard_recovery_candidate_acceptable(item[1])
         ]
         pool = acceptable or safe_rollouts
+        scene_info = scene_info or {}
+
+        if self._lane_change_first_required(hard_risk_reason, scene_info):
+            lane_change_pool = [
+                item for item in pool
+                if self._hard_recovery_rollout_is_lane_change_pass(item[1])
+            ]
+            if lane_change_pool:
+                latched_side = self._hard_bypass_side if self._hard_bypass_remaining > 0 else ""
+
+                def lane_change_priority(item: Tuple[TrajectoryScore, TrajectoryRollout]) -> Tuple[int, int, float, float]:
+                    score, rollout = item
+                    rollout_side = self._hard_bypass_side_for_rollout(rollout)
+                    side_group = 0 if latched_side and rollout_side == latched_side else 1
+                    terminal_group = 0 if score.terminal_passed_blocker or score.terminal_recoverable else 1
+                    speed_target = _safe_float(rollout.candidate.speed_target, 0.0)
+                    return side_group, terminal_group, float(score.total_score), -speed_target
+
+                return min(lane_change_pool, key=lane_change_priority)
 
         def priority(item: Tuple[TrajectoryScore, TrajectoryRollout]) -> Tuple[int, float, float]:
             score, rollout = item
@@ -2748,6 +2952,40 @@ class PredictiveRecoveryFilter:
             return group, float(score.total_score), -_safe_float(rollout.min_obstacle_margin, 0.0)
 
         return min(pool, key=priority)
+
+    def _lane_change_first_required(self, hard_risk_reason: str, scene_info: Dict[str, Any]) -> bool:
+        reason_l = str(hard_risk_reason or "").lower()
+        if not reason_l:
+            return False
+        if "boundary" in reason_l or "out_of_road" in reason_l:
+            return False
+        if "static" in reason_l or "traffic_object" in reason_l:
+            return False
+        if str(scene_info.get("front_blocking_object_type", "")).lower() != "vehicle":
+            return False
+        if not np.isfinite(_safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))):
+            return False
+        min_side_gap = max(0.35, self.config.min_boundary_margin_for_bypass)
+        side_available = max(
+            _safe_float(scene_info.get("blocker_left_gap"), 0.0),
+            _safe_float(scene_info.get("blocker_right_gap"), 0.0),
+        ) > min_side_gap
+        if not side_available:
+            return False
+        longitudinal_markers = (
+            "vehicle_ttc",
+            "longitudinal",
+            "predicted_collision_within_1s",
+            "raw_collision_risk:collision",
+            "high_speed_near_blocker",
+            "high_speed_approach",
+        )
+        lateral_vehicle_markers = (
+            "cut_in_danger",
+            "vehicle_lateral_margin_violation",
+            "parallel_lateral_violation",
+        )
+        return any(marker in reason_l for marker in longitudinal_markers + lateral_vehicle_markers)
 
     def _deadlock_progress_release_allowed(
         self,
@@ -3471,7 +3709,30 @@ class PredictiveRecoveryFilter:
 
             low_speed = speed <= max(self.config.blocking_speed_threshold, ego_speed * self.config.low_speed_ratio)
             lateral_overlap = abs(rel_l) <= (ego_width + width) * 0.5 + self.config.safety_margin
-            is_blocking = bool(projection.frenet_valid and rel_s > 0.0 and lateral_overlap and low_speed)
+            lateral_gap = abs(rel_l) - (ego_width + width) * 0.5
+            vehicle_front_limit = min(
+                self.config.route_front_distance,
+                max(
+                    self.config.ultra_front_block_distance,
+                    ego_speed * self.config.dynamic_vehicle_blocker_time_headway,
+                ),
+            )
+            classic_blocking = bool(projection.frenet_valid and rel_s > 0.0 and lateral_overlap and low_speed)
+            dynamic_vehicle_blocking = bool(
+                is_vehicle
+                and projection.frenet_valid
+                and rel_s > 0.0
+                and rel_s <= vehicle_front_limit
+                and lateral_gap <= self.config.dynamic_vehicle_blocker_lateral_gap
+                and speed <= ego_speed + self.config.dynamic_vehicle_blocker_speed_margin
+            )
+            is_blocking = classic_blocking or dynamic_vehicle_blocking
+            promoted_dynamic_vehicle_blocking = dynamic_vehicle_blocking and not classic_blocking
+            blocking_reason = ""
+            if classic_blocking:
+                blocking_reason = "low_speed_overlap"
+            elif dynamic_vehicle_blocking:
+                blocking_reason = "dynamic_vehicle"
             candidates.append(SceneObject(
                 object_id=obj_id,
                 object_type=object_type,
@@ -3486,6 +3747,8 @@ class PredictiveRecoveryFilter:
                 frenet_valid=projection.frenet_valid,
                 s=projection.s,
                 l=projection.l,
+                blocking_reason=blocking_reason,
+                is_dynamic_vehicle_blocker=promoted_dynamic_vehicle_blocking,
             ))
 
         candidates.sort(key=lambda obj: abs(obj.s - ego_projection.s) if obj.frenet_valid else float(np.linalg.norm(obj.position_xy - ego_pos)))
@@ -3514,6 +3777,8 @@ class PredictiveRecoveryFilter:
         info = {
             "front_blocking_object_type": front.object_type if front is not None else "",
             "front_blocking_object_distance": (front.s - ego_projection.s) if front is not None else float("inf"),
+            "front_blocking_object_reason": front.blocking_reason if front is not None else "",
+            "front_blocking_is_dynamic_vehicle": bool(front.is_dynamic_vehicle_blocker) if front is not None else False,
             "front_blocking_object_s": front.s if front is not None else float("inf"),
             "front_blocking_object_l": front.l if front is not None else float("inf"),
             "front_blocking_object_width": front.width if front is not None else 0.0,
@@ -3713,8 +3978,12 @@ class PredictiveRecoveryFilter:
             l_low = -self.config.default_lane_width * 0.5
             l_high = self.config.default_lane_width * 0.5
 
-        has_blocker = np.isfinite(_safe_float(scene_info.get("front_blocking_object_distance"), float("inf")))
+        blocking_distance = _safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))
+        has_blocker = np.isfinite(blocking_distance)
+        dynamic_vehicle_blocker = bool(scene_info.get("front_blocking_is_dynamic_vehicle", False))
+        front_vehicle_blocker = str(scene_info.get("front_blocking_object_type", "")).lower() == "vehicle"
         target_values = [current_l]
+        preferred_pass_targets: List[float] = []
         if has_blocker and ego_projection.frenet_valid:
             target_values.append(0.0)
         n_lat = max(1, int(self.config.num_lateral_targets))
@@ -3730,24 +3999,77 @@ class PredictiveRecoveryFilter:
                 current_l + self.config.max_lateral_without_blocker,
             ])
 
-        blocking_distance = _safe_float(scene_info.get("front_blocking_object_distance"), float("inf"))
         if np.isfinite(blocking_distance) and ego_projection.frenet_valid:
             blocking_l = _safe_float(scene_info.get("front_blocking_object_l"), current_l)
             blocking_width = _safe_float(scene_info.get("front_blocking_object_width"), ego_width)
-            target_values.append(blocking_l + blocking_width * 0.5 + ego_width * 0.5 + 0.8)
-            target_values.append(blocking_l - blocking_width * 0.5 - ego_width * 0.5 - 0.8)
+            left_pass_target = (
+                blocking_l
+                + blocking_width * 0.5
+                + ego_width * 0.5
+                + self.config.overtake_lateral_clearance
+            )
+            right_pass_target = (
+                blocking_l
+                - blocking_width * 0.5
+                - ego_width * 0.5
+                - self.config.overtake_lateral_clearance
+            )
+            left_lane_target = current_l + self.config.default_lane_width
+            right_lane_target = current_l - self.config.default_lane_width
+            min_side_gap = max(0.35, self.config.min_boundary_margin_for_bypass)
+            blocker_left_gap = _safe_float(scene_info.get("blocker_left_gap"), 0.0)
+            blocker_right_gap = _safe_float(scene_info.get("blocker_right_gap"), 0.0)
+            side_targets: List[Tuple[str, float, float]] = []
+            if blocker_left_gap > min_side_gap:
+                side_targets.append(("left", blocker_left_gap, left_pass_target))
+                target_values.append(left_lane_target)
+            if blocker_right_gap > min_side_gap:
+                side_targets.append(("right", blocker_right_gap, right_pass_target))
+                target_values.append(right_lane_target)
+            latched_side = self._hard_bypass_side if self._hard_bypass_remaining > 0 else ""
+            side_targets.sort(
+                key=lambda item: (
+                    0 if latched_side and item[0] == latched_side else 1,
+                    -item[1],
+                )
+            )
+            for _, _, target in side_targets:
+                preferred_pass_targets.append(target)
+                target_values.append(target)
+            target_values.append(left_pass_target)
+            target_values.append(right_pass_target)
 
-        lateral_targets = []
-        for value in target_values:
+        def clip_lateral_target(value: float) -> Optional[float]:
             clipped = _clip(value, l_low, l_high)
             if (
                 not ego_projection.frenet_valid
                 and abs(clipped - current_l) > self.config.max_lateral_when_frenet_unstable
             ):
+                return None
+            return clipped
+
+        lateral_targets = []
+        for value in preferred_pass_targets:
+            clipped = clip_lateral_target(value)
+            if clipped is None:
+                continue
+            if abs(clipped - current_l) < self.config.overtake_min_lateral_shift:
                 continue
             if all(abs(clipped - existing) > 0.25 for existing in lateral_targets):
                 lateral_targets.append(clipped)
-        lateral_targets = sorted(lateral_targets, key=lambda x: abs(x - current_l))[:max(1, n_lat + 2)]
+        preferred_lateral_targets = list(lateral_targets)
+        general_targets = []
+        for value in target_values:
+            clipped = clip_lateral_target(value)
+            if clipped is None:
+                continue
+            if all(abs(clipped - existing) > 0.25 for existing in lateral_targets + general_targets):
+                general_targets.append(clipped)
+        lateral_limit_count = max(1, n_lat + (4 if has_blocker else 2))
+        for clipped in sorted(general_targets, key=lambda x: abs(x - current_l)):
+            if len(lateral_targets) >= lateral_limit_count:
+                break
+            lateral_targets.append(clipped)
 
         raw_target_speed = _clip(ego_speed + self._action_to_accel(raw_action[1]) * 1.5, 0.0, self.config.max_speed)
         speed_values = [
@@ -3768,9 +4090,33 @@ class PredictiveRecoveryFilter:
         speed_targets = speed_targets[:max(1, int(self.config.num_speed_targets))]
 
         combos = [(lat, speed) for lat in lateral_targets for speed in speed_targets]
-        combos.sort(key=lambda item: self._candidate_priority(item[0], item[1], current_l, raw_target_speed, has_blocking=np.isfinite(blocking_distance)))
+        combos.sort(key=lambda item: self._candidate_priority(
+            item[0],
+            item[1],
+            current_l,
+            raw_target_speed,
+            has_blocking=np.isfinite(blocking_distance),
+            preferred_lateral_targets=preferred_lateral_targets,
+            dynamic_vehicle_blocker=dynamic_vehicle_blocker,
+        ))
         max_candidates = max(1, int(self.config.max_candidates))
         selected_combos = combos[:max_candidates]
+        if front_vehicle_blocker and preferred_lateral_targets:
+            lane_change_combos = [
+                (lat, speed)
+                for lat in preferred_lateral_targets
+                for speed in speed_targets
+                if speed > 0.5
+            ]
+            lane_change_combos.sort(key=lambda item: abs(item[1] - raw_target_speed))
+            forced = lane_change_combos[:min(4, max_candidates)]
+            merged: List[Tuple[float, float]] = []
+            for combo in forced + selected_combos:
+                if all(abs(combo[0] - existing[0]) > 0.25 or abs(combo[1] - existing[1]) > 0.4 for existing in merged):
+                    merged.append(combo)
+                if len(merged) >= max_candidates:
+                    break
+            selected_combos = merged
         keep_stop = min(combos, key=lambda item: abs(item[0] - current_l) + abs(item[1])) if combos else None
         if keep_stop is not None and keep_stop not in selected_combos:
             selected_combos[-1] = keep_stop
@@ -3778,6 +4124,12 @@ class PredictiveRecoveryFilter:
         specs = []
         for candidate_id, (lateral_target, speed_target) in enumerate(selected_combos):
             candidate_type = self._candidate_type(current_l, lateral_target, ego_speed, speed_target)
+            if (
+                front_vehicle_blocker
+                and abs(lateral_target - current_l) >= self.config.overtake_min_lateral_shift
+                and speed_target > 0.5
+            ):
+                candidate_type = ("left_" if lateral_target > current_l else "right_") + "pass"
             candidate = TrajectoryCandidate(candidate_id, candidate_type, lateral_target, speed_target, raw_action.copy())
             specs.append(candidate)
         return specs
@@ -3789,12 +4141,30 @@ class PredictiveRecoveryFilter:
         current_l: float,
         raw_target_speed: float,
         has_blocking: bool,
+        preferred_lateral_targets: Optional[Sequence[float]] = None,
+        dynamic_vehicle_blocker: bool = False,
     ) -> float:
         lateral_shift = abs(lateral_target - current_l)
         speed_shift = abs(speed_target - raw_target_speed)
         priority = lateral_shift + 0.08 * speed_shift
-        if has_blocking and lateral_shift > 0.5 and speed_target > 1.0:
-            priority -= 1.0
+        preferred_lateral = bool(
+            preferred_lateral_targets
+            and any(abs(lateral_target - target) <= 0.30 for target in preferred_lateral_targets)
+            and lateral_shift >= self.config.overtake_min_lateral_shift
+        )
+        if has_blocking:
+            if dynamic_vehicle_blocker and preferred_lateral and speed_target > 1.0:
+                priority -= self.config.overtake_candidate_bonus
+            elif lateral_shift >= self.config.overtake_min_lateral_shift and speed_target > 1.0:
+                priority -= 1.0
+            if (
+                dynamic_vehicle_blocker
+                and lateral_shift < self.config.overtake_min_lateral_shift
+                and speed_target < raw_target_speed - 1.0
+            ):
+                priority += self.config.blocked_follow_penalty
+            if dynamic_vehicle_blocker and lateral_shift < 0.5 and speed_target > 0.5:
+                priority += 1.0
         if speed_target < 0.5:
             priority += 0.2 if has_blocking else 1.2
         return priority
@@ -4230,13 +4600,29 @@ class PredictiveRecoveryFilter:
         blocker_left_gap = _safe_float(scene_info.get("blocker_left_gap"), 0.0)
         blocker_right_gap = _safe_float(scene_info.get("blocker_right_gap"), 0.0)
         side_channel_available = max(blocker_left_gap, blocker_right_gap) > 0.35
+        dynamic_vehicle_blocker = bool(scene_info.get("front_blocking_is_dynamic_vehicle", False))
         deadlock_penalty = 0.0
+        terminal_recovery_score = 0.0
+        candidate_type = str(rollout.candidate.candidate_type)
+        candidate_speed_target = _safe_float(rollout.candidate.speed_target, 0.0)
+        candidate_lateral_shift = abs(_safe_float(rollout.candidate.lateral_target, ego_projection.l) - ego_projection.l)
+        moving_overtake_candidate = (
+            candidate_lateral_shift >= self.config.overtake_min_lateral_shift
+            and candidate_speed_target > 1.0
+            and not candidate_type.endswith("_stop")
+        )
         if has_blocking:
             if avg_speed < 1.5:
                 deadlock_penalty += 10.0 if side_channel_available else 4.0
             target_progress = min(blocking_distance + 6.0, max(8.0, self.config.horizon * 5.0))
             if progress < target_progress:
                 deadlock_penalty += max(0.0, target_progress - progress) * (0.9 if side_channel_available else 0.35)
+            if side_channel_available and dynamic_vehicle_blocker:
+                if moving_overtake_candidate:
+                    terminal_recovery_score -= 3.0
+                    progress_score -= 0.15 * max(0.0, progress)
+                elif candidate_speed_target > 0.5:
+                    deadlock_penalty += self.config.blocked_follow_penalty
 
         stop_candidate = rollout.candidate.speed_target < 0.5 or rollout.candidate.candidate_type.endswith("_stop")
         raw_throttle = _safe_float(raw_action[1] if raw_action is not None and len(raw_action) > 1 else 0.0, 0.0)
@@ -4264,7 +4650,6 @@ class PredictiveRecoveryFilter:
         nominal_deviation_score = float(np.linalg.norm(np.array([rollout.steer_actions[0], rollout.throttle_actions[0]]) - raw_action))
         continuity_score = 0.0
 
-        terminal_recovery_score = 0.0
         terminal_passed_blocker = False
         terminal_recoverable = False
         if has_blocking:
@@ -4449,6 +4834,31 @@ class PredictiveRecoveryFilter:
         radius_a = 0.5 * math.sqrt(length_a ** 2 + width_a ** 2)
         radius_b = 0.5 * math.sqrt(length_b ** 2 + width_b ** 2)
         return center_dist - radius_a - radius_b
+
+    def _candidate_action_from_rollout(
+        self,
+        rollout: TrajectoryRollout,
+        use_bypass_lookahead: bool = False,
+    ) -> np.ndarray:
+        if rollout.steer_actions.size == 0 or rollout.throttle_actions.size == 0:
+            return np.zeros(2, dtype=np.float32)
+
+        steer = float(rollout.steer_actions[0])
+        throttle = float(rollout.throttle_actions[0])
+        if use_bypass_lookahead and self._hard_recovery_rollout_is_moving_bypass(rollout):
+            times = (
+                rollout.times
+                if rollout.times.size == rollout.steer_actions.size
+                else np.arange(rollout.steer_actions.size, dtype=float)
+            )
+            lookahead_time = max(self.config.dt, self.config.hard_bypass_steer_lookahead_time)
+            window = np.where(times <= lookahead_time)[0]
+            if window.size == 0:
+                window = np.array([min(1, rollout.steer_actions.size - 1)], dtype=int)
+            steer_index = int(window[np.argmax(np.abs(rollout.steer_actions[window]))])
+            steer = float(rollout.steer_actions[steer_index])
+
+        return np.array([steer, throttle], dtype=np.float32)
 
     def _clip_action_to_raw_delta(
         self,
