@@ -65,6 +65,8 @@ if __name__ == '__main__':
         env_config=dict(
             num_predicted_steps=args.num_predicted_steps,
             preference_horizon=args.preference_horizon,
+            accident_prob=0.0,
+            traffic_density=0.08,
         ),
 
         # Algorithm config

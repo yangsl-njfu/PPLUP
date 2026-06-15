@@ -8,13 +8,17 @@ param(
     [Alias("rss_shield")]
     [switch]$RssShield,
 
+    [Alias("rss_shield_mode")]
+    [ValidateSet("standard", "spring_damper")]
+    [string]$RssShieldMode = "standard",
+
     [Alias("rss_debug_interval")]
     [int]$RssDebugInterval = 0
 )
 
 # ========== Configuration ==========
-$MODEL_DIR = "E:\CodeProject\CodexExp01\PPL-main\runs\PPL\PPL_0ee03603\models"
-$RESULT_DIR = "evaluation_results\PPL_0ee03603_RSS_Collision_End"
+$MODEL_DIR = "E:\CodeProject\CodexExp01\PPL-main\runs\PPL\PPL_de15a333\models"
+$RESULT_DIR = "evaluation_results\PPL_de15a333_RSS"
 $START_STEP = 6000
 $END_STEP = 8000
 $STEP_INTERVAL = 200
@@ -27,7 +31,7 @@ Write-Host "Model Directory: $MODEL_DIR" -ForegroundColor White
 Write-Host "Result Directory: $RESULT_DIR" -ForegroundColor White
 Write-Host "Step Range: $START_STEP -> $END_STEP (interval $STEP_INTERVAL)" -ForegroundColor White
 Write-Host "Episodes per Env: $NUM_EP_IN_ONE_ENV, Total Envs: $TOTAL_ENV_NUM" -ForegroundColor White
-Write-Host "RSS Observe: $RssObserve, RSS Shield: $RssShield, RSS Debug Interval: $RssDebugInterval" -ForegroundColor White
+Write-Host "RSS Observe: $RssObserve, RSS Shield: $RssShield, RSS Shield Mode: $RssShieldMode, RSS Debug Interval: $RssDebugInterval" -ForegroundColor White
 Write-Host ""
 
 # Create result directory
@@ -61,6 +65,7 @@ for ($step = $START_STEP; $step -le $END_STEP; $step += $STEP_INTERVAL) {
             }
             if ($RssShield) {
                 $eval_args += "--rss_shield"
+                $eval_args += @("--rss_shield_mode", "$RssShieldMode")
             }
             if ($RssDebugInterval -gt 0) {
                 $eval_args += @("--rss_debug_interval", "$RssDebugInterval")

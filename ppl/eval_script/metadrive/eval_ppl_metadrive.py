@@ -57,9 +57,17 @@ class RSSObserver:
         max_lateral_distance=8.0,
         log_every_step=False,
         debug_interval=0,
+        shield_mode="standard",
         shield_brake=1.0,
         lateral_shield_brake=0.5,
         lateral_steering_scale=0.25,
+        spring_longitudinal_buffer=2.0,
+        spring_longitudinal_k=0.08,
+        damper_longitudinal_k=0.015,
+        spring_lateral_buffer=0.4,
+        spring_lateral_k=0.05,
+        damper_lateral_k=0.02,
+        spring_lateral_max_steer=0.04,
         verbose=False,
     ):
         self.response_time = response_time
@@ -76,9 +84,17 @@ class RSSObserver:
         self.max_lateral_distance = max_lateral_distance
         self.log_every_step = log_every_step
         self.debug_interval = debug_interval
+        self.shield_mode = shield_mode
         self.shield_brake = shield_brake
         self.lateral_shield_brake = lateral_shield_brake
         self.lateral_steering_scale = lateral_steering_scale
+        self.spring_longitudinal_buffer = spring_longitudinal_buffer
+        self.spring_longitudinal_k = spring_longitudinal_k
+        self.damper_longitudinal_k = damper_longitudinal_k
+        self.spring_lateral_buffer = spring_lateral_buffer
+        self.spring_lateral_k = spring_lateral_k
+        self.damper_lateral_k = damper_lateral_k
+        self.spring_lateral_max_steer = spring_lateral_max_steer
         self.verbose = verbose
         self.was_longitudinal_unsafe = False
         self.was_lateral_unsafe = False
@@ -113,6 +129,7 @@ class RSSObserver:
             return action, empty_info
 
         longitudinal_active = False
+        response = {"response": "none", "throttle_cap": None}
         front = front_state["front"]
         ego = front_state["ego"]
         ego_proj = front_state["ego_proj"]
@@ -145,15 +162,24 @@ class RSSObserver:
                 "rss_longitudinal_shield_violation": max(0.0, float(violation)),
                 "rss_shield_front_vehicle": getattr(front_vehicle, "name", getattr(front_vehicle, "id", "")),
             }
-            if violation > 0.0:
-                brake = self._proper_response_brake()
-                action[1] = min(float(action[1]), -brake)
-                longitudinal_active = True
+            response = self._longitudinal_shield_response(
+                action=action,
+                distance=distance,
+                safe_distance=safe_distance,
+                ego_speed=ego.speed,
+                front_speed=front_speed,
+            )
+            if response["active"]:
+                if response["throttle_cap"] is not None:
+                    action[1] = min(float(action[1]), response["throttle_cap"])
+                else:
+                    action[1] = min(float(action[1]), -response["brake"])
+                longitudinal_active = response["response"] == "hard"
                 if self.verbose and (not self.was_shielding or self.log_every_step):
                     print(
                         "[RSS SHIELD] seed={} episode={} step={} "
                         "distance={:.2f} safe_distance={:.2f} violation={:.2f} "
-                        "proper_response_brake={:.2f} action_throttle={:.2f}->{:.2f} "
+                        "response={} brake={:.2f} action_throttle={:.2f}->{:.2f} "
                         "ego_acc={:.2f} ego_brake={:.2f} front_brake={:.2f} "
                         "ego_v={:.2f} front_v={:.2f} ego_s={:.2f} front_s={:.2f} front={} type={}".format(
                             env_seed,
@@ -162,7 +188,8 @@ class RSSObserver:
                             distance,
                             safe_distance,
                             violation,
-                            brake,
+                            response["response"],
+                            response["brake"],
                             original_throttle,
                             action[1],
                             ego_max_accel,
@@ -180,7 +207,14 @@ class RSSObserver:
                             ),
                         )
                     )
-                long_info["rss_shield_brake"] = brake
+                long_info.update(
+                    {
+                        "rss_shield_brake": response["brake"],
+                        "rss_shield_response": response["response"],
+                        "rss_shield_closing_speed": response["closing_speed"],
+                        "rss_shield_soft_penetration": response["soft_penetration"],
+                    }
+                )
             elif self.verbose and self.was_shielding:
                 print(
                     "[RSS SHIELD CLEAR] seed={} episode={} step={} "
@@ -193,37 +227,42 @@ class RSSObserver:
         lateral_unsafe = lateral is not None and lateral["unsafe"]
         lateral_active = False
         lateral_info = {}
-        if lateral_unsafe:
-            lateral_brake = self._proper_response_lateral_brake()
+        if lateral is not None:
             vehicle = lateral["vehicle"]
             signed_lateral_delta = self._relative_lateral_delta(ego, vehicle)
             steering_toward_vehicle = self._is_steering_toward_lateral_vehicle(
                 original_steering, signed_lateral_delta
             )
-            severe_lateral_risk = lateral["lateral_gap"] < 0.3
-            if steering_toward_vehicle:
-                action[0] = float(np.clip(action[0] * self.lateral_steering_scale, -1.0, 1.0))
-                action[1] = min(float(action[1]), -lateral_brake)
-                lateral_active = True
-            elif severe_lateral_risk:
-                action[1] = min(float(action[1]), -lateral_brake)
-                lateral_active = True
-            lateral_info = {
-                "rss_lateral_shield_vehicle": getattr(vehicle, "name", getattr(vehicle, "id", "")),
-                "rss_lateral_shield_gap": lateral["lateral_gap"],
-                "rss_lateral_shield_safe_distance": lateral["safe_lateral_distance"],
-                "rss_lateral_shield_longitudinal_gap": lateral["longitudinal_gap"],
-                "rss_lateral_shield_brake": lateral_brake,
-                "rss_lateral_shield_source": lateral.get("source", ""),
-                "rss_lateral_shield_signed_delta": signed_lateral_delta,
-                "rss_lateral_shield_steering_toward": steering_toward_vehicle,
-                "rss_lateral_shield_severe": severe_lateral_risk,
-            }
-            if lateral_active and self.verbose and (not self.was_lateral_shielding or self.log_every_step):
+            lateral_response = self._lateral_shield_response(
+                action=action,
+                lateral=lateral,
+                signed_lateral_delta=signed_lateral_delta,
+                steering_toward_vehicle=steering_toward_vehicle,
+            )
+            if lateral_response["active"]:
+                action[0] = lateral_response["steering"]
+                if lateral_response["brake"] > 0.0:
+                    action[1] = min(float(action[1]), -lateral_response["brake"])
+                lateral_active = lateral_response["response"] in {"hard", "hard_brake"}
+                lateral_info = {
+                    "rss_lateral_shield_vehicle": getattr(vehicle, "name", getattr(vehicle, "id", "")),
+                    "rss_lateral_shield_gap": lateral["lateral_gap"],
+                    "rss_lateral_shield_safe_distance": lateral["safe_lateral_distance"],
+                    "rss_lateral_shield_longitudinal_gap": lateral["longitudinal_gap"],
+                    "rss_lateral_shield_brake": lateral_response["brake"],
+                    "rss_lateral_shield_source": lateral.get("source", ""),
+                    "rss_lateral_shield_signed_delta": signed_lateral_delta,
+                    "rss_lateral_shield_steering_toward": steering_toward_vehicle,
+                    "rss_lateral_shield_severe": lateral_response["severe"],
+                    "rss_lateral_shield_response": lateral_response["response"],
+                    "rss_lateral_shield_closing_speed": lateral_response["closing_speed"],
+                    "rss_lateral_shield_soft_penetration": lateral_response["soft_penetration"],
+                }
+            if lateral_response["active"] and self.verbose and (not self.was_lateral_shielding or self.log_every_step):
                 print(
                     "[RSS LAT SHIELD] seed={} episode={} step={} "
-                    "lat_gap={:.2f} safe_lat={:.2f} long_gap={:.2f} "
-                    "toward={} severe={} action_steer={:.2f}->{:.2f} "
+                        "lat_gap={:.2f} safe_lat={:.2f} long_gap={:.2f} "
+                    "response={} toward={} severe={} action_steer={:.2f}->{:.2f} "
                     "action_throttle={:.2f}->{:.2f} other={} source={}".format(
                         env_seed,
                         episode,
@@ -231,8 +270,9 @@ class RSSObserver:
                         lateral["lateral_gap"],
                         lateral["safe_lateral_distance"],
                         lateral["longitudinal_gap"],
+                        lateral_response["response"],
                         steering_toward_vehicle,
-                        severe_lateral_risk,
+                        lateral_response["severe"],
                         original_steering,
                         action[0],
                         original_throttle,
@@ -248,7 +288,10 @@ class RSSObserver:
                 )
             )
 
-        shield_active = longitudinal_active or lateral_active
+        spring_soft_active = response.get("response") == "spring_damper_soft" or lateral_info.get(
+            "rss_lateral_shield_response"
+        ) == "spring_damper"
+        shield_active = longitudinal_active or lateral_active or spring_soft_active
         shield_started = shield_active and not (self.was_shielding or self.was_lateral_shielding)
         self.was_shielding = longitudinal_active
         self.was_lateral_shielding = lateral_active
@@ -258,6 +301,9 @@ class RSSObserver:
             "rss_shield_started": shield_started,
             "rss_longitudinal_shield_active": longitudinal_active,
             "rss_lateral_shield_active": lateral_active,
+            "rss_spring_soft_active": spring_soft_active,
+            "rss_longitudinal_spring_soft_active": response.get("response") == "spring_damper_soft",
+            "rss_lateral_spring_soft_active": lateral_info.get("rss_lateral_shield_response") == "spring_damper",
             "rss_shield_original_throttle": original_throttle,
             "rss_shield_original_steering": original_steering,
             "rss_shield_action_throttle": float(action[1]),
@@ -272,6 +318,167 @@ class RSSObserver:
 
     def _proper_response_lateral_brake(self):
         return float(np.clip(self.lateral_shield_brake, 0.0, 1.0))
+
+    def _longitudinal_shield_response(self, action, distance, safe_distance, ego_speed, front_speed):
+        violation = safe_distance - distance
+        closing_speed = max(0.0, float(ego_speed) - float(front_speed))
+        response = {
+            "active": False,
+            "brake": 0.0,
+            "response": "none",
+            "closing_speed": closing_speed,
+            "soft_penetration": 0.0,
+            "throttle_cap": None,
+        }
+
+        if self.shield_mode == "standard":
+            if violation > 0.0:
+                response.update(
+                    {
+                        "active": True,
+                        "brake": self._proper_response_brake(),
+                        "response": "hard",
+                    }
+                )
+            return response
+
+        if violation > 0.0:
+            response.update(
+                {
+                    "active": True,
+                    "brake": self._proper_response_brake(),
+                    "response": "hard",
+                    "soft_penetration": float(violation),
+                }
+            )
+            return response
+
+        if self.shield_mode != "spring_damper":
+            return response
+
+        if self.spring_longitudinal_buffer <= 0.0:
+            return response
+
+        soft_boundary = safe_distance + self.spring_longitudinal_buffer
+        soft_penetration = soft_boundary - distance
+        response["soft_penetration"] = max(0.0, float(soft_penetration))
+        if soft_penetration <= 0.0 or closing_speed <= 0.1 or float(action[1]) <= 0.0:
+            return response
+
+        buffer = max(self.spring_longitudinal_buffer, 1e-3)
+        penetration_ratio = float(np.clip(soft_penetration / buffer, 0.0, 1.0))
+        throttle_reduction = self.spring_longitudinal_k * penetration_ratio + self.damper_longitudinal_k * closing_speed
+        throttle_cap = max(0.0, float(action[1]) - throttle_reduction)
+        if throttle_cap >= float(action[1]) - 1e-6:
+            return response
+
+        response.update(
+            {
+                "active": True,
+                "response": "spring_damper_soft",
+                "throttle_cap": throttle_cap,
+            }
+        )
+        return response
+
+    def _lateral_shield_response(self, action, lateral, signed_lateral_delta, steering_toward_vehicle):
+        severe = lateral["lateral_gap"] < 0.30
+        response = {
+            "active": False,
+            "steering": float(action[0]),
+            "brake": 0.0,
+            "response": "none",
+            "severe": severe,
+            "closing_speed": 0.0,
+            "soft_penetration": 0.0,
+        }
+
+        if self.shield_mode == "standard":
+            if not lateral["unsafe"]:
+                return response
+            lateral_brake = self._proper_response_lateral_brake()
+            if steering_toward_vehicle:
+                response.update(
+                    {
+                        "active": True,
+                        "steering": float(np.clip(float(action[0]) * self.lateral_steering_scale, -1.0, 1.0)),
+                        "brake": lateral_brake,
+                        "response": "hard",
+                    }
+                )
+            elif severe:
+                response.update(
+                    {
+                        "active": True,
+                        "brake": lateral_brake,
+                        "response": "hard_brake",
+                    }
+                )
+            return response
+
+        if signed_lateral_delta is None or abs(signed_lateral_delta) < 1e-6:
+            return response
+
+        if lateral["unsafe"]:
+            lateral_brake = self._proper_response_lateral_brake()
+            if steering_toward_vehicle:
+                response.update(
+                    {
+                        "active": True,
+                        "steering": float(np.clip(float(action[0]) * self.lateral_steering_scale, -1.0, 1.0)),
+                        "brake": lateral_brake,
+                        "response": "hard",
+                    }
+                )
+            elif severe:
+                response.update(
+                    {
+                        "active": True,
+                        "brake": lateral_brake,
+                        "response": "hard_brake",
+                    }
+                )
+            return response
+
+        if self.spring_lateral_buffer <= 0.0:
+            return response
+
+        soft_boundary = lateral["safe_lateral_distance"] + self.spring_lateral_buffer
+        soft_penetration = soft_boundary - lateral["lateral_gap"]
+        response["soft_penetration"] = max(0.0, float(soft_penetration))
+        if soft_penetration <= 0.0:
+            return response
+
+        signed_gap = float(lateral.get("other_d", 0.0) - lateral.get("ego_d", 0.0))
+        if abs(signed_gap) < 1e-6:
+            signed_gap = float(signed_lateral_delta)
+        relative_lateral_speed = float(lateral.get("other_lateral_speed", 0.0)) - float(
+            lateral.get("ego_lateral_speed", 0.0)
+        )
+        closing_speed = max(0.0, -np.sign(signed_gap) * relative_lateral_speed)
+        response["closing_speed"] = closing_speed
+
+        buffer = max(self.spring_lateral_buffer, 1e-3)
+        desired_away = self.spring_lateral_k * (soft_penetration / buffer) + self.damper_lateral_k * closing_speed
+        desired_away = float(np.clip(desired_away, 0.0, self.spring_lateral_max_steer))
+        away_direction = float(np.sign(signed_lateral_delta))
+        current_away = float(action[0]) * away_direction
+        steer_delta = max(0.0, desired_away - current_away)
+
+        brake = 0.0
+
+        if steer_delta <= 1e-6 and brake <= 1e-6:
+            return response
+
+        response.update(
+            {
+                "active": True,
+                "steering": float(np.clip(float(action[0]) + away_direction * steer_delta, -1.0, 1.0)),
+                "brake": brake,
+                "response": "spring_damper",
+            }
+        )
+        return response
 
     def _relative_lateral_delta(self, ego, vehicle):
         ego_pos = np.asarray(getattr(ego, "position", [0.0, 0.0]), dtype=float)[:2]
@@ -942,11 +1149,15 @@ def make_rss_episode_stats():
         "rss_shield_steps": 0,
         "rss_longitudinal_shield_steps": 0,
         "rss_lateral_shield_steps": 0,
+        "rss_spring_soft_steps": 0,
+        "rss_longitudinal_spring_soft_steps": 0,
+        "rss_lateral_spring_soft_steps": 0,
         "rss_first_unsafe_step": -1,
         "rss_first_longitudinal_unsafe_step": -1,
         "rss_first_lateral_unsafe_step": -1,
         "rss_first_shield_step": -1,
         "rss_first_lateral_shield_step": -1,
+        "rss_first_spring_soft_step": -1,
     }
 
 
@@ -968,6 +1179,11 @@ def update_rss_episode_stats(stats, info, step):
     if info.get("rss_longitudinal_shield_active", False):
         stats["rss_longitudinal_shield_steps"] += 1
     mark("rss_lateral_shield_active", "rss_lateral_shield_steps", "rss_first_lateral_shield_step")
+    mark("rss_spring_soft_active", "rss_spring_soft_steps", "rss_first_spring_soft_step")
+    if info.get("rss_longitudinal_spring_soft_active", False):
+        stats["rss_longitudinal_spring_soft_steps"] += 1
+    if info.get("rss_lateral_spring_soft_active", False):
+        stats["rss_lateral_spring_soft_steps"] += 1
 
 
 def make_episode_event_stats():
@@ -1293,9 +1509,22 @@ if __name__ == "__main__":
     parser.add_argument("--rss_max_lateral_distance", type=float, default=8.0)
     parser.add_argument("--rss_log_every_step", action="store_true")
     parser.add_argument("--rss_debug_interval", type=int, default=0)
+    parser.add_argument(
+        "--rss_shield_mode",
+        choices=["standard", "spring_damper"],
+        default="standard",
+        help="Shield response mode. 'standard' keeps the original hard RSS behavior.",
+    )
     parser.add_argument("--rss_shield_brake", type=float, default=1.0)
     parser.add_argument("--rss_lateral_shield_brake", type=float, default=0.5)
     parser.add_argument("--rss_lateral_steering_scale", type=float, default=0.25)
+    parser.add_argument("--rss_spring_longitudinal_buffer", type=float, default=2.0)
+    parser.add_argument("--rss_spring_longitudinal_k", type=float, default=0.08)
+    parser.add_argument("--rss_damper_longitudinal_k", type=float, default=0.015)
+    parser.add_argument("--rss_spring_lateral_buffer", type=float, default=0.4)
+    parser.add_argument("--rss_spring_lateral_k", type=float, default=0.05)
+    parser.add_argument("--rss_damper_lateral_k", type=float, default=0.02)
+    parser.add_argument("--rss_spring_lateral_max_steer", type=float, default=0.04)
     parser.add_argument("--rss_verbose", action="store_true", help="Print RSS trigger/shield logs to terminal.")
 
     args = parser.parse_args()
@@ -1317,20 +1546,29 @@ if __name__ == "__main__":
         max_lateral_distance=args.rss_max_lateral_distance,
         log_every_step=args.rss_log_every_step,
         debug_interval=args.rss_debug_interval,
+        shield_mode=args.rss_shield_mode,
         shield_brake=args.rss_shield_brake,
         lateral_shield_brake=args.rss_lateral_shield_brake,
         lateral_steering_scale=args.rss_lateral_steering_scale,
+        spring_longitudinal_buffer=args.rss_spring_longitudinal_buffer,
+        spring_longitudinal_k=args.rss_spring_longitudinal_k,
+        damper_longitudinal_k=args.rss_damper_longitudinal_k,
+        spring_lateral_buffer=args.rss_spring_lateral_buffer,
+        spring_lateral_k=args.rss_spring_lateral_k,
+        damper_lateral_k=args.rss_damper_lateral_k,
+        spring_lateral_max_steer=args.rss_spring_lateral_max_steer,
         verbose=args.rss_verbose,
     ) if args.rss_observe or args.rss_shield else None
     if rss_observer is not None and args.rss_verbose:
         print(
             "[RSS] observer enabled: response_time={} front_max_distance={} "
-            "dynamics_mode={} shield={} lat_long_threshold={} "
+            "dynamics_mode={} shield={} shield_mode={} lat_long_threshold={} "
             "max_lat_distance={} debug_interval={}".format(
                 args.rss_response_time,
                 args.rss_max_front_distance,
                 rss_dynamics_mode,
                 args.rss_shield,
+                args.rss_shield_mode,
                 args.rss_lateral_longitudinal_threshold,
                 args.rss_max_lateral_distance,
                 args.rss_debug_interval,

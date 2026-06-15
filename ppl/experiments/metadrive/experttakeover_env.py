@@ -63,8 +63,8 @@ def get_expert():
     )
     model = PPO(**algo_config)
 
-    ckpt = FOLDER_PATH / "metadrive_ppo_expert_20m_steps.zip"
-
+    # ckpt = FOLDER_PATH / "metadrive_ppo_expert_20m_steps.zip"
+    ckpt = FOLDER_PATH / "best_model2.zip"
     print(f"Loading checkpoint from {ckpt}!")
     data, params, pytorch_variables = load_from_zip_file(ckpt, device=model.device, print_system_info=False)
     model.set_parameters(params, exact_match=True, device=model.device)
