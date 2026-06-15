@@ -1,11 +1,22 @@
 # PPL Batch Evaluation Script for PowerShell
 # Author: Auto-generated script for evaluating all PPL checkpoints
 
+param(
+    [Alias("rss_observe")]
+    [switch]$RssObserve,
+
+    [Alias("rss_shield")]
+    [switch]$RssShield,
+
+    [Alias("rss_debug_interval")]
+    [int]$RssDebugInterval = 0
+)
+
 # ========== Configuration ==========
 $MODEL_DIR = "E:\CodeProject\CodexExp01\PPL-main\runs\PPL\PPL_0ee03603\models"
-$RESULT_DIR = "evaluation_results\PPL_0ee03603"
+$RESULT_DIR = "evaluation_results\PPL_0ee03603_RSS_Collision_End"
 $START_STEP = 6000
-$END_STEP = 10000
+$END_STEP = 8000
 $STEP_INTERVAL = 200
 $NUM_EP_IN_ONE_ENV = 1
 $TOTAL_ENV_NUM = 50
@@ -16,6 +27,7 @@ Write-Host "Model Directory: $MODEL_DIR" -ForegroundColor White
 Write-Host "Result Directory: $RESULT_DIR" -ForegroundColor White
 Write-Host "Step Range: $START_STEP -> $END_STEP (interval $STEP_INTERVAL)" -ForegroundColor White
 Write-Host "Episodes per Env: $NUM_EP_IN_ONE_ENV, Total Envs: $TOTAL_ENV_NUM" -ForegroundColor White
+Write-Host "RSS Observe: $RssObserve, RSS Shield: $RssShield, RSS Debug Interval: $RssDebugInterval" -ForegroundColor White
 Write-Host ""
 
 # Create result directory
@@ -36,7 +48,24 @@ for ($step = $START_STEP; $step -le $END_STEP; $step += $STEP_INTERVAL) {
     if (Test-Path $model_path) {
         try {
             Write-Host "[$current_count/$total_ckpts] Evaluating checkpoint $step ..." -ForegroundColor Green
-            python -m ppl.eval_script.metadrive.eval_ppl_metadrive --path "$MODEL_DIR" --ckpt_index $step --ret_save_folder "$RESULT_DIR" --num_ep_in_one_env $NUM_EP_IN_ONE_ENV --total_env_num $TOTAL_ENV_NUM
+            $eval_args = @(
+                "-m", "ppl.eval_script.metadrive.eval_ppl_metadrive",
+                "--path", "$MODEL_DIR",
+                "--ckpt_index", "$step",
+                "--ret_save_folder", "$RESULT_DIR",
+                "--num_ep_in_one_env", "$NUM_EP_IN_ONE_ENV",
+                "--total_env_num", "$TOTAL_ENV_NUM"
+            )
+            if ($RssObserve) {
+                $eval_args += "--rss_observe"
+            }
+            if ($RssShield) {
+                $eval_args += "--rss_shield"
+            }
+            if ($RssDebugInterval -gt 0) {
+                $eval_args += @("--rss_debug_interval", "$RssDebugInterval")
+            }
+            python @eval_args
             if ($LASTEXITCODE -ne 0) {
                 throw "Python evaluation failed for checkpoint $step with exit code $LASTEXITCODE"
             }
@@ -67,6 +96,8 @@ try:
         'success_rate': df['success'].mean(),
         'crash_rate': df['crash'].mean() if 'crash' in df.columns else 0.0,
         'crash_count': int(df['crash'].sum()) if 'crash' in df.columns else 0,
+        'vehicle_crash_rate': df['crash_vehicle'].mean() if 'crash_vehicle' in df.columns else 0.0,
+        'vehicle_crash_count': int(df['crash_vehicle'].sum()) if 'crash_vehicle' in df.columns else 0,
         'out_of_road_rate': df['out_of_road'].mean() if 'out_of_road' in df.columns else 0.0,
         'out_of_road_count': int(df['out_of_road'].sum()) if 'out_of_road' in df.columns else 0,
         'avg_reward': df['episode_reward'].mean(), 
