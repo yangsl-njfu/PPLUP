@@ -13,7 +13,17 @@ param(
     [string]$RssShieldMode = "standard",
 
     [Alias("rss_debug_interval")]
-    [int]$RssDebugInterval = 0
+    [int]$RssDebugInterval = 0,
+
+    [Alias("rss_attack")]
+    [ValidateSet("none", "front_range_overestimate", "front_object_removal", "lateral_gap_overestimate")]
+    [string]$RssAttack = "none",
+
+    [Alias("rss_attack_front_distance_delta")]
+    [double]$RssAttackFrontDistanceDelta = 0.0,
+
+    [Alias("rss_attack_lateral_gap_delta")]
+    [double]$RssAttackLateralGapDelta = 0.0
 )
 
 # ========== Configuration ==========
@@ -32,6 +42,7 @@ Write-Host "Result Directory: $RESULT_DIR" -ForegroundColor White
 Write-Host "Step Range: $START_STEP -> $END_STEP (interval $STEP_INTERVAL)" -ForegroundColor White
 Write-Host "Episodes per Env: $NUM_EP_IN_ONE_ENV, Total Envs: $TOTAL_ENV_NUM" -ForegroundColor White
 Write-Host "RSS Observe: $RssObserve, RSS Shield: $RssShield, RSS Shield Mode: $RssShieldMode, RSS Debug Interval: $RssDebugInterval" -ForegroundColor White
+Write-Host "RSS Attack: $RssAttack, Front Distance Delta: $RssAttackFrontDistanceDelta m, Lateral Gap Delta: $RssAttackLateralGapDelta m" -ForegroundColor White
 Write-Host ""
 
 # Create result directory
@@ -69,6 +80,11 @@ for ($step = $START_STEP; $step -le $END_STEP; $step += $STEP_INTERVAL) {
             }
             if ($RssDebugInterval -gt 0) {
                 $eval_args += @("--rss_debug_interval", "$RssDebugInterval")
+            }
+            if ($RssAttack -ne "none") {
+                $eval_args += @("--rss_attack", "$RssAttack")
+                $eval_args += @("--rss_attack_front_distance_delta", "$RssAttackFrontDistanceDelta")
+                $eval_args += @("--rss_attack_lateral_gap_delta", "$RssAttackLateralGapDelta")
             }
             python @eval_args
             if ($LASTEXITCODE -ne 0) {
@@ -110,6 +126,17 @@ try:
         'avg_velocity': df['velocity_step_mean'].mean(),
                 'avg_cost': df['episode_cost'].mean(),
                 'avg_route_completion': df['route_completion'].mean() if 'route_completion' in df.columns else 0.0,
+                'avg_rss_attack_steps': df['rss_attack_steps'].mean() if 'rss_attack_steps' in df.columns else 0.0,
+                'avg_rss_front_attack_steps': df['rss_front_attack_steps'].mean() if 'rss_front_attack_steps' in df.columns else 0.0,
+                'avg_rss_lateral_attack_steps': df['rss_lateral_attack_steps'].mean() if 'rss_lateral_attack_steps' in df.columns else 0.0,
+                'avg_rss_attack_delta': df['rss_attack_delta_mean'].mean() if 'rss_attack_delta_mean' in df.columns else 0.0,
+                'avg_rss_lateral_attack_delta': df['rss_lateral_attack_delta_mean'].mean() if 'rss_lateral_attack_delta_mean' in df.columns else 0.0,
+                'avg_rss_front_distance_raw': df['rss_front_distance_raw_mean'].mean() if 'rss_front_distance_raw_mean' in df.columns else 0.0,
+                'avg_rss_front_distance_attacked': df['rss_front_distance_attacked_mean'].mean() if 'rss_front_distance_attacked_mean' in df.columns else 0.0,
+                'avg_rss_front_distance_used': df['rss_front_distance_used_mean'].mean() if 'rss_front_distance_used_mean' in df.columns else 0.0,
+                'avg_rss_lateral_gap_raw': df['rss_lateral_gap_raw_mean'].mean() if 'rss_lateral_gap_raw_mean' in df.columns else 0.0,
+                'avg_rss_lateral_gap_attacked': df['rss_lateral_gap_attacked_mean'].mean() if 'rss_lateral_gap_attacked_mean' in df.columns else 0.0,
+                'avg_rss_lateral_gap_used': df['rss_lateral_gap_used_mean'].mean() if 'rss_lateral_gap_used_mean' in df.columns else 0.0,
                 'num_episodes': len(df)
     }
     header = not os.path.exists('$summary_csv_py')

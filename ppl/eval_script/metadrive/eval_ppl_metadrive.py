@@ -33,6 +33,7 @@ from ppl.ppl import PPL
 from ppl.sb3.td3.policies import TD3Policy
 from ppl.utils.metadrive_route_projection import MetaDriveRouteProjector
 from ppl.utils.print_dict_utils import pretty_print, RecorderEnv
+from ppl.utils.rss_attack import build_rss_attack
 from ppl.utils.train_eval_config import baseline_eval_config
 
 EVAL_ENV_START = baseline_eval_config["start_seed"]
@@ -68,6 +69,7 @@ class RSSObserver:
         spring_lateral_k=0.05,
         damper_lateral_k=0.02,
         spring_lateral_max_steer=0.04,
+        attack=None,
         verbose=False,
     ):
         self.response_time = response_time
@@ -95,11 +97,13 @@ class RSSObserver:
         self.spring_lateral_k = spring_lateral_k
         self.damper_lateral_k = damper_lateral_k
         self.spring_lateral_max_steer = spring_lateral_max_steer
+        self.attack = attack if attack is not None else build_rss_attack()
         self.verbose = verbose
         self.was_longitudinal_unsafe = False
         self.was_lateral_unsafe = False
         self.was_shielding = False
         self.was_lateral_shielding = False
+        self.attack.reset()
 
     def reset(self):
         self.was_longitudinal_unsafe = False
@@ -130,7 +134,16 @@ class RSSObserver:
 
         longitudinal_active = False
         response = {"response": "none", "throttle_cap": None}
-        front = front_state["front"]
+        raw_front = front_state["front"]
+        front, attack_info = self._attack_front_candidate(
+            raw_front,
+            front_state,
+            env_seed=env_seed,
+            episode=episode,
+            step=step,
+        )
+        front_state["front"] = front
+        front_state["raw_front"] = raw_front
         ego = front_state["ego"]
         ego_proj = front_state["ego_proj"]
         long_info = {}
@@ -161,6 +174,7 @@ class RSSObserver:
                 "rss_shield_safe_distance": safe_distance,
                 "rss_longitudinal_shield_violation": max(0.0, float(violation)),
                 "rss_shield_front_vehicle": getattr(front_vehicle, "name", getattr(front_vehicle, "id", "")),
+                **attack_info,
             }
             response = self._longitudinal_shield_response(
                 action=action,
@@ -223,10 +237,19 @@ class RSSObserver:
                     )
                 )
 
-        lateral = self._find_lateral_candidate(front_state)
+        raw_lateral = self._find_lateral_candidate(front_state)
+        lateral, lateral_attack_info = self._attack_lateral_candidate(
+            raw_lateral,
+            front_state,
+            env_seed=env_seed,
+            episode=episode,
+            step=step,
+        )
+        front_state["lateral"] = lateral
+        front_state["raw_lateral"] = raw_lateral
         lateral_unsafe = lateral is not None and lateral["unsafe"]
         lateral_active = False
-        lateral_info = {}
+        lateral_info = lateral_attack_info
         if lateral is not None:
             vehicle = lateral["vehicle"]
             signed_lateral_delta = self._relative_lateral_delta(ego, vehicle)
@@ -244,7 +267,7 @@ class RSSObserver:
                 if lateral_response["brake"] > 0.0:
                     action[1] = min(float(action[1]), -lateral_response["brake"])
                 lateral_active = lateral_response["response"] in {"hard", "hard_brake"}
-                lateral_info = {
+                lateral_info.update({
                     "rss_lateral_shield_vehicle": getattr(vehicle, "name", getattr(vehicle, "id", "")),
                     "rss_lateral_shield_gap": lateral["lateral_gap"],
                     "rss_lateral_shield_safe_distance": lateral["safe_lateral_distance"],
@@ -257,7 +280,7 @@ class RSSObserver:
                     "rss_lateral_shield_response": lateral_response["response"],
                     "rss_lateral_shield_closing_speed": lateral_response["closing_speed"],
                     "rss_lateral_shield_soft_penetration": lateral_response["soft_penetration"],
-                }
+                })
             if lateral_response["active"] and self.verbose and (not self.was_lateral_shielding or self.log_every_step):
                 print(
                     "[RSS LAT SHIELD] seed={} episode={} step={} "
@@ -544,18 +567,54 @@ class RSSObserver:
 
         ego = front_state["ego"]
         ego_proj = front_state["ego_proj"]
-        front = front_state["front"]
+        raw_front = front_state["front"]
+        front, attack_info = self._attack_front_candidate(
+            raw_front,
+            front_state,
+            env_seed=env_seed,
+            episode=episode,
+            step=step,
+        )
+        front_state["front"] = front
+        front_state["raw_front"] = raw_front
         stats = front_state["stats"]
-        lateral = self._find_lateral_candidate(front_state)
+        raw_lateral = self._find_lateral_candidate(front_state)
+        lateral, lateral_attack_info = self._attack_lateral_candidate(
+            raw_lateral,
+            front_state,
+            env_seed=env_seed,
+            episode=episode,
+            step=step,
+        )
+        front_state["lateral"] = lateral
+        front_state["raw_lateral"] = raw_lateral
 
-        longitudinal_info = self._observe_longitudinal(front, ego, ego_proj, env_seed, episode, step)
-        lateral_info = self._observe_lateral(lateral, env_seed, episode, step)
+        longitudinal_info = self._observe_longitudinal(front, ego, ego_proj, env_seed, episode, step, attack_info)
+        lateral_info = self._observe_lateral(lateral, env_seed, episode, step, lateral_attack_info)
         self._debug(env_seed, episode, step, stats, front, lateral, longitudinal_info, lateral_info)
         return {
             "rss_unsafe": longitudinal_info["rss_longitudinal_unsafe"] or lateral_info["rss_lateral_unsafe"],
             **longitudinal_info,
             **lateral_info,
         }
+
+    def _attack_front_candidate(self, front, front_state, env_seed, episode, step):
+        context = {
+            "front_state": front_state,
+            "env_seed": env_seed,
+            "episode": episode,
+            "step": step,
+        }
+        return self.attack.apply_front(front, context)
+
+    def _attack_lateral_candidate(self, lateral, front_state, env_seed, episode, step):
+        context = {
+            "front_state": front_state,
+            "env_seed": env_seed,
+            "episode": episode,
+            "step": step,
+        }
+        return self.attack.apply_lateral(lateral, context)
 
     def _find_longitudinal_front(self, env):
         raw_env = self._unwrap(env)
@@ -676,7 +735,8 @@ class RSSObserver:
         stats["lateral_candidates"] += 1
         return self._select_lateral_candidate(lateral, candidate)
 
-    def _observe_longitudinal(self, front, ego, ego_proj, env_seed, episode, step):
+    def _observe_longitudinal(self, front, ego, ego_proj, env_seed, episode, step, attack_info=None):
+        attack_info = attack_info or {}
         if front is None:
             if self.verbose and self.was_longitudinal_unsafe:
                 print(
@@ -685,7 +745,7 @@ class RSSObserver:
                     )
                 )
             self.was_longitudinal_unsafe = False
-            return {"rss_longitudinal_unsafe": False}
+            return {"rss_longitudinal_unsafe": False, **attack_info}
 
         front_vehicle = front["vehicle"]
         front_proj = front["proj"]
@@ -740,9 +800,11 @@ class RSSObserver:
             "rss_safe_distance": safe_distance,
             "rss_front_vehicle": getattr(front_vehicle, "name", getattr(front_vehicle, "id", "")),
             "rss_front_type": getattr(front_vehicle, "metadrive_type", getattr(front_vehicle, "class_name", "")),
+            **attack_info,
         }
 
-    def _observe_lateral(self, lateral, env_seed, episode, step):
+    def _observe_lateral(self, lateral, env_seed, episode, step, lateral_attack_info=None):
+        lateral_attack_info = lateral_attack_info or {}
         if lateral is None:
             if self.verbose and self.was_lateral_unsafe:
                 print(
@@ -751,7 +813,7 @@ class RSSObserver:
                     )
                 )
             self.was_lateral_unsafe = False
-            return {"rss_lateral_unsafe": False}
+            return {"rss_lateral_unsafe": False, **lateral_attack_info}
 
         unsafe = lateral["unsafe"]
         vehicle = lateral["vehicle"]
@@ -795,6 +857,7 @@ class RSSObserver:
             "rss_lateral_safe_distance": lateral["safe_lateral_distance"],
             "rss_lateral_vehicle": getattr(vehicle, "name", getattr(vehicle, "id", "")),
             "rss_lateral_source": lateral.get("source", ""),
+            **lateral_attack_info,
         }
 
     def _lateral_candidate(self, projector, ego, ego_ref, vehicle, proj):
@@ -1152,12 +1215,42 @@ def make_rss_episode_stats():
         "rss_spring_soft_steps": 0,
         "rss_longitudinal_spring_soft_steps": 0,
         "rss_lateral_spring_soft_steps": 0,
+        "rss_attack_steps": 0,
+        "rss_front_attack_steps": 0,
+        "rss_lateral_attack_steps": 0,
+        "rss_attack_delta_mean": 0.0,
+        "rss_lateral_attack_delta_mean": 0.0,
+        "rss_front_distance_raw_mean": 0.0,
+        "rss_front_distance_attacked_mean": 0.0,
+        "rss_front_distance_used_mean": 0.0,
+        "rss_lateral_gap_raw_mean": 0.0,
+        "rss_lateral_gap_attacked_mean": 0.0,
+        "rss_lateral_gap_used_mean": 0.0,
         "rss_first_unsafe_step": -1,
         "rss_first_longitudinal_unsafe_step": -1,
         "rss_first_lateral_unsafe_step": -1,
         "rss_first_shield_step": -1,
         "rss_first_lateral_shield_step": -1,
         "rss_first_spring_soft_step": -1,
+        "rss_first_attack_step": -1,
+        "rss_first_front_attack_step": -1,
+        "rss_first_lateral_attack_step": -1,
+        "_rss_attack_delta_sum": 0.0,
+        "_rss_attack_delta_samples": 0,
+        "_rss_lateral_attack_delta_sum": 0.0,
+        "_rss_lateral_attack_delta_samples": 0,
+        "_rss_front_distance_raw_sum": 0.0,
+        "_rss_front_distance_raw_samples": 0,
+        "_rss_front_distance_attacked_sum": 0.0,
+        "_rss_front_distance_attacked_samples": 0,
+        "_rss_front_distance_used_sum": 0.0,
+        "_rss_front_distance_used_samples": 0,
+        "_rss_lateral_gap_raw_sum": 0.0,
+        "_rss_lateral_gap_raw_samples": 0,
+        "_rss_lateral_gap_attacked_sum": 0.0,
+        "_rss_lateral_gap_attacked_samples": 0,
+        "_rss_lateral_gap_used_sum": 0.0,
+        "_rss_lateral_gap_used_samples": 0,
     }
 
 
@@ -1184,6 +1277,92 @@ def update_rss_episode_stats(stats, info, step):
         stats["rss_longitudinal_spring_soft_steps"] += 1
     if info.get("rss_lateral_spring_soft_active", False):
         stats["rss_lateral_spring_soft_steps"] += 1
+    front_attack_active = info.get("rss_attack_active", False)
+    lateral_attack_active = info.get("rss_lateral_attack_active", False)
+    if front_attack_active or lateral_attack_active:
+        stats["rss_attack_steps"] += 1
+        if stats["rss_first_attack_step"] < 0:
+            stats["rss_first_attack_step"] = step
+    mark("rss_attack_active", "rss_front_attack_steps", "rss_first_front_attack_step")
+    mark("rss_lateral_attack_active", "rss_lateral_attack_steps", "rss_first_lateral_attack_step")
+
+    raw_distance = _finite_info_value(info.get("rss_front_distance_raw"))
+    attacked_distance = _finite_info_value(info.get("rss_front_distance_attacked"))
+    used_distance = _finite_info_value(info.get("rss_front_distance_used"))
+    if raw_distance is not None:
+        stats["_rss_front_distance_raw_samples"] += 1
+        stats["_rss_front_distance_raw_sum"] += raw_distance
+        stats["rss_front_distance_raw_mean"] = (
+            stats["_rss_front_distance_raw_sum"] / stats["_rss_front_distance_raw_samples"]
+        )
+    if attacked_distance is not None:
+        stats["_rss_front_distance_attacked_samples"] += 1
+        stats["_rss_front_distance_attacked_sum"] += attacked_distance
+        stats["rss_front_distance_attacked_mean"] = (
+            stats["_rss_front_distance_attacked_sum"] / stats["_rss_front_distance_attacked_samples"]
+        )
+    if used_distance is not None:
+        stats["_rss_front_distance_used_samples"] += 1
+        stats["_rss_front_distance_used_sum"] += used_distance
+        stats["rss_front_distance_used_mean"] = (
+            stats["_rss_front_distance_used_sum"] / stats["_rss_front_distance_used_samples"]
+        )
+
+    if front_attack_active:
+        attack_delta = _finite_info_value(info.get("rss_attack_delta"))
+        if attack_delta is not None:
+            stats["_rss_attack_delta_samples"] += 1
+            stats["_rss_attack_delta_sum"] += attack_delta
+            stats["rss_attack_delta_mean"] = stats["_rss_attack_delta_sum"] / stats["_rss_attack_delta_samples"]
+
+    raw_lateral_gap = _finite_info_value(info.get("rss_lateral_gap_raw"))
+    attacked_lateral_gap = _finite_info_value(info.get("rss_lateral_gap_attacked"))
+    used_lateral_gap = _finite_info_value(info.get("rss_lateral_gap_used"))
+    if raw_lateral_gap is not None:
+        stats["_rss_lateral_gap_raw_samples"] += 1
+        stats["_rss_lateral_gap_raw_sum"] += raw_lateral_gap
+        stats["rss_lateral_gap_raw_mean"] = (
+            stats["_rss_lateral_gap_raw_sum"] / stats["_rss_lateral_gap_raw_samples"]
+        )
+    if attacked_lateral_gap is not None:
+        stats["_rss_lateral_gap_attacked_samples"] += 1
+        stats["_rss_lateral_gap_attacked_sum"] += attacked_lateral_gap
+        stats["rss_lateral_gap_attacked_mean"] = (
+            stats["_rss_lateral_gap_attacked_sum"] / stats["_rss_lateral_gap_attacked_samples"]
+        )
+    if used_lateral_gap is not None:
+        stats["_rss_lateral_gap_used_samples"] += 1
+        stats["_rss_lateral_gap_used_sum"] += used_lateral_gap
+        stats["rss_lateral_gap_used_mean"] = (
+            stats["_rss_lateral_gap_used_sum"] / stats["_rss_lateral_gap_used_samples"]
+        )
+
+    if lateral_attack_active:
+        lateral_attack_delta = _finite_info_value(info.get("rss_lateral_attack_delta"))
+        if lateral_attack_delta is not None:
+            stats["_rss_lateral_attack_delta_samples"] += 1
+            stats["_rss_lateral_attack_delta_sum"] += lateral_attack_delta
+            stats["rss_lateral_attack_delta_mean"] = (
+                stats["_rss_lateral_attack_delta_sum"] / stats["_rss_lateral_attack_delta_samples"]
+            )
+
+
+def _finite_info_value(value):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def finalize_rss_episode_stats(stats):
+    if stats is None:
+        return None
+    return {key: value for key, value in stats.items() if not key.startswith("_rss_")}
 
 
 def make_episode_event_stats():
@@ -1360,7 +1539,7 @@ def evaluate_ppl_once(
                     velocity_step_mean=np.mean(ep_velocities) if ep_velocities else 0,
                 ))
                 if rss_episode_stats is not None:
-                    res.update(rss_episode_stats)
+                    res.update(finalize_rss_episode_stats(rss_episode_stats))
                 ep_velocities = []
 
                 res["episode"] = ep_count
@@ -1525,12 +1704,35 @@ if __name__ == "__main__":
     parser.add_argument("--rss_spring_lateral_k", type=float, default=0.05)
     parser.add_argument("--rss_damper_lateral_k", type=float, default=0.02)
     parser.add_argument("--rss_spring_lateral_max_steer", type=float, default=0.04)
+    parser.add_argument(
+        "--rss_attack",
+        choices=["none", "front_range_overestimate", "front_object_removal", "lateral_gap_overestimate"],
+        default="none",
+        help="Object-level attack applied to RSS monitor inputs.",
+    )
+    parser.add_argument(
+        "--rss_attack_front_distance_delta",
+        type=float,
+        default=0.0,
+        help="Distance added to the selected front vehicle for front_range_overestimate attack, in meters.",
+    )
+    parser.add_argument(
+        "--rss_attack_lateral_gap_delta",
+        type=float,
+        default=0.0,
+        help="Gap added to the selected lateral vehicle for lateral_gap_overestimate attack, in meters.",
+    )
     parser.add_argument("--rss_verbose", action="store_true", help="Print RSS trigger/shield logs to terminal.")
 
     args = parser.parse_args()
 
     deterministic = not args.stochastic
     rss_dynamics_mode = "manual" if args.rss_disable_auto_dynamics else args.rss_dynamics_mode
+    rss_attack = build_rss_attack(
+        name=args.rss_attack,
+        front_distance_delta=args.rss_attack_front_distance_delta,
+        lateral_gap_delta=args.rss_attack_lateral_gap_delta,
+    )
     rss_observer = RSSObserver(
         response_time=args.rss_response_time,
         ego_max_accel=args.rss_ego_max_accel,
@@ -1557,13 +1759,15 @@ if __name__ == "__main__":
         spring_lateral_k=args.rss_spring_lateral_k,
         damper_lateral_k=args.rss_damper_lateral_k,
         spring_lateral_max_steer=args.rss_spring_lateral_max_steer,
+        attack=rss_attack,
         verbose=args.rss_verbose,
     ) if args.rss_observe or args.rss_shield else None
     if rss_observer is not None and args.rss_verbose:
         print(
             "[RSS] observer enabled: response_time={} front_max_distance={} "
             "dynamics_mode={} shield={} shield_mode={} lat_long_threshold={} "
-            "max_lat_distance={} debug_interval={}".format(
+            "max_lat_distance={} debug_interval={} attack={} attack_front_delta={} "
+            "attack_lateral_gap_delta={}".format(
                 args.rss_response_time,
                 args.rss_max_front_distance,
                 rss_dynamics_mode,
@@ -1572,6 +1776,9 @@ if __name__ == "__main__":
                 args.rss_lateral_longitudinal_threshold,
                 args.rss_max_lateral_distance,
                 args.rss_debug_interval,
+                args.rss_attack,
+                args.rss_attack_front_distance_delta,
+                args.rss_attack_lateral_gap_delta,
             )
         )
 
