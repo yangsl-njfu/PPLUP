@@ -495,7 +495,7 @@ class RSSObserver:
         buffer = max(self.spring_lateral_buffer, 1e-3)
         desired_away = self.spring_lateral_k * (soft_penetration / buffer) + self.damper_lateral_k * closing_speed
         desired_away = float(np.clip(desired_away, 0.0, self.spring_lateral_max_steer))
-        away_direction = float(np.sign(signed_lateral_delta))
+        away_direction = -float(np.sign(signed_lateral_delta))
         current_away = float(action[0]) * away_direction
         steer_delta = max(0.0, desired_away - current_away)
 
@@ -531,7 +531,7 @@ class RSSObserver:
             return False
         if abs(steering) < 1e-3:
             return False
-        return float(steering) * float(signed_lateral_delta) < 0.0
+        return float(steering) * float(signed_lateral_delta) > 0.0
 
     def verify_shield_step(self, env, shield_info, env_seed, episode, step):
         if not shield_info.get("rss_shield_active"):
