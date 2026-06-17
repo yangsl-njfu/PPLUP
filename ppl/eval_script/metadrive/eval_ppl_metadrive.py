@@ -34,6 +34,7 @@ from ppl.sb3.td3.policies import TD3Policy
 from ppl.utils.metadrive_route_projection import MetaDriveRouteProjector
 from ppl.utils.print_dict_utils import pretty_print, RecorderEnv
 from ppl.utils.rss_attack import build_rss_attack
+from ppl.utils.rss_uncertainty import build_rss_uncertainty
 from ppl.utils.train_eval_config import baseline_eval_config
 
 EVAL_ENV_START = baseline_eval_config["start_seed"]
@@ -70,6 +71,7 @@ class RSSObserver:
         damper_lateral_k=0.02,
         spring_lateral_max_steer=0.04,
         attack=None,
+        uncertainty=None,
         verbose=False,
     ):
         self.response_time = response_time
@@ -98,24 +100,28 @@ class RSSObserver:
         self.damper_lateral_k = damper_lateral_k
         self.spring_lateral_max_steer = spring_lateral_max_steer
         self.attack = attack if attack is not None else build_rss_attack()
+        self.uncertainty = uncertainty if uncertainty is not None else build_rss_uncertainty()
         self.verbose = verbose
         self.was_longitudinal_unsafe = False
         self.was_lateral_unsafe = False
         self.was_shielding = False
         self.was_lateral_shielding = False
         self.attack.reset()
+        self.uncertainty.reset()
 
     def reset(self):
         self.was_longitudinal_unsafe = False
         self.was_lateral_unsafe = False
         self.was_shielding = False
         self.was_lateral_shielding = False
+        self.attack.reset()
+        self.uncertainty.reset()
 
     def shield_action(self, env, action, env_seed, episode, step):
         action = np.asarray(action, dtype=float).copy()
         original_steering = float(action[0])
         original_throttle = float(action[1])
-        front_state = self._find_longitudinal_front(env)
+        front_state = self._find_longitudinal_front(env, env_seed=env_seed, episode=episode, step=step)
         empty_info = {
             "rss_shield_active": False,
             "rss_longitudinal_shield_active": False,
@@ -142,6 +148,8 @@ class RSSObserver:
             episode=episode,
             step=step,
         )
+        front, uncertainty_info = self._uncertainty_front_candidate(front, front_state)
+        attack_info["rss_front_distance_used"] = None if front is None else front.get("distance")
         front_state["front"] = front
         front_state["raw_front"] = raw_front
         ego = front_state["ego"]
@@ -160,7 +168,7 @@ class RSSObserver:
             front_proj = front["proj"]
             distance = front["distance"]
             ego_max_accel, ego_min_brake, front_max_brake = self._longitudinal_dynamics(ego, front_vehicle)
-            front_speed = self._object_speed(front_vehicle)
+            front_speed = front.get("speed", self._object_speed(front_vehicle))
             safe_distance = self.safe_longitudinal_distance(
                 ego.speed,
                 front_speed,
@@ -175,6 +183,7 @@ class RSSObserver:
                 "rss_longitudinal_shield_violation": max(0.0, float(violation)),
                 "rss_shield_front_vehicle": getattr(front_vehicle, "name", getattr(front_vehicle, "id", "")),
                 **attack_info,
+                **uncertainty_info,
             }
             response = self._longitudinal_shield_response(
                 action=action,
@@ -245,11 +254,13 @@ class RSSObserver:
             episode=episode,
             step=step,
         )
+        lateral, lateral_uncertainty_info = self._uncertainty_lateral_candidate(lateral, front_state)
+        lateral_attack_info["rss_lateral_gap_used"] = None if lateral is None else lateral.get("lateral_gap")
         front_state["lateral"] = lateral
         front_state["raw_lateral"] = raw_lateral
         lateral_unsafe = lateral is not None and lateral["unsafe"]
         lateral_active = False
-        lateral_info = lateral_attack_info
+        lateral_info = {**lateral_attack_info, **lateral_uncertainty_info}
         if lateral is not None:
             vehicle = lateral["vehicle"]
             signed_lateral_delta = self._relative_lateral_delta(ego, vehicle)
@@ -561,7 +572,7 @@ class RSSObserver:
         }
 
     def observe(self, env, env_seed, episode, step):
-        front_state = self._find_longitudinal_front(env)
+        front_state = self._find_longitudinal_front(env, env_seed=env_seed, episode=episode, step=step)
         if front_state is None:
             return {"rss_unsafe": False}
 
@@ -575,6 +586,8 @@ class RSSObserver:
             episode=episode,
             step=step,
         )
+        front, uncertainty_info = self._uncertainty_front_candidate(front, front_state)
+        attack_info["rss_front_distance_used"] = None if front is None else front.get("distance")
         front_state["front"] = front
         front_state["raw_front"] = raw_front
         stats = front_state["stats"]
@@ -586,11 +599,27 @@ class RSSObserver:
             episode=episode,
             step=step,
         )
+        lateral, lateral_uncertainty_info = self._uncertainty_lateral_candidate(lateral, front_state)
+        lateral_attack_info["rss_lateral_gap_used"] = None if lateral is None else lateral.get("lateral_gap")
         front_state["lateral"] = lateral
         front_state["raw_lateral"] = raw_lateral
 
-        longitudinal_info = self._observe_longitudinal(front, ego, ego_proj, env_seed, episode, step, attack_info)
-        lateral_info = self._observe_lateral(lateral, env_seed, episode, step, lateral_attack_info)
+        longitudinal_info = self._observe_longitudinal(
+            front,
+            ego,
+            ego_proj,
+            env_seed,
+            episode,
+            step,
+            {**attack_info, **uncertainty_info},
+        )
+        lateral_info = self._observe_lateral(
+            lateral,
+            env_seed,
+            episode,
+            step,
+            {**lateral_attack_info, **lateral_uncertainty_info},
+        )
         self._debug(env_seed, episode, step, stats, front, lateral, longitudinal_info, lateral_info)
         return {
             "rss_unsafe": longitudinal_info["rss_longitudinal_unsafe"] or lateral_info["rss_lateral_unsafe"],
@@ -616,7 +645,13 @@ class RSSObserver:
         }
         return self.attack.apply_lateral(lateral, context)
 
-    def _find_longitudinal_front(self, env):
+    def _uncertainty_front_candidate(self, front, front_state):
+        return self.uncertainty.apply_front(front, {"front_state": front_state})
+
+    def _uncertainty_lateral_candidate(self, lateral, front_state):
+        return self.uncertainty.apply_lateral(lateral, {"front_state": front_state})
+
+    def _find_longitudinal_front(self, env, env_seed=None, episode=None, step=None):
         raw_env = self._unwrap(env)
         ego = getattr(raw_env, "vehicle", None)
         if ego is None or getattr(ego, "navigation", None) is None:
@@ -651,13 +686,39 @@ class RSSObserver:
             if vehicle is ego:
                 continue
 
-            traffic_vehicles.append(vehicle)
-            proj = projector.project_vehicle(vehicle, use_closest_lane=True)
+            perceived_vehicle, uncertainty_info = self.uncertainty.perceive_vehicle(
+                vehicle,
+                {
+                    "ego": ego,
+                    "env_seed": env_seed,
+                    "episode": episode,
+                    "step": step,
+                },
+            )
+            traffic_vehicles.append(
+                {
+                    "vehicle": vehicle,
+                    "perceived_vehicle": perceived_vehicle,
+                    "uncertainty_info": uncertainty_info,
+                    "uncertainty_active": uncertainty_info.get("rss_uncertainty_active", False),
+                }
+            )
+            raw_proj = projector.project_vehicle(vehicle, use_closest_lane=True)
+            proj = projector.project_vehicle(perceived_vehicle, use_closest_lane=True)
             if proj is None:
                 continue
 
             stats["route_vehicles"] += 1
-            route_vehicle_projections.append((vehicle, proj))
+            route_vehicle_projections.append(
+                {
+                    "vehicle": vehicle,
+                    "perceived_vehicle": perceived_vehicle,
+                    "proj": proj,
+                    "raw_proj": raw_proj,
+                    "uncertainty_info": uncertainty_info,
+                    "uncertainty_active": uncertainty_info.get("rss_uncertainty_active", False),
+                }
+            )
             if proj.lane_index[2] != ego_proj.lane_index[2]:
                 continue
 
@@ -673,7 +734,30 @@ class RSSObserver:
 
             stats["front_candidates"] += 1
             if front is None or distance < front["distance"]:
-                front = {"vehicle": vehicle, "proj": proj, "distance": distance}
+                raw_distance = None
+                if raw_proj is not None:
+                    raw_distance = (
+                        raw_proj.route_s
+                        - ego_proj.route_s
+                        - self._vehicle_length(ego) / 2.0
+                        - self._vehicle_length(vehicle) / 2.0
+                    )
+                raw_speed = self._object_speed(vehicle)
+                noisy_speed = self._object_speed(perceived_vehicle)
+                front = {
+                    "vehicle": perceived_vehicle,
+                    "raw_vehicle": vehicle,
+                    "proj": proj,
+                    "raw_proj": raw_proj,
+                    "distance": distance,
+                    "raw_distance": None if raw_distance is None else float(raw_distance),
+                    "noisy_distance": float(distance),
+                    "speed": noisy_speed,
+                    "raw_speed": raw_speed,
+                    "noisy_speed": noisy_speed,
+                    "uncertainty_info": uncertainty_info,
+                    "uncertainty_active": uncertainty_info.get("rss_uncertainty_active", False),
+                }
 
         return {
             "ego": ego,
@@ -694,10 +778,13 @@ class RSSObserver:
         lateral = None
         projected_vehicle_ids = set()
 
-        for vehicle, proj in front_state["route_vehicle_projections"]:
+        for vehicle_entry in front_state["route_vehicle_projections"]:
+            vehicle = vehicle_entry["perceived_vehicle"]
+            raw_vehicle = vehicle_entry["vehicle"]
+            proj = vehicle_entry["proj"]
             if vehicle is ego:
                 continue
-            projected_vehicle_ids.add(id(vehicle))
+            projected_vehicle_ids.add(id(raw_vehicle))
 
             if ego_ref is not None:
                 route_candidate = self._lateral_candidate(
@@ -706,16 +793,33 @@ class RSSObserver:
                     ego_ref=ego_ref,
                     vehicle=vehicle,
                     proj=proj,
+                    raw_vehicle=raw_vehicle,
+                    raw_proj=vehicle_entry.get("raw_proj"),
+                    uncertainty_info=vehicle_entry.get("uncertainty_info"),
+                    uncertainty_active=vehicle_entry.get("uncertainty_active", False),
                 )
                 lateral = self._record_lateral_candidate(stats, lateral, route_candidate)
 
-            relative_candidate = self._relative_lateral_candidate(ego, vehicle)
+            relative_candidate = self._relative_lateral_candidate(
+                ego,
+                vehicle,
+                raw_vehicle=raw_vehicle,
+                uncertainty_info=vehicle_entry.get("uncertainty_info"),
+                uncertainty_active=vehicle_entry.get("uncertainty_active", False),
+            )
             lateral = self._record_lateral_candidate(stats, lateral, relative_candidate)
 
-        for vehicle in front_state.get("traffic_vehicles", []):
-            if id(vehicle) in projected_vehicle_ids:
+        for vehicle_entry in front_state.get("traffic_vehicles", []):
+            raw_vehicle = vehicle_entry["vehicle"]
+            if id(raw_vehicle) in projected_vehicle_ids:
                 continue
-            relative_candidate = self._relative_lateral_candidate(ego, vehicle)
+            relative_candidate = self._relative_lateral_candidate(
+                ego,
+                vehicle_entry["perceived_vehicle"],
+                raw_vehicle=raw_vehicle,
+                uncertainty_info=vehicle_entry.get("uncertainty_info"),
+                uncertainty_active=vehicle_entry.get("uncertainty_active", False),
+            )
             lateral = self._record_lateral_candidate(stats, lateral, relative_candidate)
 
         return lateral
@@ -751,7 +855,7 @@ class RSSObserver:
         front_proj = front["proj"]
         front_distance = front["distance"]
         ego_max_accel, ego_min_brake, front_max_brake = self._longitudinal_dynamics(ego, front_vehicle)
-        front_speed = self._object_speed(front_vehicle)
+        front_speed = front.get("speed", self._object_speed(front_vehicle))
         safe_distance = self.safe_longitudinal_distance(
             ego.speed,
             front_speed,
@@ -860,7 +964,18 @@ class RSSObserver:
             **lateral_attack_info,
         }
 
-    def _lateral_candidate(self, projector, ego, ego_ref, vehicle, proj):
+    def _lateral_candidate(
+        self,
+        projector,
+        ego,
+        ego_ref,
+        vehicle,
+        proj,
+        raw_vehicle=None,
+        raw_proj=None,
+        uncertainty_info=None,
+        uncertainty_active=False,
+    ):
         other_ref = self._reference_coordinates(projector, vehicle.position, proj.road_key)
         if other_ref is None:
             return None
@@ -889,24 +1004,49 @@ class RSSObserver:
         violation = safe_lateral_distance - lateral_gap
         lane_width_like_gap = max(3.2, self._vehicle_width(ego) + self._vehicle_width(vehicle))
         same_lane = center_lateral_distance < lane_width_like_gap * 0.5
+        raw_lateral_gap = None
+        if raw_vehicle is not None and raw_proj is not None:
+            raw_ref = self._reference_coordinates(projector, raw_vehicle.position, raw_proj.road_key)
+            if raw_ref is not None:
+                raw_other_route_s, _, raw_other_d, _ = raw_ref
+                raw_center_lateral_distance = abs(raw_other_d - ego_d)
+                raw_lateral_gap = (
+                    raw_center_lateral_distance
+                    - self._vehicle_width(ego) / 2.0
+                    - self._vehicle_width(raw_vehicle) / 2.0
+                )
+                raw_longitudinal_gap = abs(raw_other_route_s - ego_route_s) - self._vehicle_length(
+                    ego
+                ) / 2.0 - self._vehicle_length(raw_vehicle) / 2.0
+                raw_longitudinal_gap = max(0.0, float(raw_longitudinal_gap))
+            else:
+                raw_longitudinal_gap = None
+        else:
+            raw_longitudinal_gap = None
 
         candidate = {
             "vehicle": vehicle,
+            "raw_vehicle": raw_vehicle or vehicle,
             "unsafe": unsafe,
             "violation": violation,
             "lateral_gap": float(lateral_gap),
+            "raw_lateral_gap": None if raw_lateral_gap is None else float(raw_lateral_gap),
+            "noisy_lateral_gap": float(lateral_gap),
             "safe_lateral_distance": safe_lateral_distance,
             "longitudinal_gap": longitudinal_gap,
+            "raw_longitudinal_gap": raw_longitudinal_gap,
             "ego_d": ego_d,
             "other_d": other_d,
             "ego_lateral_speed": ego_lateral_speed,
             "other_lateral_speed": other_lateral_speed,
             "source": "route",
             "same_lane": same_lane,
+            "uncertainty_info": uncertainty_info or {},
+            "uncertainty_active": bool(uncertainty_active),
         }
         return candidate
 
-    def _relative_lateral_candidate(self, ego, vehicle):
+    def _relative_lateral_candidate(self, ego, vehicle, raw_vehicle=None, uncertainty_info=None, uncertainty_active=False):
         ego_pos = np.asarray(getattr(ego, "position", [0.0, 0.0]), dtype=float)[:2]
         other_pos = np.asarray(getattr(vehicle, "position", [0.0, 0.0]), dtype=float)[:2]
         heading = np.asarray(getattr(ego, "heading", [1.0, 0.0]), dtype=float)[:2]
@@ -944,20 +1084,44 @@ class RSSObserver:
         violation = safe_lateral_distance - lateral_gap
         lane_width_like_gap = max(3.2, self._vehicle_width(ego) + self._vehicle_width(vehicle))
         same_lane = center_lateral_distance < lane_width_like_gap * 0.5
+        raw_lateral_gap = None
+        raw_longitudinal_gap = None
+        if raw_vehicle is not None:
+            raw_other_pos = np.asarray(getattr(raw_vehicle, "position", [0.0, 0.0]), dtype=float)[:2]
+            raw_delta = raw_other_pos - ego_pos
+            raw_signed_longitudinal_delta = float(np.dot(raw_delta, forward_axis))
+            raw_signed_lateral_delta = float(np.dot(raw_delta, lateral_axis))
+            raw_longitudinal_gap = (
+                abs(raw_signed_longitudinal_delta)
+                - self._vehicle_length(ego) / 2.0
+                - self._vehicle_length(raw_vehicle) / 2.0
+            )
+            raw_longitudinal_gap = max(0.0, float(raw_longitudinal_gap))
+            raw_lateral_gap = (
+                abs(raw_signed_lateral_delta)
+                - self._vehicle_width(ego) / 2.0
+                - self._vehicle_width(raw_vehicle) / 2.0
+            )
 
         return {
             "vehicle": vehicle,
+            "raw_vehicle": raw_vehicle or vehicle,
             "unsafe": unsafe,
             "violation": violation,
             "lateral_gap": float(lateral_gap),
+            "raw_lateral_gap": None if raw_lateral_gap is None else float(raw_lateral_gap),
+            "noisy_lateral_gap": float(lateral_gap),
             "safe_lateral_distance": safe_lateral_distance,
             "longitudinal_gap": longitudinal_gap,
+            "raw_longitudinal_gap": raw_longitudinal_gap,
             "ego_d": 0.0,
             "other_d": signed_lateral_delta,
             "ego_lateral_speed": ego_lateral_speed,
             "other_lateral_speed": other_lateral_speed,
             "source": "relative",
             "same_lane": same_lane,
+            "uncertainty_info": uncertainty_info or {},
+            "uncertainty_active": bool(uncertainty_active),
         }
 
     @staticmethod
@@ -1218,13 +1382,21 @@ def make_rss_episode_stats():
         "rss_attack_steps": 0,
         "rss_front_attack_steps": 0,
         "rss_lateral_attack_steps": 0,
+        "rss_uncertainty_steps": 0,
+        "rss_front_uncertainty_steps": 0,
+        "rss_lateral_uncertainty_steps": 0,
         "rss_attack_delta_mean": 0.0,
         "rss_lateral_attack_delta_mean": 0.0,
+        "rss_front_distance_noise_mean": 0.0,
+        "rss_front_speed_noise_mean": 0.0,
+        "rss_lateral_gap_noise_mean": 0.0,
         "rss_front_distance_raw_mean": 0.0,
         "rss_front_distance_attacked_mean": 0.0,
+        "rss_front_distance_noisy_mean": 0.0,
         "rss_front_distance_used_mean": 0.0,
         "rss_lateral_gap_raw_mean": 0.0,
         "rss_lateral_gap_attacked_mean": 0.0,
+        "rss_lateral_gap_noisy_mean": 0.0,
         "rss_lateral_gap_used_mean": 0.0,
         "rss_first_unsafe_step": -1,
         "rss_first_longitudinal_unsafe_step": -1,
@@ -1235,20 +1407,33 @@ def make_rss_episode_stats():
         "rss_first_attack_step": -1,
         "rss_first_front_attack_step": -1,
         "rss_first_lateral_attack_step": -1,
+        "rss_first_uncertainty_step": -1,
+        "rss_first_front_uncertainty_step": -1,
+        "rss_first_lateral_uncertainty_step": -1,
         "_rss_attack_delta_sum": 0.0,
         "_rss_attack_delta_samples": 0,
         "_rss_lateral_attack_delta_sum": 0.0,
         "_rss_lateral_attack_delta_samples": 0,
+        "_rss_front_distance_noise_sum": 0.0,
+        "_rss_front_distance_noise_samples": 0,
+        "_rss_front_speed_noise_sum": 0.0,
+        "_rss_front_speed_noise_samples": 0,
+        "_rss_lateral_gap_noise_sum": 0.0,
+        "_rss_lateral_gap_noise_samples": 0,
         "_rss_front_distance_raw_sum": 0.0,
         "_rss_front_distance_raw_samples": 0,
         "_rss_front_distance_attacked_sum": 0.0,
         "_rss_front_distance_attacked_samples": 0,
+        "_rss_front_distance_noisy_sum": 0.0,
+        "_rss_front_distance_noisy_samples": 0,
         "_rss_front_distance_used_sum": 0.0,
         "_rss_front_distance_used_samples": 0,
         "_rss_lateral_gap_raw_sum": 0.0,
         "_rss_lateral_gap_raw_samples": 0,
         "_rss_lateral_gap_attacked_sum": 0.0,
         "_rss_lateral_gap_attacked_samples": 0,
+        "_rss_lateral_gap_noisy_sum": 0.0,
+        "_rss_lateral_gap_noisy_samples": 0,
         "_rss_lateral_gap_used_sum": 0.0,
         "_rss_lateral_gap_used_samples": 0,
     }
@@ -1285,9 +1470,18 @@ def update_rss_episode_stats(stats, info, step):
             stats["rss_first_attack_step"] = step
     mark("rss_attack_active", "rss_front_attack_steps", "rss_first_front_attack_step")
     mark("rss_lateral_attack_active", "rss_lateral_attack_steps", "rss_first_lateral_attack_step")
+    front_uncertainty_active = info.get("rss_uncertainty_active", False)
+    lateral_uncertainty_active = info.get("rss_lateral_uncertainty_active", False)
+    if front_uncertainty_active or lateral_uncertainty_active:
+        stats["rss_uncertainty_steps"] += 1
+        if stats["rss_first_uncertainty_step"] < 0:
+            stats["rss_first_uncertainty_step"] = step
+    mark("rss_uncertainty_active", "rss_front_uncertainty_steps", "rss_first_front_uncertainty_step")
+    mark("rss_lateral_uncertainty_active", "rss_lateral_uncertainty_steps", "rss_first_lateral_uncertainty_step")
 
     raw_distance = _finite_info_value(info.get("rss_front_distance_raw"))
     attacked_distance = _finite_info_value(info.get("rss_front_distance_attacked"))
+    noisy_distance = _finite_info_value(info.get("rss_front_distance_noisy"))
     used_distance = _finite_info_value(info.get("rss_front_distance_used"))
     if raw_distance is not None:
         stats["_rss_front_distance_raw_samples"] += 1
@@ -1300,6 +1494,12 @@ def update_rss_episode_stats(stats, info, step):
         stats["_rss_front_distance_attacked_sum"] += attacked_distance
         stats["rss_front_distance_attacked_mean"] = (
             stats["_rss_front_distance_attacked_sum"] / stats["_rss_front_distance_attacked_samples"]
+        )
+    if noisy_distance is not None:
+        stats["_rss_front_distance_noisy_samples"] += 1
+        stats["_rss_front_distance_noisy_sum"] += noisy_distance
+        stats["rss_front_distance_noisy_mean"] = (
+            stats["_rss_front_distance_noisy_sum"] / stats["_rss_front_distance_noisy_samples"]
         )
     if used_distance is not None:
         stats["_rss_front_distance_used_samples"] += 1
@@ -1315,8 +1515,25 @@ def update_rss_episode_stats(stats, info, step):
             stats["_rss_attack_delta_sum"] += attack_delta
             stats["rss_attack_delta_mean"] = stats["_rss_attack_delta_sum"] / stats["_rss_attack_delta_samples"]
 
+    if front_uncertainty_active:
+        distance_noise = _finite_info_value(info.get("rss_front_distance_noise"))
+        if distance_noise is not None:
+            stats["_rss_front_distance_noise_samples"] += 1
+            stats["_rss_front_distance_noise_sum"] += distance_noise
+            stats["rss_front_distance_noise_mean"] = (
+                stats["_rss_front_distance_noise_sum"] / stats["_rss_front_distance_noise_samples"]
+            )
+        speed_noise = _finite_info_value(info.get("rss_front_speed_noise"))
+        if speed_noise is not None:
+            stats["_rss_front_speed_noise_samples"] += 1
+            stats["_rss_front_speed_noise_sum"] += speed_noise
+            stats["rss_front_speed_noise_mean"] = (
+                stats["_rss_front_speed_noise_sum"] / stats["_rss_front_speed_noise_samples"]
+            )
+
     raw_lateral_gap = _finite_info_value(info.get("rss_lateral_gap_raw"))
     attacked_lateral_gap = _finite_info_value(info.get("rss_lateral_gap_attacked"))
+    noisy_lateral_gap = _finite_info_value(info.get("rss_lateral_gap_noisy"))
     used_lateral_gap = _finite_info_value(info.get("rss_lateral_gap_used"))
     if raw_lateral_gap is not None:
         stats["_rss_lateral_gap_raw_samples"] += 1
@@ -1329,6 +1546,12 @@ def update_rss_episode_stats(stats, info, step):
         stats["_rss_lateral_gap_attacked_sum"] += attacked_lateral_gap
         stats["rss_lateral_gap_attacked_mean"] = (
             stats["_rss_lateral_gap_attacked_sum"] / stats["_rss_lateral_gap_attacked_samples"]
+        )
+    if noisy_lateral_gap is not None:
+        stats["_rss_lateral_gap_noisy_samples"] += 1
+        stats["_rss_lateral_gap_noisy_sum"] += noisy_lateral_gap
+        stats["rss_lateral_gap_noisy_mean"] = (
+            stats["_rss_lateral_gap_noisy_sum"] / stats["_rss_lateral_gap_noisy_samples"]
         )
     if used_lateral_gap is not None:
         stats["_rss_lateral_gap_used_samples"] += 1
@@ -1344,6 +1567,15 @@ def update_rss_episode_stats(stats, info, step):
             stats["_rss_lateral_attack_delta_sum"] += lateral_attack_delta
             stats["rss_lateral_attack_delta_mean"] = (
                 stats["_rss_lateral_attack_delta_sum"] / stats["_rss_lateral_attack_delta_samples"]
+            )
+
+    if lateral_uncertainty_active:
+        lateral_noise = _finite_info_value(info.get("rss_lateral_gap_noise"))
+        if lateral_noise is not None:
+            stats["_rss_lateral_gap_noise_samples"] += 1
+            stats["_rss_lateral_gap_noise_sum"] += lateral_noise
+            stats["rss_lateral_gap_noise_mean"] = (
+                stats["_rss_lateral_gap_noise_sum"] / stats["_rss_lateral_gap_noise_samples"]
             )
 
 
@@ -1722,6 +1954,60 @@ if __name__ == "__main__":
         default=0.0,
         help="Gap added to the selected lateral vehicle for lateral_gap_overestimate attack, in meters.",
     )
+    parser.add_argument(
+        "--rss_uncertainty",
+        choices=["none", "gaussian"],
+        default="none",
+        help="Perception uncertainty model applied to RSS monitor inputs.",
+    )
+    parser.add_argument(
+        "--rss_noise_level",
+        choices=["custom", "small", "medium", "large"],
+        default="custom",
+        help="Preset Gaussian noise level. small/medium are MetaDrive-scaled; large matches the paper stress setting.",
+    )
+    parser.add_argument(
+        "--rss_noise_front_distance_sigma",
+        type=float,
+        default=0.0,
+        help="Backward-compatible alias for longitudinal position sigma in meters.",
+    )
+    parser.add_argument(
+        "--rss_noise_lateral_gap_sigma",
+        type=float,
+        default=0.0,
+        help="Backward-compatible alias for lateral position sigma in meters.",
+    )
+    parser.add_argument(
+        "--rss_noise_position_x_sigma",
+        type=float,
+        default=None,
+        help="Gaussian sigma for perceived longitudinal position noise, in meters.",
+    )
+    parser.add_argument(
+        "--rss_noise_position_y_sigma",
+        type=float,
+        default=None,
+        help="Gaussian sigma for perceived lateral position noise, in meters.",
+    )
+    parser.add_argument(
+        "--rss_noise_speed_sigma",
+        type=float,
+        default=0.0,
+        help="Gaussian sigma for perceived speed noise, in m/s.",
+    )
+    parser.add_argument(
+        "--rss_noise_heading_sigma",
+        type=float,
+        default=0.0,
+        help="Gaussian sigma for perceived heading noise, in radians.",
+    )
+    parser.add_argument(
+        "--rss_noise_seed",
+        type=int,
+        default=0,
+        help="Random seed for RSS perception noise. Set negative for non-deterministic RandomState.",
+    )
     parser.add_argument("--rss_verbose", action="store_true", help="Print RSS trigger/shield logs to terminal.")
 
     args = parser.parse_args()
@@ -1732,6 +2018,17 @@ if __name__ == "__main__":
         name=args.rss_attack,
         front_distance_delta=args.rss_attack_front_distance_delta,
         lateral_gap_delta=args.rss_attack_lateral_gap_delta,
+    )
+    rss_uncertainty = build_rss_uncertainty(
+        name=args.rss_uncertainty,
+        noise_level=args.rss_noise_level,
+        front_distance_sigma=args.rss_noise_front_distance_sigma,
+        lateral_gap_sigma=args.rss_noise_lateral_gap_sigma,
+        position_x_sigma=args.rss_noise_position_x_sigma,
+        position_y_sigma=args.rss_noise_position_y_sigma,
+        speed_sigma=args.rss_noise_speed_sigma,
+        heading_sigma=args.rss_noise_heading_sigma,
+        seed=args.rss_noise_seed,
     )
     rss_observer = RSSObserver(
         response_time=args.rss_response_time,
@@ -1760,6 +2057,7 @@ if __name__ == "__main__":
         damper_lateral_k=args.rss_damper_lateral_k,
         spring_lateral_max_steer=args.rss_spring_lateral_max_steer,
         attack=rss_attack,
+        uncertainty=rss_uncertainty,
         verbose=args.rss_verbose,
     ) if args.rss_observe or args.rss_shield else None
     if rss_observer is not None and args.rss_verbose:
@@ -1767,7 +2065,8 @@ if __name__ == "__main__":
             "[RSS] observer enabled: response_time={} front_max_distance={} "
             "dynamics_mode={} shield={} shield_mode={} lat_long_threshold={} "
             "max_lat_distance={} debug_interval={} attack={} attack_front_delta={} "
-            "attack_lateral_gap_delta={}".format(
+            "attack_lateral_gap_delta={} uncertainty={} noise_level={} noise_x_sigma={} "
+            "noise_y_sigma={} noise_v_sigma={} noise_theta_sigma={} noise_seed={}".format(
                 args.rss_response_time,
                 args.rss_max_front_distance,
                 rss_dynamics_mode,
@@ -1779,6 +2078,17 @@ if __name__ == "__main__":
                 args.rss_attack,
                 args.rss_attack_front_distance_delta,
                 args.rss_attack_lateral_gap_delta,
+                args.rss_uncertainty,
+                args.rss_noise_level,
+                args.rss_noise_position_x_sigma
+                if args.rss_noise_position_x_sigma is not None
+                else args.rss_noise_front_distance_sigma,
+                args.rss_noise_position_y_sigma
+                if args.rss_noise_position_y_sigma is not None
+                else args.rss_noise_lateral_gap_sigma,
+                args.rss_noise_speed_sigma,
+                args.rss_noise_heading_sigma,
+                args.rss_noise_seed,
             )
         )
 

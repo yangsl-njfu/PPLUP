@@ -23,17 +23,46 @@ param(
     [double]$RssAttackFrontDistanceDelta = 0.0,
 
     [Alias("rss_attack_lateral_gap_delta")]
-    [double]$RssAttackLateralGapDelta = 0.0
+    [double]$RssAttackLateralGapDelta = 0.0,
+
+    [Alias("rss_uncertainty")]
+    [ValidateSet("none", "gaussian")]
+    [string]$RssUncertainty = "none",
+
+    [Alias("rss_noise_level")]
+    [ValidateSet("small", "medium", "large")]
+    [string]$RssNoiseLevel = "medium"
 )
 
 # ========== Configuration ==========
 $MODEL_DIR = "E:\CodeProject\CodexExp01\PPL-main\runs\PPL\PPL_de15a333\models"
-$RESULT_DIR = "evaluation_results\PPL_de15a333_RSS"
+$RESULT_DIR = "evaluation_results\PPL_de15a333_SpringDamper_GaussianNoise"
 $START_STEP = 6000
 $END_STEP = 8000
 $STEP_INTERVAL = 200
 $NUM_EP_IN_ONE_ENV = 1
 $TOTAL_ENV_NUM = 50
+
+# Fixed perception uncertainty settings for Gaussian RSS-noise experiments.
+# medium is the recommended MetaDrive setting; large matches the paper's
+# high-covariance highway setting and is mainly for stress tests.
+if ($RssNoiseLevel -eq "small") {
+    $RSS_NOISE_POSITION_X_SIGMA = 0.50
+    $RSS_NOISE_POSITION_Y_SIGMA = 0.15
+    $RSS_NOISE_SPEED_SIGMA = 0.50
+    $RSS_NOISE_HEADING_SIGMA = 0.02
+} elseif ($RssNoiseLevel -eq "large") {
+    $RSS_NOISE_POSITION_X_SIGMA = 1.87
+    $RSS_NOISE_POSITION_Y_SIGMA = 0.54
+    $RSS_NOISE_SPEED_SIGMA = 2.64
+    $RSS_NOISE_HEADING_SIGMA = 0.10
+} else {
+    $RSS_NOISE_POSITION_X_SIGMA = 1.00
+    $RSS_NOISE_POSITION_Y_SIGMA = 0.30
+    $RSS_NOISE_SPEED_SIGMA = 1.00
+    $RSS_NOISE_HEADING_SIGMA = 0.05
+}
+$RSS_NOISE_SEED = 7
 
 # ========== Start Evaluation ==========
 Write-Host "===== PPL Batch Evaluation Script =====" -ForegroundColor Cyan
@@ -43,6 +72,7 @@ Write-Host "Step Range: $START_STEP -> $END_STEP (interval $STEP_INTERVAL)" -For
 Write-Host "Episodes per Env: $NUM_EP_IN_ONE_ENV, Total Envs: $TOTAL_ENV_NUM" -ForegroundColor White
 Write-Host "RSS Observe: $RssObserve, RSS Shield: $RssShield, RSS Shield Mode: $RssShieldMode, RSS Debug Interval: $RssDebugInterval" -ForegroundColor White
 Write-Host "RSS Attack: $RssAttack, Front Distance Delta: $RssAttackFrontDistanceDelta m, Lateral Gap Delta: $RssAttackLateralGapDelta m" -ForegroundColor White
+Write-Host "RSS Uncertainty: $RssUncertainty, Noise Level: $RssNoiseLevel, SigmaX: $RSS_NOISE_POSITION_X_SIGMA m, SigmaY: $RSS_NOISE_POSITION_Y_SIGMA m, SigmaV: $RSS_NOISE_SPEED_SIGMA m/s, SigmaTheta: $RSS_NOISE_HEADING_SIGMA rad, Noise Seed: $RSS_NOISE_SEED" -ForegroundColor White
 Write-Host ""
 
 # Create result directory
@@ -86,6 +116,15 @@ for ($step = $START_STEP; $step -le $END_STEP; $step += $STEP_INTERVAL) {
                 $eval_args += @("--rss_attack_front_distance_delta", "$RssAttackFrontDistanceDelta")
                 $eval_args += @("--rss_attack_lateral_gap_delta", "$RssAttackLateralGapDelta")
             }
+            if ($RssUncertainty -ne "none") {
+                $eval_args += @("--rss_uncertainty", "$RssUncertainty")
+                $eval_args += @("--rss_noise_level", "$RssNoiseLevel")
+                $eval_args += @("--rss_noise_position_x_sigma", "$RSS_NOISE_POSITION_X_SIGMA")
+                $eval_args += @("--rss_noise_position_y_sigma", "$RSS_NOISE_POSITION_Y_SIGMA")
+                $eval_args += @("--rss_noise_speed_sigma", "$RSS_NOISE_SPEED_SIGMA")
+                $eval_args += @("--rss_noise_heading_sigma", "$RSS_NOISE_HEADING_SIGMA")
+                $eval_args += @("--rss_noise_seed", "$RSS_NOISE_SEED")
+            }
             python @eval_args
             if ($LASTEXITCODE -ne 0) {
                 throw "Python evaluation failed for checkpoint $step with exit code $LASTEXITCODE"
@@ -114,6 +153,12 @@ try:
     df = pd.read_csv('$ckpt_csv_py')
     summary = {
         'ckpt_index': $step,
+        'rss_uncertainty': '$RssUncertainty',
+        'rss_noise_level': '$RssNoiseLevel',
+        'rss_noise_sigma_x': $RSS_NOISE_POSITION_X_SIGMA,
+        'rss_noise_sigma_y': $RSS_NOISE_POSITION_Y_SIGMA,
+        'rss_noise_sigma_v': $RSS_NOISE_SPEED_SIGMA,
+        'rss_noise_sigma_theta': $RSS_NOISE_HEADING_SIGMA,
         'success_rate': df['success'].mean(),
         'crash_rate': df['crash'].mean() if 'crash' in df.columns else 0.0,
         'crash_count': int(df['crash'].sum()) if 'crash' in df.columns else 0,
@@ -129,13 +174,21 @@ try:
                 'avg_rss_attack_steps': df['rss_attack_steps'].mean() if 'rss_attack_steps' in df.columns else 0.0,
                 'avg_rss_front_attack_steps': df['rss_front_attack_steps'].mean() if 'rss_front_attack_steps' in df.columns else 0.0,
                 'avg_rss_lateral_attack_steps': df['rss_lateral_attack_steps'].mean() if 'rss_lateral_attack_steps' in df.columns else 0.0,
+                'avg_rss_uncertainty_steps': df['rss_uncertainty_steps'].mean() if 'rss_uncertainty_steps' in df.columns else 0.0,
+                'avg_rss_front_uncertainty_steps': df['rss_front_uncertainty_steps'].mean() if 'rss_front_uncertainty_steps' in df.columns else 0.0,
+                'avg_rss_lateral_uncertainty_steps': df['rss_lateral_uncertainty_steps'].mean() if 'rss_lateral_uncertainty_steps' in df.columns else 0.0,
                 'avg_rss_attack_delta': df['rss_attack_delta_mean'].mean() if 'rss_attack_delta_mean' in df.columns else 0.0,
                 'avg_rss_lateral_attack_delta': df['rss_lateral_attack_delta_mean'].mean() if 'rss_lateral_attack_delta_mean' in df.columns else 0.0,
+                'avg_rss_front_distance_noise': df['rss_front_distance_noise_mean'].mean() if 'rss_front_distance_noise_mean' in df.columns else 0.0,
+                'avg_rss_front_speed_noise': df['rss_front_speed_noise_mean'].mean() if 'rss_front_speed_noise_mean' in df.columns else 0.0,
+                'avg_rss_lateral_gap_noise': df['rss_lateral_gap_noise_mean'].mean() if 'rss_lateral_gap_noise_mean' in df.columns else 0.0,
                 'avg_rss_front_distance_raw': df['rss_front_distance_raw_mean'].mean() if 'rss_front_distance_raw_mean' in df.columns else 0.0,
                 'avg_rss_front_distance_attacked': df['rss_front_distance_attacked_mean'].mean() if 'rss_front_distance_attacked_mean' in df.columns else 0.0,
+                'avg_rss_front_distance_noisy': df['rss_front_distance_noisy_mean'].mean() if 'rss_front_distance_noisy_mean' in df.columns else 0.0,
                 'avg_rss_front_distance_used': df['rss_front_distance_used_mean'].mean() if 'rss_front_distance_used_mean' in df.columns else 0.0,
                 'avg_rss_lateral_gap_raw': df['rss_lateral_gap_raw_mean'].mean() if 'rss_lateral_gap_raw_mean' in df.columns else 0.0,
                 'avg_rss_lateral_gap_attacked': df['rss_lateral_gap_attacked_mean'].mean() if 'rss_lateral_gap_attacked_mean' in df.columns else 0.0,
+                'avg_rss_lateral_gap_noisy': df['rss_lateral_gap_noisy_mean'].mean() if 'rss_lateral_gap_noisy_mean' in df.columns else 0.0,
                 'avg_rss_lateral_gap_used': df['rss_lateral_gap_used_mean'].mean() if 'rss_lateral_gap_used_mean' in df.columns else 0.0,
                 'num_episodes': len(df)
     }
